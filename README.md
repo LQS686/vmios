@@ -129,16 +129,21 @@ Needs `aarch64-linux-gnu-gcc` and `mkbootimg`.
 ```sh
 python3 tools/mkadt.py shim/out/sweet.adt --highmem
 python3 tools/mkpayload.py xnu/out/kernel.development.sweet shim/out/sweet.adt shim/out/payload.bin \
-    --cmdline 'debug=0xc serial=3 cpus=6 keepsyms=1 -enable_kprintf_spam -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_noconsole=1 sweetfb_hz=30'
+    --profile device
 shim/build.sh ../shim/out/payload.bin      # -> shim/out/shim-boot.img
 ```
 
-What the less obvious boot-args do:
+The boot-args live in [`tools/bootargs.py`](tools/bootargs.py): `--profile device` is the phone, `vm`/`vm-sample`/`vm-mttcg` are for SweetVM (the Android app under QEMU; `vm-mttcg` adds `tcgmulti=1`, which switches the app from `thread=single` to real MTTCG), `timing` adds console timestamps and UFS counters, `sample` adds the stack sampler, `qemu`/`probe` are kernel-only. Print one with `python3 tools/bootargs.py timing`. What the less obvious ones do:
 
 | Boot-arg | Effect |
 | --- | --- |
 | `rd=ufsroot0 ufsrw=1 rootrw=1` | Root on the `userdata` partition, writable |
-| `cpus=6` | Start the six A55 cores; `cpus=1` is the safe fallback |
+| `cpus=8` | All eight cores (6x A55 + 2x A76); `cpus=1` is the safe fallback |
+| `ufscache=1` | Clean only the DMA ranges a command touches instead of syncing the whole bounce buffer |
+| `ufswait=1` | Sleep in the command wait instead of `delay(1)` spinning, when the caller may block |
+| `sweetts=1` | Prefix every console line with `[seconds.milliseconds]` from reset (`tools/boot-timeline.py`) |
+| `ufsstats=1 ufsstatsecs=5` | Count UFS commands, bytes, latency and sleep ratio; one log line per interval |
+| `sweetsample=a,b,c` | Sample those processes' stacks (0054); `-` turns it off |
 | `launchd_unsecure_cache=1` | launchd accepts its job cache without AMFI |
 | `wdt=-1 wdt_test=no_user_checkin` | No hardware watchdog |
 | `sweetfb_noconsole=1` | Stop drawing kernel text over the GUI. It still goes to the persistent log; panics are drawn |
@@ -153,7 +158,7 @@ fastboot -S 512M flash userdata ios16-root.simg   # ~7 minutes; do not unplug
 fastboot boot shim/out/shim-boot.img
 ```
 
-The first boot takes about 4–5 minutes on the Apple logo, then the lock screen appears. Swipe up to unlock. To get back to fastboot, hold Power + Volume down.
+The first boot takes about 4–5 minutes on the Apple logo, then the lock screen appears. Swipe up to unlock. To get back to fastboot, hold Power + Volume down. [`docs/BOOT_ANALYSIS.md`](docs/BOOT_ANALYSIS.md) explains where that time goes and [`docs/BOOT_FIXES.md`](docs/BOOT_FIXES.md) what is already applied against it.
 
 ### 5. Read the kernel log
 
@@ -177,8 +182,17 @@ The log contains crash reports with backtraces (`CRASH name ...`), IOKit traces 
 | `xnu/patches/` | The XNU patch series (applied in order by CI), plus staging scripts for libpthread, HFS and BearSSL |
 | `.github/workflows/xnu.yml` | Kernel CI build |
 | `tools/mkadt.py` | Generates the Apple Device Tree from sweet's MMIO layout and the iPhone X identity |
-| `tools/mkpayload.py` | Packs kernel + ADT + boot-args into the shim payload |
-| `tools/mkiosroot.sh` | Builds the HFS+ iOS root from the IPSW images |
+| `tools/mkpayload.py` | Packs kernel + ADT + boot-args into the shim payload (`--profile` from `tools/bootargs.py`) |
+| `tools/bootargs.py` | The boot-arg profiles: `device`, `timing`, `sample`, `qemu`, `probe` |
+| `tools/boot-timeline.py` | Turns a `sweetts=1` console log into a boot timeline: the largest silences and what surrounded them |
+| `tools/mkiosroot.sh` | Builds the HFS+ iOS root from the IPSW images, including the shared-cache patches |
+| `tools/dsc-patch.py` | Verifies and rewrites the GPU-wait sites in the split dyld shared cache |
+| `tools/dsc-frames.py` | Resolves sampled raw addresses to `dylib+offset` against the shared cache |
+| `tools/test-sweet-ufs.py` | Compiles and exercises the console-timestamp and UFS-statistics code against stubs |
+| `tools/image-patch.py` | Finds and patches the shared-cache sites inside a raw disk image, no HFS mount needed |
+| `tools/phone-patch.py` | Same patch on the image inside SweetVM's app storage, one 4 KiB block at a time over adb |
+| `tools/kernel-patch.py` | Patch one instruction in a built kernel (or in a packed payload) at a named, byte-checked site - how the touch fixes landed without Xcode |
+| `tools/vm-probe.py`, `tools/compare-runs.py` | Poll a running VM's SWEETLOG ring and compare two boots by guest-time flush sequence |
 | `tools/sweet-root-tweaks.py` | Bring-up changes to the root (Setup skip, activation, daemons) |
 | `tools/sweet-log-pull.sh`, `sweet-log.py` | Read the persistent kernel log from recovery |
 | `tools/sweet-crash.py` | Symbolicate console crash reports |

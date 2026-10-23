@@ -1,0 +1,21 @@
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -575,10 +575,16 @@
+ 	/* Keep the IC in reset while its rails settle; IRQ stays an input. */
+ 	touch_gpio(9, 0, 3, 3, false, false); /* IRQ input, 8 mA, pull-up */
+ 	touch_gpio(8, 0, 3, 3, true, false);
++	/*
++	 * The rail vote is a precondition only on real hardware. Under SweetVM the
++	 * RPMh register block is not emulated (it reads back 0xffffffff), so the
++	 * vote fails with ENODEV and the whole touch controller used to be skipped:
++	 * no touch at all, not even a tap. Warn and keep going - if the rail really
++	 * is off, the probe below fails on its own and says so.
++	 */
+ 	int power_error = sweet_rpmh_vreg_enable("ldoc11", 3200);
+ 	if (power_error) {
+-		printf("SWEET TOUCH: L11C RPMh enable failed %d; probes skipped\n", power_error);
+-		goto out;
++		printf("SWEET TOUCH: L11C vote failed %d; probing anyway\n", power_error);
+ 	}
+ 	touch_gpio(90, 0, 0, 0, true, true); /* board digital power enable */
+ 	touch_wait(10); /* conservative rail settling; not a DT timing value */

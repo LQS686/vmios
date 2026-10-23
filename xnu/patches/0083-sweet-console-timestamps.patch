@@ -1,0 +1,126 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -117,6 +117,10 @@
+ static LCK_GRP_DECLARE(sweet_ufs_grp, "sweet_ufs");
+ static LCK_MTX_DECLARE(sweet_ufs_lock, &sweet_ufs_grp);
+ 
++/* Boot-arg sweetts=1: prefix every console line with a reset-relative time. */
++static bool sweet_ts;
++static bool sweet_ts_bol = true;         /* next byte starts a line */
++
+ static inline uint32_t
+ ufs_rd(uint32_t off)
+ {
+@@ -601,11 +605,13 @@
+ 	PE_parse_boot_argn("ufsroot", want, sizeof(want));
+ 	uint32_t rw = 0;
+ 	PE_parse_boot_argn("ufsrw", &rw, sizeof(rw));
+-	uint32_t cache = 0, wait = 0;
++	uint32_t cache = 0, wait = 0, ts = 0;
+ 	PE_parse_boot_argn("ufscache", &cache, sizeof(cache));
+ 	PE_parse_boot_argn("ufswait", &wait, sizeof(wait));
++	PE_parse_boot_argn("sweetts", &ts, sizeof(ts));
+ 	su.cache = (cache == 1);
+ 	su.wait = (wait == 1);
++	sweet_ts = (ts == 1);
+ 
+ 	su.regs = ml_io_map(reg[0], reg[1]);
+ 	if (kmem_alloc_contig(kernel_map, &su.dma, DMA_SIZE, PAGE_MASK, 0, 0,
+@@ -685,6 +691,49 @@
+ static int sweet_log_chan;
+ static uint32_t sweet_log_secs = SWEET_LOG_SECS;
+ 
++/*
++ * Boot timeline (boot-arg sweetts=1). The console log is the only trace of
++ * what the kernel does between early start and launchd, and it has no
++ * timestamps: a 31 s hole in it cannot be attributed to anything. With
++ * sweetts=1 every line that reaches the console is prefixed with
++ * "[seconds.milliseconds] " taken from the ARM generic timer, which counts
++ * from reset, so gaps in the log become gaps in time.
++ *
++ * The prefix is a fixed 13 bytes ("[" 6 digits "." 3 digits "] ") so a
++ * chunk's ring space can be reserved with one atomic add before writing.
++ */
++#define SWEET_TS_LEN    13u
++
++static uint32_t
++sweet_ts_prefix(char *out)
++{
++	static const uint32_t digits[6] = { 100000u, 10000u, 1000u, 100u, 10u, 1u };
++	char msbuf[3];
++
++	uint64_t ns = 0;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	uint64_t secs = ns / NSEC_PER_SEC;
++	uint32_t ms = (uint32_t)((ns % NSEC_PER_SEC) / NSEC_PER_MSEC);
++	uint32_t n = 0;
++	if (secs > 999999) {
++		secs = 999999;           /* saturate: 11.5 days of uptime */
++	}
++	msbuf[0] = (char)('0' + ms / 100);
++	msbuf[1] = (char)('0' + (ms / 10) % 10);
++	msbuf[2] = (char)('0' + ms % 10);
++	out[n++] = '[';
++	for (int i = 0; i < 6; i++) {
++		out[n++] = (char)('0' + (secs / digits[i]) % 10);
++	}
++	out[n++] = '.';
++	out[n++] = msbuf[0];
++	out[n++] = msbuf[1];
++	out[n++] = msbuf[2];
++	out[n++] = ']';
++	out[n++] = ' ';
++	return n;
++}
++
+ /* Called for all console output, any context: never blocks. */
+ void sweet_log_append(const char *c, int size);
+ 
+@@ -694,10 +743,45 @@
+ 	if (size <= 0) {
+ 		return;
+ 	}
+-	uint64_t at = os_atomic_add_orig(&sweet_log_total, (uint64_t)size, relaxed);
++	if (!sweet_ts) {
++		uint64_t at = os_atomic_add_orig(&sweet_log_total, (uint64_t)size, relaxed);
++		for (int i = 0; i < size; i++) {
++			sweet_log_ring[(at + (uint64_t)i) % SWEET_LOG_SIZE] = c[i];
++		}
++		return;
++	}
++
++	/* Count the prefixes this chunk will need, then reserve once. */
++	uint32_t prefixes = 0;
++	bool bol = sweet_ts_bol;
+ 	for (int i = 0; i < size; i++) {
+-		sweet_log_ring[(at + (uint64_t)i) % SWEET_LOG_SIZE] = c[i];
++		if (bol) {
++			prefixes++;
++			bol = false;
++		}
++		if (c[i] == '\n') {
++			bol = true;
++		}
++	}
++	uint64_t at = os_atomic_add_orig(&sweet_log_total,
++	    (uint64_t)size + (uint64_t)prefixes * SWEET_TS_LEN, relaxed);
++	uint64_t pos = at;
++	bol = sweet_ts_bol;
++	for (int i = 0; i < size; i++) {
++		if (bol) {
++			char ts[SWEET_TS_LEN];
++			(void)sweet_ts_prefix(ts);
++			for (uint32_t k = 0; k < SWEET_TS_LEN; k++) {
++				sweet_log_ring[(pos++) % SWEET_LOG_SIZE] = ts[k];
++			}
++			bol = false;
++		}
++		sweet_log_ring[(pos++) % SWEET_LOG_SIZE] = c[i];
++		if (c[i] == '\n') {
++			bol = true;
++		}
+ 	}
++	sweet_ts_bol = bol;
+ }
+ 
+ /*

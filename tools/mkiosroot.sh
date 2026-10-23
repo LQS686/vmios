@@ -16,6 +16,8 @@
 # cryptex shared cache (ignition_level=1 looks there), and
 # /private/var/keybags/systembag.kb is the plain-plist system keybag that
 # keybagd reads with /defaults/no-effaceable-storage (tools/mkadt.py).
+# tools/dsc-patch.py also rewrites the two GPU-wait sites in the shared cache
+# (see BOOT_FIXES.md); SWEET_DSC_FIX=0 turns that off.
 set -euo pipefail
 
 [[ $# -ge 4 ]] || { sed -n '2,12p' "$0"; exit 2; }
@@ -24,7 +26,7 @@ os=$(realpath "$1") sysos=$(realpath "$2") appos=$(realpath "$3") out=$4 size=${
 
 # Pre-flight tool check
 missing_tools=()
-for tool in apfs-fuse mkfs.hfsplus rsync; do
+for tool in apfs-fuse mkfs.hfsplus rsync python3; do
 	command -v "$tool" >/dev/null 2>&1 || missing_tools+=("$tool")
 done
 
@@ -109,6 +111,18 @@ for c in OS App; do
 		fi
 	done
 done
+
+# Two userland waits in the shared cache assume a working GPU:
+# QuartzCore polls 300 x 100 ms for IOAcceleratorES (30 s of the main thread,
+# once per process) and IOSurface waits up to 240 s for IOCoreSurfaceRoot.
+# Both are single unslid instructions; tools/dsc-patch.py verifies the bytes
+# before writing and records an undo file next to the image. Set
+# SWEET_DSC_FIX=0 to keep the cache pristine (e.g. for an A/B boot).
+if [[ ${SWEET_DSC_FIX:-1} != 0 ]]; then
+	here=$(cd "$(dirname "$0")" && pwd)
+	sudo python3 "$here/dsc-patch.py" --root "$work/root" --presets all -y \
+		--undo-out "$out.dsc-undo.json"
+fi
 
 # logd's log stores, normally made at restore: it checks owner _logd (272)
 # and mode, plus a .migrated marker, else asks a helper and crashes

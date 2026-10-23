@@ -15,10 +15,22 @@ README and it does not replace it.
 - The app's iOS branch was tested with a 64 MB HFS+ test root and a UFS
   payload: the guest logs `SWEET UFS: "userdata" on LUN 0: first block 0x22,
   64 MiB`, mounts the volume and runs `/sbin/launchd` as PID 1.
-- Touch works end to end in the app: a payload built with the QEMU input
-  patches reaches `SWEET TOUCH: selected GT9896 Yellowstone`; the app's
-  touches go through a Unix socket into `vm/qemu/sweet_touch.c`. Hardware
-  keys are not modelled yet.
+- Touch works end to end on a real phone (Redmi K70 Pro, 2026-10-23): the
+  guest reaches `SWEET TOUCH: selected GT9896 Yellowstone, 1080x2400, poll=10ms`
+  and `SWEET HID: touch 0 down/up` arrive in pairs - a swipe in the VM walked
+  iOS Setup from the Hello screen to the country picker. Two kernel-side
+  defects had to be fixed first (the L11C rail vote aborted the probe, and a
+  lift report was treated as "no new frame"); see `../docs/BOOT_FIXES.md` §11.
+  Hardware keys are not modelled: `sweetkeys=1` panics under QEMU because the
+  SPMI driver reads an unemulated PMIC.
+- **MTTCG is reachable from the payload.** `VmEngine` reads `tcgmulti=1` from
+  the command line and switches `-accel` from `tcg,thread=single` to
+  `tcg,thread=multi`, so multi-vCPU runs need a payload change, not an APK
+  rebuild. Verified to boot (`/proc/<pid>/cmdline` shows `thread=multi`, five
+  threads) and to reach the present loop without the pset0 ticket-lock
+  deadlock. It did not make the UI fast enough to use: rendering is still a
+  1125x2436 software rasterizer on emulated CPU, see `../docs/BOOT_FIXES.md`
+  §10 and §12.
 - Host QEMU (2 vCPU, MTTCG) with the bring-up image patches now reaches the
   real iOS lock screen and, after skipping Setup, the SpringBoard home
   screen; unlock swipes and Setup taps go through the GENI+GT9896 model.
@@ -126,3 +138,49 @@ QEMU is GPLv2; the engine assets contain a QEMU build. The source is upstream
 QEMU 8.2.0 plus the patch and driver in [`../vm/qemu/`](../vm/qemu/). Termux's
 GLib/pixman and dependency builds are used unchanged. See
 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
+
+## Building the APK on a Windows host (no Android Studio)
+
+The build only needs a JDK and the SDK command line tools; both can live inside
+the repository's ignored `.tools/` so nothing is installed system-wide.
+
+```sh
+# JDK 17 (AGP 8.7.3 needs 17+). Any mirror works; this one is fast in CN.
+curl -L -o .tools/dl/jdk17.zip \
+  https://mirrors.tuna.tsinghua.edu.cn/Adoptium/17/jdk/x64/windows/OpenJDK17U-jdk_x64_windows_hotspot_17.0.20.1_1.zip
+unzip -q .tools/dl/jdk17.zip -d .tools/dl/jdk && mv ".tools/dl/jdk/jdk-17.0.20.1+1" .tools/jdk
+
+# SDK: platform 35 + build-tools 35.0.0
+curl -L -o .tools/dl/cmdtools.zip \
+  https://dl.google.com/android/repository/commandlinetools-win-11076708_latest.zip
+unzip -q .tools/dl/cmdtools.zip -d .tools/dl/cmdtools
+mkdir -p .tools/android-sdk/cmdline-tools
+cp -r .tools/dl/cmdtools/cmdline-tools .tools/android-sdk/cmdline-tools/latest
+yes | .tools/android-sdk/cmdline-tools/latest/bin/sdkmanager.bat \
+  --sdk_root="$PWD/.tools/android-sdk" --licenses
+.tools/android-sdk/cmdline-tools/latest/bin/sdkmanager.bat \
+  --sdk_root="$PWD/.tools/android-sdk" "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+
+# Gradle 8.9 (services.gradle.org is slow here; the mirrors are not)
+curl -L -o .tools/dl/gradle.zip https://mirrors.huaweicloud.com/gradle/gradle-8.9-bin.zip
+unzip -q .tools/dl/gradle.zip -d .tools/gradle
+
+printf 'sdk.dir=%s\n' "$(cygpath -w "$PWD/.tools/android-sdk" | sed 's/\\/\\\\/g; s/:/\\:/')" \
+  > android/local.properties
+
+JAVA_HOME="$PWD/.tools/jdk" ANDROID_HOME="$PWD/.tools/android-sdk" \
+  .tools/gradle/gradle-8.9/bin/gradle.bat -p android assembleDebug --no-daemon
+# -> android/app/build/outputs/apk/debug/app-debug.apk
+```
+
+Two host-specific traps:
+
+- **Non-ASCII build path.** AGP refuses a project under a CJK path (this repo
+  lives under `桌面/`); `android.overridePathCheck=true` in
+  `android/gradle.properties` lifts that check, and the build then works.
+- **Signature mismatch on install.** `adb install -r` fails against an APK that
+  was signed with a different debug key
+  (`INSTALL_FAILED_UPDATE_INCOMPATIBLE`). Uninstalling deletes the app's data,
+  i.e. the 16 GiB root image, so plan for it: keep a patched copy of the image
+  on the host (`tools/image-patch.py apply` works on the raw file) and push it
+  back afterwards.

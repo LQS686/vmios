@@ -1,0 +1,183 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -49,6 +49,7 @@
+ extern void thread_deallocate(thread_t);
+ extern int hz;
+ static void sweet_log_start(void);
++static void ufs_stats_start(void);
+ extern void sweet_sample_start(void);
+ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
+@@ -121,6 +122,51 @@
+ static bool sweet_ts;
+ static bool sweet_ts_bol = true;         /* next byte starts a line */
+ 
++/*
++ * Command statistics (boot-arg ufsstats=1, report every ufsstatsecs=10 s).
++ * One command at a time on slot 0 makes the controller a serial resource;
++ * these counters show what it is actually asked to do and how long each
++ * command takes, which is the input to "should the bounce buffer, the slot
++ * count or the delay(1) polling change". They also show whether ufswait=1
++ * really converts spinning into sleeping (slept vs cmds).
++ *
++ * ufs_scsi() runs under sweet_ufs_lock, so the counters need no atomics;
++ * the reporter copies them under the same lock.
++ */
++static bool ufs_stats_on;
++static uint32_t ufs_stats_secs = 10;
++static int ufs_stats_chan;
++static uint64_t ufs_st_cmds, ufs_st_reads, ufs_st_writes, ufs_st_bytes;
++static uint64_t ufs_st_ns, ufs_st_max_ns, ufs_st_slept, ufs_st_errors;
++
++/* Called at the end of every command, under sweet_ufs_lock. */
++static void
++ufs_stat(uint64_t t0, uint32_t len, bool write, bool slept, bool ok)
++{
++	if (!ufs_stats_on) {
++		return;
++	}
++	uint64_t ns = 0;
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	ufs_st_cmds++;
++	if (write) {
++		ufs_st_writes++;
++	} else {
++		ufs_st_reads++;
++	}
++	if (!ok) {
++		ufs_st_errors++;
++	}
++	ufs_st_bytes += len;
++	ufs_st_ns += ns;
++	if (slept) {
++		ufs_st_slept++;
++	}
++	if (ns > ufs_st_max_ns) {
++		ufs_st_max_ns = ns;
++	}
++}
++
+ static inline uint32_t
+ ufs_rd(uint32_t off)
+ {
+@@ -209,6 +255,8 @@
+ 	__builtin_arm_dsb(0xf);
+ 
+ 	ufs_wr(REG_UTRLDBR, 1);
++	uint64_t t0 = mach_absolute_time();     /* latency: doorbell to completion */
++	bool slept = false;
+ 	uint64_t deadline;
+ 	nanoseconds_to_absolutetime(CMD_TIMEOUT_NS, &deadline);
+ 	deadline += mach_absolute_time();
+@@ -225,6 +273,7 @@
+ 		if (now > deadline) {
+ 			ufs_wr(REG_UTRLCLR, ~1u);
+ 			printf("SWEET UFS: command 0x%02x timed out\n", cdb[0]);
++			ufs_stat(t0, len, write, slept, false);
+ 			return ETIMEDOUT;
+ 		}
+ 		if (sleepable && now >= spin_until) {
+@@ -233,6 +282,7 @@
+ 			if (assert_wait_deadline_with_leeway((event_t)&su.wait, THREAD_UNINT,
+ 			    TIMEOUT_URGENCY_SYS_CRITICAL, wake, 0) == THREAD_WAITING) {
+ 				thread_block(THREAD_CONTINUE_NULL);
++				slept = true;
+ 			}
+ 		} else {
+ 			delay(1);
+@@ -255,8 +305,10 @@
+ 	if (ocs || ucd->resp[0] != 0x21 || ucd->resp[6] || ucd->resp[7]) {
+ 		printf("SWEET UFS: command 0x%02x failed: ocs 0x%x upiu 0x%x response 0x%x status 0x%x\n",
+ 		    cdb[0], ocs, ucd->resp[0], ucd->resp[6], ucd->resp[7]);
++		ufs_stat(t0, len, write, slept, false);
+ 		return EIO;
+ 	}
++	ufs_stat(t0, len, write, slept, true);
+ 	return 0;
+ }
+ 
+@@ -605,13 +657,16 @@
+ 	PE_parse_boot_argn("ufsroot", want, sizeof(want));
+ 	uint32_t rw = 0;
+ 	PE_parse_boot_argn("ufsrw", &rw, sizeof(rw));
+-	uint32_t cache = 0, wait = 0, ts = 0;
++	uint32_t cache = 0, wait = 0, ts = 0, stats = 0;
+ 	PE_parse_boot_argn("ufscache", &cache, sizeof(cache));
+ 	PE_parse_boot_argn("ufswait", &wait, sizeof(wait));
+ 	PE_parse_boot_argn("sweetts", &ts, sizeof(ts));
++	PE_parse_boot_argn("ufsstats", &stats, sizeof(stats));
+ 	su.cache = (cache == 1);
+ 	su.wait = (wait == 1);
+ 	sweet_ts = (ts == 1);
++	/* Counted from the first probe command, not from the reporter start. */
++	ufs_stats_on = (stats == 1);
+ 
+ 	su.regs = ml_io_map(reg[0], reg[1]);
+ 	if (kmem_alloc_contig(kernel_map, &su.dma, DMA_SIZE, PAGE_MASK, 0, 0,
+@@ -661,6 +716,7 @@
+ 	    want, su.lun, su.first_block, su.nblocks * UFS_BLOCK >> 20,
+ 	    su.writable ? "read-write" : "read-only", su.dma_pa);
+ 	sweet_log_start();
++	ufs_stats_start();
+ 	sweet_sample_start();
+ 	/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */
+ 	sweet_keys_init();
+@@ -888,6 +944,58 @@
+ 		thread_deallocate(thread);
+ 	}
+ }
++
++/*
++ * Reporter for ufsstats=1. A command that stays in the spin phase although
++ * ufswait=1 means the caller was in interrupt context or held a preemption
++ * level; the slept/cmds ratio is what decides whether the sleep path is
++ * worth keeping.
++ */
++static void
++ufs_stats_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	uint64_t last_cmds = 0, last_bytes = 0, last_ns = 0;
++
++	printf("SWEET UFS: statistics every %u s (ufsstats=1)\n", ufs_stats_secs);
++	for (;;) {
++		(void)tsleep(&ufs_stats_chan, PZERO, "ufsstat", hz * (int)ufs_stats_secs);
++
++		lck_mtx_lock(&sweet_ufs_lock);
++		uint64_t cmds = ufs_st_cmds, bytes = ufs_st_bytes, ns = ufs_st_ns;
++		uint64_t max_ns = ufs_st_max_ns, slept = ufs_st_slept, errors = ufs_st_errors;
++		uint64_t reads = ufs_st_reads, writes = ufs_st_writes;
++		lck_mtx_unlock(&sweet_ufs_lock);
++
++		if (cmds == last_cmds) {
++			continue;               /* idle: nothing changed */
++		}
++		uint64_t delta = cmds - last_cmds;
++		printf("SWEET UFS: %llu cmds (%llu rd/%llu wr, +%llu), %llu KiB (+%llu), "
++		    "avg %llu us, max %llu us, slept %llu, errors %llu\n",
++		    cmds, reads, writes, delta, bytes >> 10, (bytes - last_bytes) >> 10,
++		    (ns - last_ns) / delta / 1000, max_ns / 1000, slept, errors);
++		last_cmds = cmds;
++		last_bytes = bytes;
++		last_ns = ns;
++	}
++}
++
++static void
++ufs_stats_start(void)
++{
++	thread_t thread;
++
++	if (!ufs_stats_on) {
++		return;
++	}
++	PE_parse_boot_argn("ufsstatsecs", &ufs_stats_secs, sizeof(ufs_stats_secs));
++	if (ufs_stats_secs == 0 || ufs_stats_secs > 60) {
++		ufs_stats_secs = 10;
++	}
++	if (kernel_thread_start(ufs_stats_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
+ 
+ /* Root device for rd=ufsroot0 (IOFindBSDRoot). */
+ int sweet_ufs_rootdev(dev_t *dev);

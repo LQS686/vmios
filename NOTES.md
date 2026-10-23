@@ -1,5 +1,37 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+### >>> BOOT / GPU ANALYSIS (2026-10-23): docs/BOOT_ANALYSIS.md <<<
+
+**Measured:** 7 boots reach launchd at 31.3-31.7 s, launchd's early-boot tasks finish at 35-36 s, and the remaining ~200 s is SpringBoard blocked in a LaunchServices sync XPC (`__ulock_wait`-class syscall 515 + `mach_msg2`). The 90 s / 210 s / 330 s samples in `artifacts/ios-clean-log.txt` show the **same stack three times**; `lock-log.txt` reproduces it. So the 4-minute logo is a wait chain (SpringBoard -> FrontBoard -> CoreServices -> lsd), not CPU work: backboardd and `CA::Render::Server` are idle in the same samples.
+
+**Disassembled hard timeouts in the shared cache:** QuartzCore `___CAMetalContextCreate_block_invoke` polls `IOAcceleratorES` x300 with `usleep(100 ms)` = **30 s per process** (VA `0x18853e6b4`, `dyld_shared_cache_arm64.03` @ file 0x17b26b4); `IOSurface __iosConnectInitalize` waits **240 x 1 s = 4 min** for `IOCoreSurfaceRoot` (VA `0x1a3983c98`, `.11`) — latent only, the kernel registers the service before launchd today.
+
+**Not enabled yet:** 0069's `ufscache=1` / `ufswait=1` are missing from the command line, and `cpus=6` although 0078 supports 8 (the two A76s are idle).
+
+**New tools:** `tools/macho-analyze.py` (Mach-O symbols/export/disasm/xref), `tools/dsc-frames.py` (symbolicate sampler backtraces against the split cache without macOS), `tools/dsc-patch.py` (unslid VA -> subcache offset, verify + write + undo; presets `metal-wait-300ms`, `iosurface-wait-3s`, tested on the real cache).
+
+**Next:** (1) boot with `sweetsample=SpringBoard,lsd,backboardd,containermanagerd` and pull the log to see where lsd actually sits; (2) add kernel timestamps (`sweetts=1`) and UFS counters to split the 31.5 s before launchd; (3) apply the Metal wait patch at image build.
+
+### >>> BOOT FIXES LANDED (2026-10-23 late): docs/BOOT_FIXES.md <<<
+
+**Shipped:** (a) `tools/mkiosroot.sh` now patches the split shared cache during the build (`dsc-patch.py --presets all`, `SWEET_DSC_FIX=0` to skip, undo sidecar next to the image); `dsc-patch.py` grew `--root/--presets/--check/--undo-out`, is idempotent and verifies by read-back (round trip tested on `research/dsc-test`). (b) boot-args now come from one place, `tools/bootargs.py` (`--profile device|timing|sample|qemu|probe`, 255–347 bytes vs the 607-byte limit) and `mkpayload.py --profile`; `device` adds `ufscache=1 ufswait=1 cpus=8`, so 0069's options finally reach the driver. (c) kernel `0083-sweet-console-timestamps.patch` (`sweetts=1`: fixed 13-byte `[ssssss.mmm]` prefix injected in `sweet_log_append`, one atomic reservation per chunk, covers kernel and `/dev/console`). (d) kernel `0084-sweet-ufs-stats.patch` (`ufsstats=1 ufsstatsecs=5`: cmds/rd/wr/bytes/avg/max/slept/errors from doorbell to completion). (e) `tools/boot-timeline.py` (+ `tools/sweetlog.py` shared decoder) turns a timed log into "largest silences and what surrounded them". (f) `sweet-root-tweaks.py: daemons()` removes the `bluetoothd` and `fairplayd.H2` LaunchDaemons by executable name (30–35 exec attempts per boot, impossible hardware), `SWEET_KEEP_DAEMONS=1` keeps them.
+
+**Verified offline:** both patches apply cleanly on a 8796.141.3 tree with 0001–0082 applied and reproduce the working file byte for byte; `mkiosroot.sh`/`sweet-root-tweaks.py` pass `bash -n`; payload builds with `--profile device`; daemon removal unit-tested on a synthetic `launchd.plist`; timeline tool tested on a synthetic log and degrades cleanly on `phone-klog3.bin` (no prefixes).
+
+**Still needs the phone:** a `--profile timing` boot (splits the 31.5 s) and a `--profile sample` boot (lsd's own stack). No device attached in this session, so neither has been run.
+
+### >>> FIRST MEASUREMENT ON THE PHONE (2026-10-23 late): SweetVM, not the Note 10 Pro <<<
+
+**The device that connected is the VM host, and the earlier "hardware" numbers were the VM.** K70 Pro (shennong/pineapple, Android 16) with `dev.hackios.sweetvm` installed, a 16 GiB `ios16-root.img` and `payload.bin` in app storage. Every log in `artifacts/` says `SWEET CPU: requested=1 selected=1`, `vm_page_bootstrap: 76090 free pages` (~1.19 GB), `DMA at 0xb33d8000` and userdata `first block 0x22` — QEMU `-M virt -cpu cortex-a76 -smp N -accel tcg,thread=single,tb-size=512`, where `N` is the `cpus=` from the payload. Corrected in `BOOT_ANALYSIS.md` §2 and written up in `BOOT_FIXES.md` §8.
+
+**A/B on the shared-cache patch (4 runs, same payload/image, only 8 bytes differ):** base 0/2 runs reached the present loop (65 888 B/seq 22 and 70 356 B/seq 30); patched 2/2 did (65 704 B/seq 23, 68 172 B/seq 24), both at ~210-220 s guest. So `metal-wait-300ms` lands in the VM: the "renders surfaces but sits on the boot logo" state was partly the 30 s usleep loop. `-smp` and the wait are the only variables; `tools/vm-probe.py` + `tools/compare-runs.py` did the timing off the SWEETLOG flush counter, not the wall clock.
+
+**Two new tools that made it possible without mounting HFS anywhere:** `tools/image-patch.py` scans a raw image for `dyld_v1` and resolves the site through each member's mapping table (member_start + VA is wrong — the VA→file offset lives in the mapping info); `tools/phone-patch.py` does the 4 KiB read/modify/write through `run-as` + base64 (adb on Windows mangles binary and MSYS mangles `/sdcard/...`).
+
+**cpus=2 does not help:** rebuilt with `--profile vm`, same numbers as 1 vCPU. `thread=single` round-robins every vCPU on one host thread, so `-smp` buys nothing; MTTCG is the only real lever and it still deadlocks SWEET's pset0 ticket lock. Screenshot after 6 min: black screen with one vertical line (`artifacts/vm-2cpu-screen.png`) — frames are being presented, the content is not a lock screen, so rendering is now a separate line of work.
+
+**lsd answered (P0-3):** `artifacts/vm-lsd-stacks.txt` — main thread idle in its own XPC loop, workers inside `CoreServices+0x118cc0`/`+0x21ff8` (CF + malloc) and `UserManagement`. lsd is not waiting on a missing service; it is building the LaunchServices database on one emulated core.
+
 ### >>> ANDROID VM / QEMU PATH (2026-10-23, separate from the phone port) <<<
 
 **State:** added an experimental Android app (`android/`, SweetVM) that runs the
@@ -730,3 +762,18 @@ What it took today (in order): 0058 HID services (Apple IOHIDFamily-1915 user cl
      cpu_init, before arm_vm_init.
   5. panic hook at top of panic_trap_to_debugger: va_copy + _doprnt(fmt, &copy, sweet_early_putc, 16).
   Verify with tools/xnu-cc.py (compile+symbols) and patch-order simulation before the single CI run.
+
+### >>> TOUCH IS ALIVE, AND THE STUTTER IS NOT A GPU PROBLEM (2026-10-23, after midnight) <<<
+
+Two kernel defects blocked every gesture, both now fixed in source and, because there is no Xcode here, also in the built kernel via `tools/kernel-patch.py` (byte-checked sites, undo sidecar):
+
+1. `sweet_touch_init()` voted the L11C rail through RPMh; QEMU does not emulate that block (reads back `0xffffffff`), the vote returned ENODEV and the driver `goto out`, so the GT9896 was never probed. `artifacts/nocc-log2.txt` proves the same VM probed it fine before that vote existed. Fix: kernel 0085 (warn and keep going); binary preset `touch-skip-rail-vote` at `0x74E9AAC`.
+2. The QEMU model only sets the report's "valid" bit while the state file says down, so a lift looked like "no new frame" and the driver kept `st.active` forever - the finger never came up. Fix: kernel 0086 (empty frame releases contacts) plus a model fix in `vm/qemu/sweet_touch.c` (emit one valid empty frame per lift); binary preset `touch-release-on-empty-frame` at `0x74EA06C`, which jumps to the existing `touch_report(0, x, y)` call site (w0 is still 0 from the successful `touch_read`).
+
+Verified on the K70 Pro: `SWEET HID: touch 0 down/up` in pairs, and one swipe took iOS Setup from the Hello screen to the country picker.
+
+**Performance, honestly.** There is no GPU to enable: the guest log has zero occurrences of `IOAccelerator`, `Metal` or `IOGPU`, so CoreAnimation runs its software renderer, and QEMU `-M virt` has no GPU to pass through anyway (iOS has no Adreno driver either). Per frame the guest rasterizes 1125x2436 and the kernel memcpys 10.4 MB into the 1080x2400 panel; measured 16.5 fps during animation. The three levers are resolution (ADT + kernel + app), MTTCG (engine), and dropping redundant presents (little to gain - presents are already change-driven).
+
+`VmEngine` now takes `tcgmulti=1` from the command line and uses `-accel tcg,thread=multi`; `tools/bootargs.py vm-mttcg` is the profile. It boots, shows five threads in `/proc/<pid>/cmdline`, and does **not** trip the pset0 ticket lock - but it is not the fix for responsiveness, the software rasterizer is.
+
+The APK can be built on Windows without Android Studio; the whole recipe (JDK 17, SDK 35, Gradle 8.9 from mirrors, `android.overridePathCheck=true` for the CJK path, and the signature mismatch that forces an uninstall + 16 GiB image re-push) is in `android/README.md`.

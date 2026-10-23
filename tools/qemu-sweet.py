@@ -12,7 +12,8 @@ virt RAM starts at 0x40000000; with 4G it covers the phone's framebuffer
 After N seconds (or when the guest stops) it writes into OUTDIR:
   fb.png     the 1080x2400 framebuffer (what the phone screen would show)
   regs.txt   QEMU's view of CPU state
-  qemu.log   exceptions with ESR/FAR/ELR (-d int,guest_errors)
+  qemu.log   exceptions with ESR/FAR/ELR (only with --qemu-debug; the
+             default logging costs tens of MB per minute of boot)
 
 With --kernel KERNEL (the matching unstripped Mach-O), also decode the
 framebuffer using its iso_font into fb.txt and write result.json. This is a
@@ -242,6 +243,8 @@ def main():
                     help='feed sweet-touch from a 5-byte state file instead of a chardev')
     ap.add_argument('--incoming', metavar='FILE',
                     help='restore a VM state written by QMP migrate file:...')
+    ap.add_argument('--qemu-debug', action='store_true',
+                    help='log every exception to qemu.log (-d int,guest_errors,unimp); slow, off by default')
     a = ap.parse_args()
 
     if a.check_env:
@@ -291,7 +294,9 @@ def main():
            '-smp', str(a.smp), '-m', f'{ram_gib}G',
            '-accel', ('tcg,thread=single' if a.tcg_single or a.smp == 1 else 'tcg,thread=multi') + ',tb-size=512',
            '-nographic', '-serial', f'file:{out}/serial.txt', '-qmp', f'unix:{mon},server,nowait',
-           '-d', 'int,guest_errors,unimp', '-D', f'{out}/qemu.log', '-no-reboot']
+           '-no-reboot']
+    if a.qemu_debug:
+        cmd += ['-d', 'int,guest_errors,unimp', '-D', f'{out}/qemu.log']
     if a.shared_ram:
         cmd += ['-object', f'memory-backend-file,id=ram,size={ram_gib}G,mem-path={out}/guest-ram.bin,share=on',
                 '-numa', 'node,memdev=ram']

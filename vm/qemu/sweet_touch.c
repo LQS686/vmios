@@ -92,6 +92,7 @@ struct SweetTouchState {
     uint32_t rx_words;
 
     bool touch_down;
+    bool touch_release;                 /* a lift still has to be reported */
     uint16_t touch_x;
     uint16_t touch_y;
     int touch_fd;
@@ -147,6 +148,9 @@ static void sweet_touch_sync_file(SweetTouchState *s)
         uint16_t x = b[1] | (b[2] << 8);
         uint16_t y = b[3] | (b[4] << 8);
         memcpy(s->touch_raw, b, sizeof(b));
+        if (s->touch_down && b[0] == 0) {
+            s->touch_release = true;
+        }
         s->touch_down = b[0] != 0;
         s->touch_x = x >= 1080 ? 1079 : x;
         s->touch_y = y >= 2400 ? 2399 : y;
@@ -172,13 +176,21 @@ static void build_report(SweetTouchState *s, uint32_t nr)
         b[10] = 0x03;
         b[11] = 0x04;
     } else if (s->pointer == 0x4180) {
-        bool down;
+        bool down, release;
         qemu_mutex_lock(&s->lock);
         down = s->touch_down;
+        release = s->touch_release;
+        s->touch_release = false;
         qemu_mutex_unlock(&s->lock);
-        if (down) {
+        /*
+         * Bit 7 marks "touch data valid" and b[2] is the contact count. While
+         * down: one contact. On the lift: still a valid frame, but with zero
+         * contacts - that is how the IC says "every finger is up", and a
+         * driver that only ever sees the first shape never ends a gesture.
+         */
+        if (down || release) {
             b[0] = 0x80;
-            b[2] = 1;
+            b[2] = down ? 1 : 0;
         }
         unsigned sum = 0;
         for (unsigned i = 0; i < 6; i++) {

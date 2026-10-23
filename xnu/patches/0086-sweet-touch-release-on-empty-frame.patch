@@ -1,0 +1,21 @@
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -398,7 +398,17 @@
+ 		if (buf[0] & 0x40u) {
+ 			return ENOTSUP;
+ 		}
+-		return 0; /* no new touch frame: retain current contacts */
++		/*
++		 * Bit 7 clear with a healthy header is the lift report: the vendor
++		 * firmware stops marking the frame valid once the last finger is up.
++		 * Keeping st.active forever makes UIKit see a finger that never
++		 * leaves, so no gesture can complete. Release only if something is
++		 * actually held, so a busy-polling driver costs nothing when idle.
++		 */
++		if (st.active) {
++			touch_report(0, x, y);
++		}
++		return 0;
+ 	}
+ 	if (!touch_checksum(buf, GOODIX_HEAD_LEN)) {
+ 		return EIO; /* header untrusted: no write to the IC */

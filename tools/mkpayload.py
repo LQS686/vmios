@@ -196,11 +196,24 @@ def build(kernel_path, adt_path, cmdline, ramdisk_path=None):
 if __name__ == '__main__':
     ap = argparse.ArgumentParser()
     ap.add_argument('kernel'); ap.add_argument('adt'); ap.add_argument('out')
-    ap.add_argument('--cmdline', default='debug=0xc serial=3 cpus=1 keepsyms=1')
+    ap.add_argument('--cmdline', help='boot-args, verbatim')
+    ap.add_argument('--profile',
+                    help="named boot-arg set from tools/bootargs.py ('device' for the phone)")
     ap.add_argument('--ramdisk', help='root image for md0 (boot with rd=md0)')
     a = ap.parse_args()
-    blob, info = build(a.kernel, a.adt, a.cmdline, a.ramdisk)
+    if a.profile:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import bootargs
+        if a.profile not in bootargs.PROFILES:
+            ap.error('unknown profile %r (have: %s)'
+                     % (a.profile, ', '.join(bootargs.PROFILES)))
+        cmdline = bootargs.PROFILES[a.profile]
+    else:
+        # Kernel-only default: no root, no drivers. The phone boots --profile device.
+        cmdline = a.cmdline or 'debug=0xc serial=3 cpus=1 keepsyms=1'
+    blob, info = build(a.kernel, a.adt, cmdline, a.ramdisk)
     open(a.out, 'wb').write(blob)
+    print('cmdline: %s' % cmdline)
     for k, v in info.items():
         if k != 'segs':
             print(f'{k}: {v}')

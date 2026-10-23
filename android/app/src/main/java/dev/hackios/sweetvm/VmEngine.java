@@ -72,7 +72,7 @@ public final class VmEngine {
     public void start(File payloadFile, File rootFile, String cmdline, int fps,
                       boolean resume, Listener listener) throws Exception {
         stop();
-        this.fps = Math.max(1, Math.min(15, fps));
+        this.fps = Math.max(1, Math.min(30, fps));
         File vmDir = new File(ctx.getFilesDir(), "vm");
         if (!vmDir.isDirectory() && !vmDir.mkdirs()) {
             throw new IOException("无法创建 VM 目录");
@@ -126,9 +126,15 @@ public final class VmEngine {
         cmd.add("-cpu"); cmd.add("cortex-a76");
         cmd.add("-smp"); cmd.add(Integer.toString(cpus));
         cmd.add("-m"); cmd.add(RAM_GIB + "G");
-        // MTTCG deadlocks SWEET's pset0 ticket lock under install/Setup load.
+        // MTTCG used to deadlock SWEET's pset0 ticket lock under install/Setup
+        // load, so single-threaded TCG is the default and every vCPU time-shares
+        // one host core (-smp then buys nothing). `tcgmulti=1` on the command
+        // line switches to thread=multi so the experiment needs a payload, not
+        // an APK rebuild; XNU ignores the unknown boot-arg.
+        boolean mttcg = cmdline.contains("tcgmulti=1");
         // A large TB cache matters for the multi-hundred-MB dyld shared cache.
-        cmd.add("-accel"); cmd.add("tcg,thread=single,tb-size=512");
+        cmd.add("-accel");
+        cmd.add(mttcg ? "tcg,thread=multi,tb-size=512" : "tcg,thread=single,tb-size=512");
         cmd.add("-display"); cmd.add("none");
         cmd.add("-serial"); cmd.add("file:" + serial.getAbsolutePath());
         cmd.add("-monitor"); cmd.add("none");
@@ -199,6 +205,30 @@ public final class VmEngine {
         startReader(guestRam, payload, listener);
     }
 
+    /** Words sampled per tick to tell "new frame" from "same picture again". */
+    private static final int PROBE_WORDS = 256;
+
+    /**
+     * A full 1080x2400 frame is 10.4 MB. Copying it on every tick regardless of
+     * what the guest did costs a memcpy plus a texture upload for a picture that
+     * has not changed (iOS only presents on change, so most ticks have nothing
+     * new). Sample PROBE_WORDS words spread over the panel - a few hundred
+     * reads - and let the caller skip the copy when nothing moved.
+     */
+    private static boolean changed(MappedByteBuffer map, int[] probe, int[] last, boolean haveLast) {
+        int words = Payload.FB_STRIDE * Payload.FB_H / 4;
+        int stride = Math.max(1, words / PROBE_WORDS);
+        boolean diff = !haveLast;
+        for (int i = 0; i < PROBE_WORDS; i++) {
+            int v = map.getInt(i * stride * 4);
+            probe[i] = v;
+            if (haveLast && v != last[i]) {
+                diff = true;
+            }
+        }
+        return diff;
+    }
+
     private void startReader(File guestRam, Payload payload, Listener listener) {
         reader = new Thread(() -> {
             FileChannel ch = null;
@@ -214,10 +244,15 @@ public final class VmEngine {
                 }
             }
             long sleep = Math.max(16, 1000 / fps);
+            int[] probe = new int[PROBE_WORDS];
+            int[] lastProbe = new int[PROBE_WORDS];
+            boolean haveLast = false;
             try {
                 while (running) {
                     FramebufferView v = view;
-                    if (map != null && v != null) {
+                    if (map != null && v != null && changed(map, probe, lastProbe, haveLast)) {
+                        System.arraycopy(probe, 0, lastProbe, 0, probe.length);
+                        haveLast = true;
                         v.copyFromBuffer(map);
                         frames++;
                     }

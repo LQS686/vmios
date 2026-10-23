@@ -11,7 +11,9 @@ screen (image versions v8-v14 in NOTES.md):
 
   launchd.plist   _PanicOnCrash -> _PanicOnCrasX (a crashing daemon must not
                   panic the system); CommCenter jobs removed (no baseband: it
-                  crash-loops and Setup blocks on its CoreTelephony XPC)
+                  crash-loops and Setup blocks on its CoreTelephony XPC);
+                  bluetoothd and fairplayd.H2 removed (no Apple BT firmware, no
+                  hardware AES: 30-35 exec attempts per boot, all failing)
   containers      /private/var/containers/{Bundle,Data/System,Shared/SystemGroup,Temp}
                   (on iOS they live on the data volume)
   migration       LastSystemVersion so DataMigration does not run for an hour
@@ -31,6 +33,9 @@ import glob, os, plistlib, shutil, sys
 
 BUILD, VERSION = '20H392', '16.7.16'
 MOBILE = 501
+
+# Executables whose hardware does not exist here; see daemons().
+DISABLE_PROGRAMS = {'bluetoothd', 'fairplayd.H2'}
 
 
 def load(path):
@@ -54,6 +59,15 @@ def merge_pref(root, name, values):
     print('pref', name, sorted(values))
 
 
+def job_program(job):
+    """Last path component of a job's executable, whatever form the plist uses."""
+    prog = job.get('Program')
+    if not prog:
+        args = job.get('ProgramArguments') or []
+        prog = args[0] if args else ''
+    return os.path.basename(prog) if prog else ''
+
+
 def launchd(root):
     path = os.path.join(root, 'System/Library/xpc/launchd.plist')
     st = os.stat(path)
@@ -69,6 +83,39 @@ def launchd(root):
         del jobs[k]
     save(path, plist, st.st_uid, st.st_gid, st.st_mode & 0o7777)
     print(f'launchd.plist: {renamed} _PanicOnCrash renamed, {len(removed)} CommCenter jobs removed')
+
+
+def daemons(root):
+    """Drop the jobs that can never work on this hardware and only crash-loop.
+
+    The boot log shows bluetoothd and fairplayd.H2 being exec'd 30-35 times in
+    one boot, each attempt logging a dozen lines through the console ring and
+    the UFS driver: the radio is Qualcomm's (no Apple BT firmware) and
+    fairplayd.H2 needs the hardware AES coprocessor, which AppleKeyStore
+    answers with kIOReturnUnsupported on every selector. Leaving the jobs in
+    place does not give those features, only a spawn storm. Jobs are matched by
+    executable name, not label, so a missing label does not silently do nothing.
+    SWEET_KEEP_DAEMONS=1 keeps them.
+    """
+    if os.environ.get('SWEET_KEEP_DAEMONS') == '1':
+        print('daemons: kept (SWEET_KEEP_DAEMONS=1)')
+        return
+    path = os.path.join(root, 'System/Library/xpc/launchd.plist')
+    st = os.stat(path)
+    plist = load(path)
+    jobs = plist['LaunchDaemons']
+    gone = {}
+    for key, job in list(jobs.items()):
+        prog = job_program(job)
+        if prog in DISABLE_PROGRAMS:
+            gone[job.get('Label', prog)] = prog
+            del jobs[key]
+    if gone:
+        save(path, plist, st.st_uid, st.st_gid, st.st_mode & 0o7777)
+    for label, prog in sorted(gone.items()):
+        print(f'daemon removed: {label} ({prog})')
+    for prog in DISABLE_PROGRAMS - set(gone.values()):
+        print(f'warning: no LaunchDaemon runs {prog}; label differs from the expected one')
 
 
 def containers(root):
@@ -127,6 +174,7 @@ def main():
         sys.exit(__doc__)
     root = sys.argv[1]
     launchd(root)
+    daemons(root)
     containers(root)
     activation(root)
     audio(root)
