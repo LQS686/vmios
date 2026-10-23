@@ -232,3 +232,25 @@ python3 tools/qemu-sweet.py payload-ios-2cpu.bin out-fix --smp 2 \
 现在只剩 `[wsl2] swap=0`，需要按原样恢复 memory/processors 等设置。
 D: 目前只剩 7.8 GB，之后不要再整盘复制 17 GB 镜像；测试请用快照，
 或者先清理空间。
+
+## 8. 验收对照表（2026-10-24）
+
+| 目标要求 | 状态 | 证据 / 缺口 |
+|---|---|---|
+| 定位卡顿根因 | ✅ | 6 层：取帧 4 fps、漏检、单 TCG 线程、锁 125 ms、缺页、输入系统调用；§1、§2、§4.2 |
+| 区分性能瓶颈所在层面 | ✅ | §1 表格 + 手机环里的 65 SpringBoard 线程 / 0 crash |
+| 确认根因后修复 | ✅ 可发布部分 | 取帧/探测/节拍/触摸/prealloc/锁超时；§3 |
+| 修复后完整测试 | ⚠️ 部分 | 宿主 A/B、900 s 稳定、APK 与解码器自测已做；**真机未测**（无设备） |
+| 运行正常且流畅 | ⚠️ 未验证 | 手机环显示 0 crash/16 presents，但没有 `fps=` 真机数据；需 `tools/sweetvm-device-test.py` |
+| iOS 原生 App 可用 | ❌ 未达成 | 手机环里 `exec Preferences/Photos/Safari/AppStore` = 0；图标 "Waiting…"，属 MobileInstallation/SystemAppMigrator 注册问题 |
+| 说明根因/方案/结果 | ✅ | 本文档 + NOTES.md 的 handoff |
+
+**剩余工作的最短路径**
+
+1. 接手机 → `python3 tools/sweetvm-device-test.py`（含 SWEETLOG 拉取），用 `fps=` 判断
+   流畅度是否达标；不达标时优先看 `capture` 是否 30、`accel` 是否 single、
+   Guest 是否在 `SWEET FB: swap` 之外大量等待。
+2. 原生 App：抓 `installd`/`mobile_installation_proxy` 的同步 XPC（参考 NOTES 里
+   lsd 的 MG IOKit 等待），目标是让系统 App 的安装/注册完成；这一步与性能无关。
+3. 进一步提升：内核 CI 做 present 零拷贝与 UFS 异步 I/O；MTTCG 已有 2 s 锁超时
+   兜底，可在真机上用 `fps=` 对比 single/multi 后再决定是否改默认。
