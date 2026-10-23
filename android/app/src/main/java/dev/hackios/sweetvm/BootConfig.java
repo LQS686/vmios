@@ -61,11 +61,13 @@ public final class BootConfig {
     }
 
     public static File defaultRoot(Context ctx) {
-        return new File(externalDir(ctx), "ios16-root.img");
+        File ext = new File(externalDir(ctx), "ios16-root.img");
+        return ext.isFile() ? ext : new File(ctx.getFilesDir(), "ios16-root.img");
     }
 
     public static File defaultPayload(Context ctx) {
-        return new File(externalDir(ctx), "payload.bin");
+        File ext = new File(externalDir(ctx), "payload.bin");
+        return ext.isFile() ? ext : new File(ctx.getFilesDir(), "payload.bin");
     }
 
     /** Copy the bundled test payload (no Apple bits) and return it. */
