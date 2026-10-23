@@ -1036,6 +1036,10 @@ public final class MainActivity extends Activity {
         StringBuilder sb = new StringBuilder();
         appendFile(sb, new File(getFilesDir(), "vm/qemu.log"));
         appendFile(sb, new File(getFilesDir(), "vm/serial.log"));
+        String guest = SweetLog.tail(cfg.rootFile(), 64 * 1024);
+        if (!guest.isEmpty()) {
+            sb.append("--- SWEETLOG ---\n").append(guest).append('\n');
+        }
         String content = sb.toString();
         if (content.trim().isEmpty()) {
             content = "还没有运行日志。";

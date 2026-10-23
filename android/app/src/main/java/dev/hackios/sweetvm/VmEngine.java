@@ -35,6 +35,7 @@ public final class VmEngine {
     private volatile boolean stopping;
     private volatile long frames;
     private File guestRam;
+    private File rootFile;
     private File logFile;
     private File qmpSocket;
     private String engineId = "";
@@ -72,6 +73,7 @@ public final class VmEngine {
     public void start(File payloadFile, File rootFile, String cmdline, int fps,
                       boolean resume, Listener listener) throws Exception {
         stop();
+        this.rootFile = rootFile;
         this.fps = Math.max(10, Math.min(60, fps));
         File vmDir = new File(ctx.getFilesDir(), "vm");
         if (!vmDir.isDirectory() && !vmDir.mkdirs()) {
@@ -332,6 +334,10 @@ public final class VmEngine {
         appendTail(sb, logFile, 8192);
         File serial = new File(ctx.getFilesDir(), "vm/serial.log");
         appendTail(sb, serial, 4096);
+        String guest = SweetLog.tail(rootFile, 32768);
+        if (!guest.isEmpty()) {
+            sb.append("\n--- SWEETLOG ---\n").append(guest);
+        }
         String s = sb.toString().trim();
         return s.isEmpty() ? "(QEMU 没有输出)" : s;
     }

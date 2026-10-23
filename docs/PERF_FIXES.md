@@ -86,7 +86,8 @@ SWEETLOG total @300s: 67,709 B
 - 宿主 A/B：同镜像、同 payload、同 300 s，唯一差别是 `thread=single`（基线）
   vs `thread=multi + prealloc`（修复）。指标见 §4.1。
 - 真机一键脚本：`python3 tools/sweetvm-device-test.py`（装 APK、起 VM、采样
-  `engine ...`/`fps=` 行、截图、做一次上滑）。本轮没有设备接入（`adb devices` 为空）。安装后看顶部 `N fps`
+  `engine ...`/`fps=` 行、截图、做一次上滑，并把根镜像尾部的 SWEETLOG 环拉成
+  `guestlog.txt`——QEMU 没有控制台 chardev，panic 只能从这里看到）。本轮没有设备接入（`adb devices` 为空）。安装后看顶部 `N fps`
   是否跟到设定值（默认 30）、logcat 的 `engine ... accel=tcg,thread=multi`，
   以及 App 启动/翻页是否还出现整秒级停顿。
 

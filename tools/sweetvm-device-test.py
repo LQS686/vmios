@@ -39,6 +39,46 @@ def run(cmd, timeout=120):
     return subprocess.run(cmd, text=True, capture_output=True, timeout=timeout)
 
 
+RING = 4 << 20
+HEADER_BLOCK = 4096
+
+
+def pull_guest_log(adb, pkg, outdir):
+    """Pull the last 4 MiB + 4 KiB of the image and decode the SWEETLOG ring.
+
+    QEMU runs without a console chardev, so the guest console (including a
+    panic) only exists in that ring; reading it off the phone is the only way
+    to see why a boot died. Uses toybox dd inside run-as, 4 KiB at a time.
+    """
+    r = run([adb, 'shell', 'run-as', pkg, 'stat', '-c', '%s', 'files/ios16-root.img'])
+    size = r.stdout.strip()
+    if not size.isdigit():
+        print('[!] cannot stat the root image on the device; no guest log', file=sys.stderr)
+        return
+    base = int(size) - RING - HEADER_BLOCK
+    if base < 0:
+        return
+    skip = (base + HEADER_BLOCK - 1) // HEADER_BLOCK
+    r = subprocess.run([adb, 'exec-out', 'run-as', pkg, 'dd',
+                        'if=files/ios16-root.img', 'bs=4096', 'skip=%d' % skip,
+                        'count=1025', '2>/dev/null'], capture_output=True, timeout=180)
+    blob = r.stdout
+    if len(blob) < HEADER_BLOCK + 16 or blob[:8] != b'SWEETLOG':
+        print('[!] no SWEETLOG header in the pulled tail', file=sys.stderr)
+        return
+    ring = int.from_bytes(blob[12:16], 'little') or RING
+    total = int.from_bytes(blob[16:24], 'little')
+    ring = min(ring, RING)
+    n = min(total, ring, 262144)
+    pos = int((total - n) % ring)
+    data = blob[HEADER_BLOCK:HEADER_BLOCK + ring]
+    out = data[pos:] + data[:pos] if n == ring else data[pos:pos + n]
+    path = os.path.join(outdir, 'guestlog.txt')
+    with open(path, 'wb') as f:
+        f.write(out)
+    print('[*] guest console ->', path, '(%d bytes of %d)' % (len(out), total))
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument('--adb', help='adb binary')
@@ -144,6 +184,7 @@ def main(argv=None):
         if max(fps) <= 12:
             print('[!] still capped near 12 fps - check the 高级选项 slider '
                   'and that the APK is the rebuilt one', file=sys.stderr)
+    pull_guest_log(adb, 'dev.hackios.sweetvm', a.out)
     print('[*] logs and screenshots in', a.out)
     return 0
 

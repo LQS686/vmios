@@ -35,10 +35,18 @@ and MTTCG is not shippable until the kernel lock work lands. Prealloc stays for
 runtime smoothness but has no measured boot effect. App input is
 still unverified on the phone (no device attached this session).
 
+**Guest log on the phone:** QEMU runs without a console chardev, so
+`vm/serial.log` is empty and the app's log screen showed nothing. `SweetLog`
+reads the kernel's 4 MiB SWEETLOG ring out of the root image (header block +
+ring at the partition tail); `VmEngine.tail()` and the log dialog use it, and
+the device test script pulls the same tail with `run-as dd` into
+`guestlog.txt`. Verified against `.tools/ios16-root.img` (printed the last
+600 bytes of a real boot). This is what makes a panic visible without a PC.
+
 **Resume:** prealloc is skipped on `-incoming` (a snapshot restore writes the
 whole RAM block anyway); logcat gets `engine cpus=N accel=... prealloc=...
 capture=Nfps` so a device session can confirm the config. The app also logs
-`fps=N frames=N uptime=N` every 5 s. APK 00:46; `tools/sweetvm-device-test.py`
+`fps=N frames=N uptime=N` every 5 s. APK 07:30; `tools/sweetvm-device-test.py`
 installs it, boots, samples those lines, and swipes once (`--reinstall` if the
 signature changed; it does NOT push the 16 GB image).
 
