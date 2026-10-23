@@ -32,7 +32,7 @@ offloaded present) and the pset0 ticket-lock timeout under heavy install load
 etc.) is still blocked on first-boot system-app registration, not on
 performance - the home-screen icons that are placeholders have nothing to
 launch. APK: `android/app/build/outputs/apk/debug/app-debug.apk` (81.9 MB,
-2026-10-24 00:00). Next device session: install it, check the top bar reads
+2026-10-24 00:01). Next device session: install it, check the top bar reads
 ~30 fps (not 4), launch an app, and if the kernel panics add `tcgsingle=1`.
 
 ### >>> BOOT / GPU ANALYSIS (2026-10-23): docs/BOOT_ANALYSIS.md <<<
