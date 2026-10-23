@@ -267,7 +267,12 @@ public final class VmEngine {
                     listener.onError("无法映射共享显存: " + e.getMessage());
                 }
             }
-            long sleep = Math.max(16, 1000 / fps);
+            // Deadline pacing, not Thread.sleep: a fixed sleep adds the copy
+            // time to every interval, so a 16 fps guest sampled at 30 fps
+            // drifts and beats (judder). Keep a monotonic deadline and park
+            // only the remainder; if a copy overruns the period, restart it.
+            final long period = 1_000_000_000L / Math.max(1, fps);
+            long next = System.nanoTime() + period;
             int[] probe = new int[Payload.FB_STRIDE * Payload.FB_H / 4 / PROBE_STEP];
             int[] lastProbe = new int[probe.length];
             boolean haveLast = false;
@@ -280,10 +285,17 @@ public final class VmEngine {
                         v.copyFromBuffer(map);
                         frames++;
                     }
-                    Thread.sleep(sleep);
+                    long now = System.nanoTime();
+                    if (next > now) {
+                        java.util.concurrent.locks.LockSupport.parkNanos(next - now);
+                    } else {
+                        next = now;
+                    }
+                    next += period;
+                    if (next < now) {
+                        next = now + period;
+                    }
                 }
-            } catch (InterruptedException ignored) {
-                Thread.currentThread().interrupt();
             } finally {
                 if (ch != null) {
                     try {

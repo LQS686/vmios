@@ -87,6 +87,9 @@ SWEETLOG total @300s: 67,709 B
 - `VmEngine.changed()`：采样步长 40 KB → 64 B（每 16 个 word 一个点），
   局部变化不再漏帧；`PROBE_STEP` 常量取代 `PROBE_WORDS`。
 - `TouchSender`：MOVE 8 ms 合并 + 复用 5 字节缓冲；DOWN/UP 不合并。
+- 取帧节拍：`Thread.sleep(33)` 会让"采样间隔 = 33 ms + 拷贝时间"并累积漂移，
+  16 fps 的内容按 30 fps 采样会 beat/judder。改成单调 deadline + parkNanos，
+  拷贝超时就重排下一拍（`VmEngine.startReader`）。
 
 ### 宿主工具
 
