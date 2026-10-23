@@ -705,7 +705,7 @@ public final class MainActivity extends Activity {
             return;
         }
         showVmScreen();
-        touch = new TouchSender(new File(getFilesDir(), "vm/touch.sock").getAbsolutePath());
+        touch = new TouchSender(new File(getFilesDir(), "vm/touch.bin"));
         touch.start();
         acquireWake();
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);

@@ -238,6 +238,8 @@ def main():
                     help='single-threaded TCG even with --smp > 1; avoids the SWEET pset0 ticket-lock deadlock')
     ap.add_argument('--touch', metavar='SOCKET',
                     help='enable vm/qemu/sweet_touch.c and listen on this Unix socket')
+    ap.add_argument('--touchfile', metavar='FILE',
+                    help='feed sweet-touch from a 5-byte state file instead of a chardev')
     a = ap.parse_args()
 
     if a.check_env:
@@ -293,9 +295,14 @@ def main():
                 '-numa', 'node,memdev=ram']
     if a.ufs:
         cmd += ['-device', f'sweet-ufs,file={os.path.abspath(a.ufs)},mmio-base=0x0e000000']
-    if a.touch:
-        cmd += ['-chardev', f'socket,id=sweet_touch,path={os.path.abspath(a.touch)},server=on,wait=off',
-                '-device', 'sweet-touch,chardev=sweet_touch']
+    if a.touch or a.touchfile:
+        dev = 'sweet-touch'
+        if a.touch:
+            cmd += ['-chardev', f'socket,id=sweet_touch,path={os.path.abspath(a.touch)},server=on,wait=off']
+            dev += ',chardev=sweet_touch'
+        if a.touchfile:
+            dev += f',touchfile={os.path.abspath(a.touchfile)}'
+        cmd += ['-device', dev]
     cmd += ['-device', f'loader,file={out}/ram.bin,addr={phys_base:#x},force-raw=on',
             '-device', f'loader,file={out}/stub.bin,addr={STUB_PA:#x},force-raw=on',
             '-device', f'loader,addr={STUB_PA:#x},cpu-num=0']

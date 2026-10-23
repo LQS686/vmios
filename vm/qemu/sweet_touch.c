@@ -11,6 +11,10 @@
  *
  *      type (0=up, 1=down, 2=move), x LE16, y LE16
  *
+ * The same 5-byte record can be supplied through a host file with the
+ * touchfile property; it is pread before each touch report, avoiding chardev
+ * flow control. The Android app uses that path.
+ *
  * The driver's RPMh LDO vote is expected to be stubbed by
  * tools/patch-qemu-input.py; no RPMh block is modelled.
  */
@@ -23,6 +27,8 @@
 #include "qemu/log.h"
 #include "qemu/module.h"
 #include "qemu/thread.h"
+#include <fcntl.h>
+#include <unistd.h>
 
 #define TYPE_SWEET_TOUCH "sweet-touch"
 OBJECT_DECLARE_SIMPLE_TYPE(SweetTouchState, SWEET_TOUCH)
@@ -88,6 +94,9 @@ struct SweetTouchState {
     bool touch_down;
     uint16_t touch_x;
     uint16_t touch_y;
+    int touch_fd;
+    uint8_t touch_raw[5];
+    char *touchfile;
 
     uint8_t in[5];
     unsigned in_len;
@@ -127,6 +136,24 @@ static uint32_t se_read(SweetTouchState *s, uint32_t off)
     }
 }
 
+static void sweet_touch_sync_file(SweetTouchState *s)
+{
+    uint8_t b[5];
+    if (s->touch_fd < 0 || pread(s->touch_fd, b, sizeof(b), 0) != sizeof(b)) {
+        return;
+    }
+    qemu_mutex_lock(&s->lock);
+    if (memcmp(b, s->touch_raw, sizeof(b)) != 0) {
+        uint16_t x = b[1] | (b[2] << 8);
+        uint16_t y = b[3] | (b[4] << 8);
+        memcpy(s->touch_raw, b, sizeof(b));
+        s->touch_down = b[0] != 0;
+        s->touch_x = x >= 1080 ? 1079 : x;
+        s->touch_y = y >= 2400 ? 2399 : y;
+    }
+    qemu_mutex_unlock(&s->lock);
+}
+
 static void build_report(SweetTouchState *s, uint32_t nr)
 {
     uint8_t b[RX_MAX];
@@ -134,6 +161,7 @@ static void build_report(SweetTouchState *s, uint32_t nr)
     if (nr > sizeof(b)) {
         nr = sizeof(b);
     }
+    sweet_touch_sync_file(s);
     if (s->pointer == 0x4022) {
         b[0] = '9';
         b[1] = '8';
@@ -326,11 +354,6 @@ static const MemoryRegionOps se_ops = {
     .valid = { .min_access_size = 4, .max_access_size = 4 },
 };
 
-static int sweet_touch_can_read(void *opaque)
-{
-    return 5;
-}
-
 static void sweet_touch_receive(void *opaque, const uint8_t *buf, int size)
 {
     SweetTouchState *s = opaque;
@@ -366,6 +389,13 @@ static void sweet_touch_realize(DeviceState *dev, Error **errp)
     s->tlmm_regs = g_new0(uint32_t, TLMM_SIZE / 4);
     s->se_regs = g_new0(uint32_t, SE_SIZE / 4);
     qemu_mutex_init(&s->lock);
+    s->touch_fd = -1;
+    if (s->touchfile) {
+        s->touch_fd = open(s->touchfile, O_RDWR | O_CREAT, 0600);
+        if (s->touch_fd < 0) {
+            fprintf(stderr, "sweet-touch: cannot open touchfile %s\n", s->touchfile);
+        }
+    }
 
     memory_region_init_io(&s->gcc, OBJECT(s), &gcc_ops, s,
                           "sweet-touch-gcc", GCC_SIZE);
@@ -380,13 +410,17 @@ static void sweet_touch_realize(DeviceState *dev, Error **errp)
     sysbus_mmio_map(sbd, 1, TLMM_BASE);
     sysbus_mmio_map(sbd, 2, SE_BASE);
 
-    qemu_chr_fe_set_handlers(&s->chr, sweet_touch_can_read,
+    qemu_chr_fe_set_handlers(&s->chr, NULL,
                              sweet_touch_receive, NULL, NULL, s, NULL, true);
+    qemu_chr_fe_accept_input(&s->chr);
 }
 
 static void sweet_touch_unrealize(DeviceState *dev)
 {
     SweetTouchState *s = SWEET_TOUCH(dev);
+    if (s->touch_fd >= 0) {
+        close(s->touch_fd);
+    }
     qemu_mutex_destroy(&s->lock);
     g_free(s->gcc_regs);
     g_free(s->tlmm_regs);
@@ -395,6 +429,7 @@ static void sweet_touch_unrealize(DeviceState *dev)
 
 static Property sweet_touch_props[] = {
     DEFINE_PROP_CHR("chardev", SweetTouchState, chr),
+    DEFINE_PROP_STRING("touchfile", SweetTouchState, touchfile),
     DEFINE_PROP_END_OF_LIST(),
 };
 

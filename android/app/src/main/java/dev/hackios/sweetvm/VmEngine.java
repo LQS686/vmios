@@ -136,13 +136,10 @@ public final class VmEngine {
             cmd.add("-device");
             cmd.add("sweet-ufs,file=" + rootFile.getAbsolutePath() + ",mmio-base=0xe000000");
         }
-        File touchSocket = new File(vmDir, "touch.sock");
-        touchSocket.delete();
-        cmd.add("-chardev");
-        cmd.add("socket,id=sweet_touch,path=" + touchSocket.getAbsolutePath()
-                + ",server=on,wait=off");
+        File touchFile = new File(vmDir, "touch.bin");
+        touchFile.delete();
         cmd.add("-device");
-        cmd.add("sweet-touch,chardev=sweet_touch");
+        cmd.add("sweet-touch,touchfile=" + touchFile.getAbsolutePath());
 
         ProcessBuilder pb = new ProcessBuilder(cmd);
         pb.environment().put("LD_LIBRARY_PATH", eng.dir.getAbsolutePath());

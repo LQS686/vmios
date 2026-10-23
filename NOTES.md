@@ -230,6 +230,15 @@ chardev was not re-armed after a receive. Added the call and rebuilt
 `qrun-setup5`. The Android engine assets need the same rebuild before the
 app-side touch is equally reliable.
 
+**Shared touch file (replaces the app chardev):** `sweet-touch` now also takes
+a `touchfile` property; `sweet_touch_sync_file()` preads the same 5-byte record
+before each report and applies it when it changed, so guest input no longer
+depends on chardev flow control. The Android app passes
+`sweet-touch,touchfile=<vmDir>/touch.bin` and `TouchSender` writes the record
+to that file; `tools/qemu-sweet.py --touchfile FILE` does the same on the host
+(`--touch` still works for the proxy). All three QEMU builds (host, arm64
+Android, x86_64 Android) and the APK were rebuilt with this change.
+
 App side: `VmEngine` now derives `-smp N` and `tcg,thread=multi` from the
 payload's `cpus=N`, and `ensureQemuArgs` no longer forces `cpus=1`, so the
 imported 2-vCPU iOS payload runs with the configuration proven here. The APK
@@ -241,6 +250,19 @@ migration-enabled boot confirms it was blocked in a CoreAnimation
 transaction commit (`CA::Render::Message::send_message`) while backboardd's
 main thread sat in CFPreferences KVO delivery; `_checkIn` was waiting for
 this migration, not for the display.
+
+**Xiaomi 14 Pro bring-up (2026-10-23):** ADB over USB works after killing the
+WSL adb server that held Windows port 5037. Device `23116PN5BC` (shennong),
+Android 16 / SDK 36, arm64-v8a, 4 KB pages, 58 GB free. `app-debug.apk`
+installs and launches (targetSdk 28); the engine self-test boots the demo
+payload on the phone (`SWEET CPU: 1/1 CPUs initialized`, AppleCLCD 1080x2400,
+HID touch registered), so the arm64 QEMU engine and framebuffer path work on
+the real device. adb-created files in the app's external dir were unreadable
+to the app, so `BootConfig` now falls back to `filesDir`/payload.bin and
+filesDir/ios16-root.img; a payload copied there via `run-as` is auto-detected
+(`payload.bin · 15.8 MB`). The 16 GB patched root is being copied to Windows
+and pushed for the full iOS VM. Touch chardev reliability/shared-file work is
+still pending for the app.
 
 **Remaining:** home screen/interaction proof, hardware keys, native IPA
 install, bundling (16 GB + Apple licensing), Xiaomi 14 Pro device test;

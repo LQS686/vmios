@@ -21,3 +21,5 @@ android/build/
 *.simg
 artifacts/
 vm/qemu/qemu/
+# local device tooling, payloads and root images
+.tools/

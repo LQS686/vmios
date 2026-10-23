@@ -1,69 +1,29 @@
 package dev.hackios.sweetvm;
 
-import android.net.LocalSocket;
-import android.net.LocalSocketAddress;
-
+import java.io.File;
 import java.io.IOException;
-import java.io.OutputStream;
+import java.io.RandomAccessFile;
 
 /**
- * Feeds the QEMU sweet-touch chardev (vm/qemu/sweet_touch.c).
- * Five-byte packets: type (0 up, 1 down, 2 move), x LE16, y LE16.
+ * Publishes the latest touch state to the file polled by sweet-touch
+ * (vm/qemu/sweet_touch.c). Five-byte records: type (0 up, 1 down, 2 move),
+ * x LE16, y LE16.
  */
 public final class TouchSender {
-    private final String path;
-    private volatile boolean closed;
-    private volatile LocalSocket socket;
-    private volatile OutputStream out;
-    private Thread connector;
+    private final File file;
+    private RandomAccessFile out;
+    private boolean closed;
 
-    public TouchSender(String path) {
-        this.path = path;
+    public TouchSender(File file) {
+        this.file = file;
     }
 
     public void start() {
+        // QEMU creates the file at realize time; open lazily on the first packet.
+    }
+
+    public synchronized void send(int type, int x, int y) {
         if (closed) {
-            return;
-        }
-        Thread t = connector;
-        if (t != null && t.isAlive()) {
-            return;
-        }
-        connector = new Thread(this::connectLoop, "sweetvm-touch");
-        connector.setDaemon(true);
-        connector.start();
-    }
-
-    private void connectLoop() {
-        while (!closed && out == null) {
-            LocalSocket s = null;
-            try {
-                s = new LocalSocket();
-                s.connect(new LocalSocketAddress(path,
-                        LocalSocketAddress.Namespace.FILESYSTEM));
-                socket = s;
-                out = s.getOutputStream();
-                return;
-            } catch (IOException e) {
-                if (s != null) {
-                    try {
-                        s.close();
-                    } catch (IOException ignored) {
-                    }
-                }
-                try {
-                    Thread.sleep(300);
-                } catch (InterruptedException ie) {
-                    Thread.currentThread().interrupt();
-                    return;
-                }
-            }
-        }
-    }
-
-    public void send(int type, int x, int y) {
-        OutputStream o = out;
-        if (o == null || closed) {
             return;
         }
         byte[] b = {
@@ -72,28 +32,33 @@ public final class TouchSender {
                 (byte) (y & 0xff), (byte) ((y >> 8) & 0xff)
         };
         try {
-            o.write(b);
-            o.flush();
+            if (out == null) {
+                File dir = file.getParentFile();
+                if (dir != null && !dir.isDirectory() && !dir.mkdirs()) {
+                    return;
+                }
+                out = new RandomAccessFile(file, "rw");
+            }
+            out.seek(0);
+            out.write(b);
         } catch (IOException e) {
-            closeSocket();
-            start();
+            closeFile();
         }
     }
 
-    private void closeSocket() {
+    private void closeFile() {
+        RandomAccessFile f = out;
         out = null;
-        LocalSocket s = socket;
-        socket = null;
-        if (s != null) {
+        if (f != null) {
             try {
-                s.close();
+                f.close();
             } catch (IOException ignored) {
             }
         }
     }
 
-    public void close() {
+    public synchronized void close() {
         closed = true;
-        closeSocket();
+        closeFile();
     }
 }
