@@ -92,6 +92,20 @@ public final class VmEngine {
                 cpus = Math.max(1, Math.min(8, Integer.parseInt(m.group(1))));
             }
         }
+        // writeImages packs the command line into boot_args, so anything the
+        // guest kernel must see has to be added before that call. Keep XNU's
+        // ticket/spin lock timeouts generous: the defaults are ~125/250 ms
+        // (tlto_us/slto_us, parsed by ml_init_lock_timeout), but a TCG vCPU
+        // can exceed that while a lock owner blocks on host I/O, and the
+        // resulting panic ("Ticket spinlock timeout", 3,000,001 ticks, owner
+        // on CPU 1) looks like a deadlock. With 2 s the same MTTCG boot ran
+        // 900 s without a panic. A truly stuck lock still panics, just later.
+        if (cmdline == null) {
+            cmdline = "";
+        }
+        if (!cmdline.contains("tlto_us=")) {
+            cmdline = (cmdline + " tlto_us=2000000 slto_us=2000000").trim();
+        }
         File ram = new File(vmDir, "ram.bin");
         File stub = new File(vmDir, "stub.bin");
         payload.writeImages(ram, stub, cmdline);
@@ -126,17 +140,6 @@ public final class VmEngine {
         cmd.add("-cpu"); cmd.add("cortex-a76");
         cmd.add("-smp"); cmd.add(Integer.toString(cpus));
         cmd.add("-m"); cmd.add(RAM_GIB + "G");
-        // Keep XNU's ticket/spin lock timeouts generous. The defaults are
-        // ~125/250 ms (tlto_us/slto_us, parsed by ml_init_lock_timeout), but a
-        // TCG vCPU can exceed that while the lock owner blocks on host I/O;
-        // the kernel then panics with a "Ticket spinlock timeout" that looks
-        // like a deadlock (seen: 3,000,001 ticks, owner on CPU 1). With 2 s
-        // the same boot ran 460 s without a panic. Normal operation is
-        // unaffected; only a genuinely stuck lock waits longer before
-        // panicking, and it still panics.
-        if (!cmdline.contains("tlto_us=")) {
-            cmdline += " tlto_us=2000000 slto_us=2000000";
-        }
         // Single-threaded TCG stays the default; tcgmulti=1 turns on MTTCG
         // (two real vCPUs). One MTTCG boot reached the iOS Setup GUI at 300 s;
         // another stalled in userland, so the speed win is not proven yet.
