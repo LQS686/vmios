@@ -223,6 +223,13 @@ project, also runs with a single vCPU (no `-smp` in `run.sh`); our
 2-vCPU single-threaded TCG Setup test (`qrun-setup4`) continues to see whether
 serialized TCG avoids the pset0 ticket lock without falling back to 1 vCPU.
 
+The proxy still saw only the first touch batch reach the guest:
+`sweet_touch_receive` never called `qemu_chr_fe_accept_input()`, so the
+chardev was not re-armed after a receive. Added the call and rebuilt
+`/opt/qemu/build/qemu-system-aarch64`; continuous gestures are retested at
+`qrun-setup5`. The Android engine assets need the same rebuild before the
+app-side touch is equally reliable.
+
 App side: `VmEngine` now derives `-smp N` and `tcg,thread=multi` from the
 payload's `cpus=N`, and `ensureQemuArgs` no longer forces `cpus=1`, so the
 imported 2-vCPU iOS payload runs with the configuration proven here. The APK

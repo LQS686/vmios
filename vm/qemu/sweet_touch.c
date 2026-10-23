@@ -354,6 +354,7 @@ static void sweet_touch_receive(void *opaque, const uint8_t *buf, int size)
             qemu_mutex_unlock(&s->lock);
         }
     }
+    qemu_chr_fe_accept_input(&s->chr);
 }
 
 static void sweet_touch_realize(DeviceState *dev, Error **errp)
