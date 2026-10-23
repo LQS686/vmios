@@ -287,7 +287,7 @@ def main():
     ram_gib = max(4, -(-(phys_base + mem_size - 0x40000000) // (1 << 30)))
     cmd = [a.qemu, '-M', 'virt,gic-version=3', '-cpu', a.cpu,
            '-smp', str(a.smp), '-m', f'{ram_gib}G',
-           '-accel', 'tcg' if a.tcg_single or a.smp == 1 else 'tcg,thread=multi',
+           '-accel', 'tcg,thread=single' if a.tcg_single or a.smp == 1 else 'tcg,thread=multi',
            '-nographic', '-serial', f'file:{out}/serial.txt', '-qmp', f'unix:{mon},server,nowait',
            '-d', 'int,guest_errors,unimp', '-D', f'{out}/qemu.log', '-no-reboot']
     if a.shared_ram:

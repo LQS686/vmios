@@ -239,6 +239,26 @@ to that file; `tools/qemu-sweet.py --touchfile FILE` does the same on the host
 (`--touch` still works for the proxy). All three QEMU builds (host, arm64
 Android, x86_64 Android) and the APK were rebuilt with this change.
 
+**`-accel tcg` is MTTCG, not single-threaded TCG.** QEMU 8.2 defaults
+`tcg` to `thread=multi` on aarch64, so the earlier "2-vCPU single-threaded TCG"
+tests (`qrun-setup5`, the app's `-accel tcg`) actually ran MTTCG. The phone
+reproduced the pset0 ticket-lock panic on the 16 GB iOS boot with 2 vCPUs
+(panicked task logd, owner on CPU 0, waiter CPU 1), and the host Setup test
+panicked the same way in fseventsd. `tools/qemu-sweet.py` and `VmEngine` now
+pass `tcg,thread=single` explicitly, but the stable bring-up remains **1 vCPU**
+(as jprx/darwin-vm does). The phone was switched to the 1-CPU ADT payload
+(`payload-ios-mig1.bin`, kernel-mu) and boots the full 16 GB image with
+`-smp 1`.
+
+**Xiaomi 14 Pro full-VM result (2026-10-23):** the app auto-adopts
+`files/ios16-root.img` (16 GiB) and `files/payload.bin`, QEMU loads the payload
+at 0xb0000000 with a 3 GB shared RAM file, and the guest boots XNU 8796 with
+`SWEET CPU: 2/2 CPUs initialized` (2-vCPU payload) before the panic. With the
+1-vCPU payload the boot reaches the Apple logo and SpringBoard startup.
+The app cached the extracted engine by versionCode only, so a rebuilt engine
+could be masked by a stale `files/engine-<abi>`; `EngineAssets` now includes
+`lastUpdateTime` in the marker.
+
 App side: `VmEngine` now derives `-smp N` and `tcg,thread=multi` from the
 payload's `cpus=N`, and `ensureQemuArgs` no longer forces `cpus=1`, so the
 imported 2-vCPU iOS payload runs with the configuration proven here. The APK

@@ -1,6 +1,7 @@
 package dev.hackios.sweetvm;
 
 import android.content.Context;
+import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
 import android.content.res.AssetManager;
 import android.os.Build;
@@ -35,7 +36,7 @@ public final class EngineAssets {
     public static Engine ensure(Context ctx) throws IOException {
         String abi = supportedAbi();
         File dir = new File(ctx.getFilesDir(), "engine-" + abi);
-        String version = appVersion(ctx) + "-" + abi;
+        String version = engineVersion(ctx) + "-" + abi;
         File marker = new File(dir, ".version");
         if (!marker.isFile() || !version.equals(readSmall(marker))) {
             deleteTree(dir);
@@ -68,10 +69,11 @@ public final class EngineAssets {
                 + String.join(",", abis));
     }
 
-    private static String appVersion(Context ctx) {
+    private static String engineVersion(Context ctx) {
         try {
-            return String.valueOf(ctx.getPackageManager()
-                    .getPackageInfo(ctx.getPackageName(), 0).versionCode);
+            PackageInfo pi = ctx.getPackageManager()
+                    .getPackageInfo(ctx.getPackageName(), 0);
+            return pi.versionCode + "-" + pi.lastUpdateTime;
         } catch (PackageManager.NameNotFoundException e) {
             return "?";
         }
