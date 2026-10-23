@@ -13,8 +13,11 @@ causes. All the ones that live outside the guest are fixed; the APK is rebuilt.
    toggle could go undetected for many ticks. Now every 64 bytes.
 3. **2 vCPUs on one TCG thread** (`thread=single`): guest daemons,
    WindowServer and apps serialize; host CPU measured at only 60-68% of one
-   core while the guest crawled. `thread=multi` is now the default when
-   `cpus>=2`; `tcgsingle=1` restores the old mode.
+   core while the guest crawled. MTTCG was briefly made the default, then a
+   second cold boot PANICKED on pset0's ticket lock after 3,000,001 ticks
+   (=125 ms at 24 MHz, owner on CPU 1, no debugger handshake), so the default
+   is single again and `tcgmulti=1` stays an experiment. This needs the kernel
+   fix in docs/PERF_FIXES.md 5.2.
 4. **Guest RAM page faults inside the vCPU thread** (507k minflt, RSS
    149 MB -> 1.78 GB in 5 min). `memory-backend-file,...,prealloc=on,
    prealloc-threads=4` moves that to startup.
@@ -22,8 +25,9 @@ causes. All the ones that live outside the guest are fixed; the APK is rebuilt.
    8 ms and the 5-byte record buffer is reused.
 
 **Measured A/B (WSL host, same image/payload, 300 s each):** baseline stayed on
-console text with zero `SWEET FB: swap`; the fixed run had two TCG threads, no
-panic, 16 swap log lines and the iOS Setup "Hei" GUI on screen. App input is
+console text with zero `SWEET FB: swap`; an MTTCG+prealloc run had two TCG
+threads, 16 swap log lines and the iOS Setup "Hei" GUI on screen - but a repeat
+of that configuration panicked, so only the prealloc half is shippable. App input is
 still unverified on the phone (no device attached this session).
 
 **Resume:** prealloc is skipped on `-incoming` (a snapshot restore writes the

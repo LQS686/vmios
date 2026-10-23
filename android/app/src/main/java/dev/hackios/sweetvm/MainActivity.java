@@ -1010,8 +1010,8 @@ public final class MainActivity extends Activity {
         });
         box.addView(fpsLabel);
         box.addView(seek);
-        box.addView(text("QEMU 固定 3 GB 客户机内存；vCPU 数取自 cpus=N，默认多线程 TCG。"
-                + "若遇内核 panic，在参数末尾加 tcgsingle=1。参数长度上限 607 字节。",
+        box.addView(text("QEMU 固定 3 GB 客户机内存；vCPU 数取自 cpus=N，默认单线程 TCG。"
+                + "tcgmulti=1 可试验多线程 TCG（当前会触发内核 panic）。参数长度上限 607 字节。",
                 10, DIM, false));
         AlertDialog d = new AlertDialog.Builder(this)
                 .setTitle("高级选项")

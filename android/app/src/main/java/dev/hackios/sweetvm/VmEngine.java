@@ -126,15 +126,15 @@ public final class VmEngine {
         cmd.add("-cpu"); cmd.add("cortex-a76");
         cmd.add("-smp"); cmd.add(Integer.toString(cpus));
         cmd.add("-m"); cmd.add(RAM_GIB + "G");
-        // Multi-threaded TCG is the default for a 2-vCPU payload: single
-        // threaded TCG time-shares every vCPU on one host core, so iOS system
-        // daemons, WindowServer and the app serialize and the whole system
-        // feels stalled even when frames render. MTTCG used to trip SWEET's
-        // pset0 ticket lock under install/Setup load; prealloc above removes
-        // the long vCPU stalls that made that timeout fire, and the booted
-        // 2-vCPU home state has run under MTTCG since. `tcgsingle=1` on the
-        // command line restores thread=single for compatibility.
-        boolean mttcg = cpus >= 2 && !cmdline.contains("tcgsingle=1");
+        // Single-threaded TCG is the only stable mode. MTTCG looks tempting
+        // (two real vCPUs instead of two time-shared on one host core) but it
+        // panics on pset0's ticket lock: 2026-10-24, 2 vCPUs, prealloc on,
+        // timeout after 3,000,001 ticks (125 ms at 24 MHz), ticket 0xca/0xcb/
+        // 0xce with the owner on CPU 1 and no debugger handshake. That is a
+        // real hang of the lock owner, not a short timeout, and it happens
+        // with or without prealloc. Keep the experiment behind tcgmulti=1;
+        // the real fix is a kernel-side lock/timeout change.
+        boolean mttcg = cpus >= 2 && cmdline.contains("tcgmulti=1");
         android.util.Log.i("sweetvm", "engine cpus=" + cpus + " accel="
                 + (mttcg ? "tcg,thread=multi" : "tcg,thread=single")
                 + " prealloc=" + !resume + " capture=" + this.fps + "fps");

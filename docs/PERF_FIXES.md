@@ -10,7 +10,7 @@ WSL 宿主 QEMU 对照跑），不是估计。
 |---|----|------|------|------|
 | L1 | App 取帧 | 整机固定 4 fps，最高只能调到 11 fps | `BootConfig.fps = 4`、滑块 `setMax(11)` | 默认 30，范围 15–60 |
 | L2 | 取帧变更检测 | 局部变化（光标、开关、点击高亮）可能十几帧都检测不到，画面"冻一下" | 256 个采样点、间隔 40 KB | 每 64 B 采样一个点 |
-| L3 | CPU 虚拟化 | 2 个 vCPU 挤在 1 个 TCG 线程，系统守护进程/WindowServer/App 串行 | `threads=4`，只有 1 个 TCG 线程；宿主单核占用仅 60–68% | 默认 MTTCG（`tcgsingle=1` 可回退） |
+| L3 | CPU 虚拟化 | 2 个 vCPU 挤在 1 个 TCG 线程，系统守护进程/WindowServer/App 串行 | `threads=4`，只有 1 个 TCG 线程；宿主单核占用仅 60–68% | 单线程仍是默认；MTTCG 会 panic（`tcgmulti=1` 仅作试验），见 §4.2 |
 | L4 | 宿主内存 | Guest 首次触页的缺页在 vCPU 线程里做，iOS 分配内存时整机停顿 | 5 分钟 50.7 万次 minflt，RSS 149 MB → 1.78 GB | `memory-backend-file,prealloc=on` |
 | L5 | 输入 | 每个 MOVE 两次系统调用，最高 120 Hz 全打在 UI 线程 | `TouchSender.send()` 每次 seek+write | 合并到 8 ms，复用缓冲区 |
 | L6 | Guest 渲染 | 无 GPU，CA 软件光栅 + 内核每帧 10.9 MB memcpy 到面板 | 既有测量 ~16.5 fps | 未改（需要 CI 内核；见 §5） |
@@ -65,7 +65,7 @@ SWEETLOG total @300s: 67,709 B
 - `MainActivity.showAdvanced()`：滑块 1–11 → 15–60（步长 5）。
 - `VmEngine.start()`：clamp 10–60；`memory-backend-file` 加 `prealloc=on`
   （快照恢复时跳过：`-incoming` 本来就会写满整块 RAM）；
-  `-accel tcg,thread=multi` 成为 `cpus>=2` 时的默认，`tcgsingle=1` 回退单线程。
+  `-accel` 仍是 `thread=single`：`tcgmulti=1` 打开多线程 TCG（试验开关）。
   启动时向 logcat 打一行 `engine cpus=N accel=... prealloc=... capture=Nfps`，
   真机上 `adb logcat -s sweetvm` 就能确认配置生效。
 - `VmEngine.changed()`：采样步长 40 KB → 64 B（每 16 个 word 一个点），
@@ -95,7 +95,7 @@ SWEETLOG total @300s: 67,709 B
 | | 基线 `thread=single`、无 prealloc | 修复 `thread=multi` + prealloc |
 |---|---|---|
 | QEMU 线程 | 4 条，1 条 TCG | 5 条，2 条 TCG（各 ≈45% 单核） |
-| vCPU 并行 | 无（2 vCPU 轮流） | 有 |
+| vCPU 并行 | 无（2 vCPU 轮流） | 有（但**不稳定**，见 4.2） |
 | 前 60 s CPU | 单核 49–66% | 两线程合计 ≈73%，之后各 ≈15%（Guest 在等） |
 | minflt | 30k@2s → 507k@200s | prealloc 启动即打满 ≈83 万（4 GB/4 KB），之后新增来自 TCG 代码页 |
 | Guest 日志 | 67,709 B，`SWEET FB: swap` **0** 次 | 62,956 B，`SWEET FB: swap` **16** 次（首批 16 次 swap 的明细日志） |
@@ -110,6 +110,23 @@ SWEETLOG total @300s: 67,709 B
 "同一镜像的两次冷启动在 300 s 时到达的阶段"，不是逐帧基准。精确的
 到 GUI 墙钟时间要跑满整个启动（15–20 min），本轮没做。
 
+### 4.2 反例：MTTCG 不能作默认
+
+同一镜像、2 vCPU、prealloc 打开，第二次冷启动在 ~3 分钟时 panic：
+
+```
+Ticket spinlock(0xfffffe0007b90880) timeout after 3000001 ticks;
+ticket: 0xca, nticket: 0xce, waiting for 0xcb,
+current owner: 0xfffffe24d32fec10 (on CPU 1) ... @lock_ticket.c:386
+handshake structure not initialized
+```
+
+24 MHz 计数下 3,000,001 tick = **125 ms**。票据 0xca..0xce 说明已有 4 个 CPU
+在等 0xcb，持有者在 CPU 1 上 125 ms 没有释放，而且 panic 时拿不到它的
+handshake/栈。这不是"超时太短被误伤"，而是持有者真的卡住了；prealloc
+并不能消除它。因此 `VmEngine` 恢复 **`thread=single` 默认**，`tcgmulti=1`
+只保留为试验开关。要真正用上第二颗核，必须做 §5.2 的内核工作。
+
 ## 5. 还剩下的两层（需要内核 CI）
 
 1. **present 拷贝**：`AppleCLCD::present()` 每帧把 1125×2436（10.9 MB）逐行
@@ -117,10 +134,12 @@ SWEETLOG total @300s: 67,709 B
    真正的修法是让 App 直接读 CA 的 surface（内核把 surface 的 PA/stride/seq
    写进 boot_args 的空字段，App 用 GPU 缩放上屏），Guest 不再拷。
    这需要一次内核构建，`xnu/patches/0087-*`。
-2. **pset0 ticket lock**：MTTCG 下重负载（Setup/SystemAppMigrator）仍可能
-   触发 300k 次自旋超时。`prealloc` 去掉了"锁持有者被宿主缺页卡住"这一类
-   超时来源，但真正的修复是把超时改成可配置并在 panic 里打印持锁 CPU 的栈
-   （同样是一次内核构建）。当前以 `tcgsingle=1` 作为兼容开关。
+2. **pset0 ticket lock**：见 §4.2，MTTCG 下 2 vCPU 冷启动即会 panic。需要
+   一次内核构建：(a) 把 `LOCK_TICKET_TIMEOUT` 做成 boot-arg（默认加大到
+   1 s 量级）；(b) 修好 `hw_lck_ticket_timeout_panic` 的 CPU handshake，让
+   panic 能打印持有 CPU 的 PC/LR（现在是 `handshake structure not
+   initialized`，什么都看不到）；(c) 若持有者确实卡死，再按 (b) 的栈定位。
+   在 (a)(b) 落地前，`thread=single` 是唯一可发布的模式。
 
 ## 6. 复现
 
