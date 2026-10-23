@@ -111,6 +111,9 @@ public final class MainActivity extends Activity {
             if (vmTimer != null) {
                 vmTimer.setText(String.format(Locale.US, "%02d:%02d · %d fps", s / 60, s % 60, fps));
             }
+            if (s % 5 == 0) {
+                android.util.Log.i("sweetvm", "fps=" + fps + " frames=" + f + " uptime=" + s);
+            }
             if (vmStatus != null) {
                 vmStatus.setText(engine.isRunning() ? "运行中 · 软件 CPU" : "正在停止…");
             }

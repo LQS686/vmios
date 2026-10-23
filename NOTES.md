@@ -28,7 +28,10 @@ still unverified on the phone (no device attached this session).
 
 **Resume:** prealloc is skipped on `-incoming` (a snapshot restore writes the
 whole RAM block anyway); logcat gets `engine cpus=N accel=... prealloc=...
-capture=Nfps` so a device session can confirm the config. APK 00:11.
+capture=Nfps` so a device session can confirm the config. The app also logs
+`fps=N frames=N uptime=N` every 5 s. APK 00:12; `tools/sweetvm-device-test.py`
+installs it, boots, samples those lines, and swipes once (`--reinstall` if the
+signature changed; it does NOT push the 16 GB image).
 
 **Environment incident 2026-10-24:** three 17 GB image copies filled host D: to
 0 bytes and WSL died with EIO. Recovered by sparse-converting the VHD, setting
