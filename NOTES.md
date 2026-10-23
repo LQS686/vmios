@@ -1,5 +1,40 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+### >>> STUTTER ROOT CAUSED AND FIXED (2026-10-23 late): docs/PERF_FIXES.md <<<
+
+The "runs, but is very laggy, and not just rendering" report had five independent
+causes. All the ones that live outside the guest are fixed; the APK is rebuilt.
+
+1. **App sampling: 4 fps default, 11 fps ceiling** (`BootConfig.fps = 4`,
+   `seek.setMax(11)`). The guest's 16 fps was irrelevant: the screen only
+   refreshed 4 times a second. Default is now 30, 15-60 range, old saved
+   values below 15 are reset to 30.
+2. **Frame change probe too sparse**: 256 words, one every 40 KB, so a caret or
+   toggle could go undetected for many ticks. Now every 64 bytes.
+3. **2 vCPUs on one TCG thread** (`thread=single`): guest daemons,
+   WindowServer and apps serialize; host CPU measured at only 60-68% of one
+   core while the guest crawled. `thread=multi` is now the default when
+   `cpus>=2`; `tcgsingle=1` restores the old mode.
+4. **Guest RAM page faults inside the vCPU thread** (507k minflt, RSS
+   149 MB -> 1.78 GB in 5 min). `memory-backend-file,...,prealloc=on,
+   prealloc-threads=4` moves that to startup.
+5. **Touch move path** did seek+write per MOVE at up to 120 Hz; coalesced to
+   8 ms and the 5-byte record buffer is reused.
+
+**Measured A/B (WSL host, same image/payload, 300 s each):** baseline stayed on
+console text with zero `SWEET FB: swap`; the fixed run had two TCG threads, no
+panic, 16 swap log lines and the iOS Setup "Hei" GUI on screen. App input is
+still unverified on the phone (no device attached this session).
+
+**Still open:** the guest-side present copy (10.9 MB/frame, needs kernel 0087
+offloaded present) and the pset0 ticket-lock timeout under heavy install load
+(needs a rebuild to make the timeout configurable). Native app launch (Settings
+etc.) is still blocked on first-boot system-app registration, not on
+performance - the home-screen icons that are placeholders have nothing to
+launch. APK: `android/app/build/outputs/apk/debug/app-debug.apk` (81.9 MB,
+2026-10-24 00:00). Next device session: install it, check the top bar reads
+~30 fps (not 4), launch an app, and if the kernel panics add `tcgsingle=1`.
+
 ### >>> BOOT / GPU ANALYSIS (2026-10-23): docs/BOOT_ANALYSIS.md <<<
 
 **Measured:** 7 boots reach launchd at 31.3-31.7 s, launchd's early-boot tasks finish at 35-36 s, and the remaining ~200 s is SpringBoard blocked in a LaunchServices sync XPC (`__ulock_wait`-class syscall 515 + `mach_msg2`). The 90 s / 210 s / 330 s samples in `artifacts/ios-clean-log.txt` show the **same stack three times**; `lock-log.txt` reproduces it. So the 4-minute logo is a wait chain (SpringBoard -> FrontBoard -> CoreServices -> lsd), not CPU work: backboardd and `CA::Render::Server` are idle in the same samples.

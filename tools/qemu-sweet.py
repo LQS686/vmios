@@ -298,7 +298,10 @@ def main():
     if a.qemu_debug:
         cmd += ['-d', 'int,guest_errors,unimp', '-D', f'{out}/qemu.log']
     if a.shared_ram:
-        cmd += ['-object', f'memory-backend-file,id=ram,size={ram_gib}G,mem-path={out}/guest-ram.bin,share=on',
+        # prealloc: keep guest pages resident so a first-touch fault never
+        # runs inside a vCPU thread (it stalls MTTCG and can trip XNU's
+        # ticket-lock timeout when another vCPU spins on it).
+        cmd += ['-object', f'memory-backend-file,id=ram,size={ram_gib}G,mem-path={out}/guest-ram.bin,share=on,prealloc=on,prealloc-threads=4',
                 '-numa', 'node,memdev=ram']
     if a.ufs:
         cmd += ['-device', f'sweet-ufs,file={os.path.abspath(a.ufs)},mmio-base=0x0e000000']

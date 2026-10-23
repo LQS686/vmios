@@ -992,20 +992,23 @@ public final class MainActivity extends Activity {
         box.addView(gap(14));
         TextView fpsLabel = text("画面采样：" + cfg.fps + " fps", 12, DIM, false);
         SeekBar seek = new SeekBar(this);
-        seek.setMax(11);
-        seek.setProgress(Math.max(0, Math.min(11, cfg.fps - 1)));
+        // 15..60 fps in steps of 5. The old 1..11 range capped the whole VM
+        // at 11 fps regardless of how fast the guest rendered.
+        seek.setMax(9);
+        seek.setProgress(Math.max(0, Math.min(9, (cfg.fps - 15) / 5)));
         seek.setProgressTintList(ColorStateList.valueOf(ACCENT));
         seek.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
             @Override
             public void onProgressChanged(SeekBar s, int p, boolean fromUser) {
-                fpsLabel.setText("画面采样：" + (p + 1) + " fps");
+                fpsLabel.setText("画面采样：" + (15 + p * 5) + " fps");
             }
             @Override public void onStartTrackingTouch(SeekBar s) { }
             @Override public void onStopTrackingTouch(SeekBar s) { }
         });
         box.addView(fpsLabel);
         box.addView(seek);
-        box.addView(text("QEMU 固定 3 GB 客户机内存、单核 Cortex-A76；参数长度上限 607 字节。",
+        box.addView(text("QEMU 固定 3 GB 客户机内存；vCPU 数取自 cpus=N，默认多线程 TCG。"
+                + "若遇内核 panic，在参数末尾加 tcgsingle=1。参数长度上限 607 字节。",
                 10, DIM, false));
         AlertDialog d = new AlertDialog.Builder(this)
                 .setTitle("高级选项")
@@ -1018,7 +1021,7 @@ public final class MainActivity extends Activity {
                 })
                 .setPositiveButton("保存", (dd, w) -> {
                     cfg.cmdline = et.getText().toString().trim();
-                    cfg.fps = seek.getProgress() + 1;
+                    cfg.fps = 15 + seek.getProgress() * 5;
                     cfg.save(this);
                     showHome();
                 })

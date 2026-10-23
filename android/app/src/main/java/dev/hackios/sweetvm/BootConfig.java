@@ -20,7 +20,7 @@ public final class BootConfig {
     public String rootPath = "";
     public String payloadPath = "";
     public String cmdline = "";
-    public int fps = 4;
+    public int fps = 30;
 
     public static BootConfig load(Context ctx) {
         SharedPreferences p = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
@@ -28,7 +28,11 @@ public final class BootConfig {
         c.rootPath = p.getString(KEY_ROOT, "");
         c.payloadPath = p.getString(KEY_PAYLOAD, "");
         c.cmdline = p.getString(KEY_CMDLINE, "");
-        c.fps = p.getInt(KEY_FPS, 4);
+        // 4 fps used to be the default; a VM captured at 4 fps looks frozen
+        // no matter how fast the guest renders. Anything below the new
+        // 15 fps floor is a leftover of the old default: reset it to 30.
+        int savedFps = p.getInt(KEY_FPS, 30);
+        c.fps = savedFps < 15 ? 30 : Math.min(60, savedFps);
         return c;
     }
 

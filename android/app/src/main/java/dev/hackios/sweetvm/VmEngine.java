@@ -72,7 +72,7 @@ public final class VmEngine {
     public void start(File payloadFile, File rootFile, String cmdline, int fps,
                       boolean resume, Listener listener) throws Exception {
         stop();
-        this.fps = Math.max(1, Math.min(30, fps));
+        this.fps = Math.max(10, Math.min(60, fps));
         File vmDir = new File(ctx.getFilesDir(), "vm");
         if (!vmDir.isDirectory() && !vmDir.mkdirs()) {
             throw new IOException("无法创建 VM 目录");
@@ -126,12 +126,15 @@ public final class VmEngine {
         cmd.add("-cpu"); cmd.add("cortex-a76");
         cmd.add("-smp"); cmd.add(Integer.toString(cpus));
         cmd.add("-m"); cmd.add(RAM_GIB + "G");
-        // MTTCG used to deadlock SWEET's pset0 ticket lock under install/Setup
-        // load, so single-threaded TCG is the default and every vCPU time-shares
-        // one host core (-smp then buys nothing). `tcgmulti=1` on the command
-        // line switches to thread=multi so the experiment needs a payload, not
-        // an APK rebuild; XNU ignores the unknown boot-arg.
-        boolean mttcg = cmdline.contains("tcgmulti=1");
+        // Multi-threaded TCG is the default for a 2-vCPU payload: single
+        // threaded TCG time-shares every vCPU on one host core, so iOS system
+        // daemons, WindowServer and the app serialize and the whole system
+        // feels stalled even when frames render. MTTCG used to trip SWEET's
+        // pset0 ticket lock under install/Setup load; prealloc above removes
+        // the long vCPU stalls that made that timeout fire, and the booted
+        // 2-vCPU home state has run under MTTCG since. `tcgsingle=1` on the
+        // command line restores thread=single for compatibility.
+        boolean mttcg = cpus >= 2 && !cmdline.contains("tcgsingle=1");
         // A large TB cache matters for the multi-hundred-MB dyld shared cache.
         cmd.add("-accel");
         cmd.add(mttcg ? "tcg,thread=multi,tb-size=512" : "tcg,thread=single,tb-size=512");
@@ -146,8 +149,12 @@ public final class VmEngine {
         cmd.add("-nic"); cmd.add("none");
         cmd.add("-L"); cmd.add(qemuShare.getAbsolutePath());
         cmd.add("-object");
+        // prealloc: without it every first touch of a guest page is a host
+        // page fault inside the vCPU thread. iOS allocates continuously, so
+        // those faults freeze the whole guest for milliseconds - the "stall
+        // that is not rendering". Touch all of it once at startup instead.
         cmd.add("memory-backend-file,id=ram,size=" + RAM_GIB
-                + "G,mem-path=" + guestRam.getAbsolutePath() + ",share=on");
+                + "G,mem-path=" + guestRam.getAbsolutePath() + ",share=on,prealloc=on,prealloc-threads=4");
         cmd.add("-numa"); cmd.add("node,memdev=ram");
         cmd.add("-device");
         cmd.add(String.format(Locale.US, "loader,file=%s,addr=0x%x,force-raw=on",
@@ -205,22 +212,23 @@ public final class VmEngine {
         startReader(guestRam, payload, listener);
     }
 
-    /** Words sampled per tick to tell "new frame" from "same picture again". */
-    private static final int PROBE_WORDS = 256;
+    /** Probe every this many 32-bit words: 16 words = 64 bytes. */
+    private static final int PROBE_STEP = 16;
 
     /**
      * A full 1080x2400 frame is 10.4 MB. Copying it on every tick regardless of
      * what the guest did costs a memcpy plus a texture upload for a picture that
      * has not changed (iOS only presents on change, so most ticks have nothing
-     * new). Sample PROBE_WORDS words spread over the panel - a few hundred
-     * reads - and let the caller skip the copy when nothing moved.
+     * new). Sample every 16th word (64 bytes) of the panel and skip the copy
+     * when nothing moved. The old 256-word probe sampled one word every 40 KB,
+     * so a localized change (a caret, a toggle, a tap highlight) could go
+     * unseen for many ticks - a frozen frame that looked like guest lag.
      */
     private static boolean changed(MappedByteBuffer map, int[] probe, int[] last, boolean haveLast) {
-        int words = Payload.FB_STRIDE * Payload.FB_H / 4;
-        int stride = Math.max(1, words / PROBE_WORDS);
+        int words = Math.min(probe.length, Payload.FB_STRIDE * Payload.FB_H / 4 / PROBE_STEP);
         boolean diff = !haveLast;
-        for (int i = 0; i < PROBE_WORDS; i++) {
-            int v = map.getInt(i * stride * 4);
+        for (int i = 0; i < words; i++) {
+            int v = map.getInt(i * PROBE_STEP * 4);
             probe[i] = v;
             if (haveLast && v != last[i]) {
                 diff = true;
@@ -244,8 +252,8 @@ public final class VmEngine {
                 }
             }
             long sleep = Math.max(16, 1000 / fps);
-            int[] probe = new int[PROBE_WORDS];
-            int[] lastProbe = new int[PROBE_WORDS];
+            int[] probe = new int[Payload.FB_STRIDE * Payload.FB_H / 4 / PROBE_STEP];
+            int[] lastProbe = new int[probe.length];
             boolean haveLast = false;
             try {
                 while (running) {
