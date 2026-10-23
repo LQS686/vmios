@@ -24,10 +24,12 @@ causes. All the ones that live outside the guest are fixed; the APK is rebuilt.
 5. **Touch move path** did seek+write per MOVE at up to 120 Hz; coalesced to
    8 ms and the 5-byte record buffer is reused.
 
-**Measured A/B (WSL host, same image/payload, 300 s each):** baseline stayed on
-console text with zero `SWEET FB: swap`; an MTTCG+prealloc run had two TCG
-threads, 16 swap log lines and the iOS Setup "Hei" GUI on screen - but a repeat
-of that configuration panicked, so only the prealloc half is shippable. App input is
+**Measured A/B (WSL host, same image/payload, 300 s each):** the baseline
+(single, no prealloc) and the shippable single+prealloc run both ended on
+console text at 300 s; an MTTCG+prealloc run showed the iOS Setup "Hei" GUI at
+300 s, but a repeat of that configuration panicked. So the speedup is MTTCG's,
+and MTTCG is not shippable until the kernel lock work lands. Prealloc stays for
+runtime smoothness but has no measured boot effect. App input is
 still unverified on the phone (no device attached this session).
 
 **Resume:** prealloc is skipped on `-incoming` (a snapshot restore writes the
@@ -36,6 +38,11 @@ capture=Nfps` so a device session can confirm the config. The app also logs
 `fps=N frames=N uptime=N` every 5 s. APK 00:12; `tools/sweetvm-device-test.py`
 installs it, boots, samples those lines, and swipes once (`--reinstall` if the
 signature changed; it does NOT push the 16 GB image).
+
+**Also tried:** the 1-vCPU-era image with a 2-vCPU payload stalls at the Apple
+logo for 11 min (mismatched pairing, no panic); WSL has no hfsplus module, so
+the Setup-skip prefs cannot be written into an image on this host. A shipping
+config run (2 vCPU, thread=single, prealloc, matching image) is in h4/.
 
 **Environment incident 2026-10-24:** three 17 GB image copies filled host D: to
 0 bytes and WSL died with EIO. Recovered by sparse-converting the VHD, setting
