@@ -234,6 +234,8 @@ def main():
                     help='back guest RAM with outdir/guest-ram.bin (share=on) for an external framebuffer reader')
     ap.add_argument('--smp', type=int, default=1,
                     help='QEMU vCPUs; must match mkadt.py --qemu-cpus N (default: 1)')
+    ap.add_argument('--tcg-single', action='store_true',
+                    help='single-threaded TCG even with --smp > 1; avoids the SWEET pset0 ticket-lock deadlock')
     ap.add_argument('--touch', metavar='SOCKET',
                     help='enable vm/qemu/sweet_touch.c and listen on this Unix socket')
     a = ap.parse_args()
@@ -283,7 +285,7 @@ def main():
     ram_gib = max(4, -(-(phys_base + mem_size - 0x40000000) // (1 << 30)))
     cmd = [a.qemu, '-M', 'virt,gic-version=3', '-cpu', a.cpu,
            '-smp', str(a.smp), '-m', f'{ram_gib}G',
-           '-accel', 'tcg,thread=multi' if a.smp > 1 else 'tcg',
+           '-accel', 'tcg' if a.tcg_single or a.smp == 1 else 'tcg,thread=multi',
            '-nographic', '-serial', f'file:{out}/serial.txt', '-qmp', f'unix:{mon},server,nowait',
            '-d', 'int,guest_errors,unimp', '-D', f'{out}/qemu.log', '-no-reboot']
     if a.shared_ram:

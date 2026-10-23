@@ -191,6 +191,27 @@ LastSystemVersion=20H392 for the stable 2-vCPU home. The new APK installs
 and launches on the x86_64 AVD (UI up; a System UI ANR was emulator load,
 not the app); the demo-run smoke test remains.
 
+**Home apps still placeholders:** on the stable 2-vCPU home, a clean
+unlock + tap on Settings produced no `Preferences` exec and no app launch
+after 45 s; the icons above show "Waiting...". The apps are not registered
+by MobileInstallation/SystemAppMigrator, so the icon tap has nothing to
+launch. The current boot (`qrun-setup2`) re-enables Setup (purplebuddy prefs
+removed) and keeps the migration skipped; the plan is to swipe past the
+Hello animation and complete enough of Setup to create the mobile user and
+install/register the system apps. This is the intended iOS first-boot path
+and the remaining prerequisite for native app use/IPA installation.
+
+**Scheduler ticket-lock deadlock under MTTCG:** selecting a language in Setup
+(or running SystemAppMigrator) on 2 vCPUs with `tcg,thread=multi` panics in
+`hw_lck_ticket_timeout_panic`; the spinlock at 0xfffffe0007b90880 is
+`_pset0 + 0x100` (the default processor-set ticket lock), owner on CPU 0,
+waiter on CPU 1, 3,000,000-tick timeout. The migration-skipped home boot is
+light enough to avoid it; 1 vCPU avoids cross-CPU contention but the install
+stalls in an `installd` sync XPC. Workaround under test: 2 vCPUs with
+**single-threaded TCG** (`tools/qemu-sweet.py --tcg-single`; the app's
+`VmEngine` now always passes `-accel tcg`), which serializes vCPUs so the
+scheduler lock cannot deadlock. Setup is booting at `qrun-setup3`.
+
 App side: `VmEngine` now derives `-smp N` and `tcg,thread=multi` from the
 payload's `cpus=N`, and `ensureQemuArgs` no longer forces `cpus=1`, so the
 imported 2-vCPU iOS payload runs with the configuration proven here. The APK

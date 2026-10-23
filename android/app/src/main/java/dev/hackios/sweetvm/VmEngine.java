@@ -109,7 +109,8 @@ public final class VmEngine {
         cmd.add("-cpu"); cmd.add("cortex-a76");
         cmd.add("-smp"); cmd.add(Integer.toString(cpus));
         cmd.add("-m"); cmd.add(RAM_GIB + "G");
-        cmd.add("-accel"); cmd.add(cpus > 1 ? "tcg,thread=multi" : "tcg");
+        // MTTCG deadlocks SWEET's pset0 ticket lock under install/Setup load.
+        cmd.add("-accel"); cmd.add("tcg");
         cmd.add("-display"); cmd.add("none");
         cmd.add("-serial"); cmd.add("file:" + serial.getAbsolutePath());
         cmd.add("-monitor"); cmd.add("none");
