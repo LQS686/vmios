@@ -66,6 +66,26 @@ def decode_ring(blob, max_bytes=262144):
     return data[pos:] + data[:n - (ring - pos)]
 
 
+def fetch_ring(adb, pkg):
+    """Return the 4 KiB SWEETLOG header + ring from the device, or None."""
+    r = run([adb, 'shell', 'run-as', pkg, 'stat', '-c', '%s', 'files/ios16-root.img'])
+    size = r.stdout.strip()
+    if not size.isdigit():
+        r = run([adb, 'shell', 'run-as', pkg, 'ls', '-l', 'files/ios16-root.img'])
+        parts = r.stdout.split()
+        size = parts[4] if len(parts) > 4 else ''
+    if not size.isdigit():
+        return None
+    base = int(size) - RING - HEADER_BLOCK
+    if base < 0:
+        return None
+    skip = (base + HEADER_BLOCK - 1) // HEADER_BLOCK
+    r = subprocess.run([adb, 'exec-out', 'run-as', pkg, 'dd',
+                        'if=files/ios16-root.img', 'bs=4096', 'skip=%d' % skip,
+                        'count=1025'], capture_output=True, timeout=180)
+    return r.stdout
+
+
 def pull_guest_log(adb, pkg, outdir):
     """Pull the last 4 MiB + 4 KiB of the image and decode the SWEETLOG ring.
 
@@ -73,25 +93,8 @@ def pull_guest_log(adb, pkg, outdir):
     panic) only exists in that ring; reading it off the phone is the only way
     to see why a boot died. Uses toybox dd inside run-as, 4 KiB at a time.
     """
-    r = run([adb, 'shell', 'run-as', pkg, 'stat', '-c', '%s', 'files/ios16-root.img'])
-    size = r.stdout.strip()
-    if not size.isdigit():
-        # toybox stat is present on every recent Android; ls -l is the fallback
-        r = run([adb, 'shell', 'run-as', pkg, 'ls', '-l', 'files/ios16-root.img'])
-        parts = r.stdout.split()
-        size = parts[4] if len(parts) > 4 else ''
-    if not size.isdigit():
-        print('[!] cannot stat the root image on the device; no guest log', file=sys.stderr)
-        return
-    base = int(size) - RING - HEADER_BLOCK
-    if base < 0:
-        return
-    skip = (base + HEADER_BLOCK - 1) // HEADER_BLOCK
-    # exec-out execs dd directly (no shell), so no redirection here.
-    r = subprocess.run([adb, 'exec-out', 'run-as', pkg, 'dd',
-                        'if=files/ios16-root.img', 'bs=4096', 'skip=%d' % skip,
-                        'count=1025'], capture_output=True, timeout=180)
-    out = decode_ring(r.stdout)
+    blob = fetch_ring(adb, pkg)
+    out = decode_ring(blob) if blob else None
     if out is None:
         print('[!] no SWEETLOG header in the pulled tail', file=sys.stderr)
         return
@@ -99,6 +102,43 @@ def pull_guest_log(adb, pkg, outdir):
     with open(path, 'wb') as f:
         f.write(out)
     print('[*] guest console ->', path, '(%d bytes of %d)' % (len(out), total))
+
+
+def native_app_check(adb, pkg, outdir, wait=120):
+    """Watch the guest console while the user opens Settings/Photos.
+
+    Native apps can only launch after MobileInstallation registers them; the
+    kernel logs `exec <binary>` for whatever actually starts, so the ring is
+    the ground truth (the screen alone cannot tell "tap ignored" from "app
+    started and rendered the same home screen").
+    """
+    def shot(name):
+        r = subprocess.run([adb, 'exec-out', 'screencap', '-p'],
+                           capture_output=True, timeout=60)
+        with open(os.path.join(outdir, name), 'wb') as f:
+            f.write(r.stdout)
+
+    print('[*] opening the home screen; then tap Settings (or Photos) on the phone')
+    print('[*] watching the guest console for %d s ...' % wait)
+    t0 = time.time()
+    seen = None
+    while time.time() - t0 < wait:
+        blob = fetch_ring(adb, pkg)
+        text = (decode_ring(blob) or b'').decode('utf-8', 'replace')
+        for prog in ('Preferences', 'MobileSlideShow', 'MobileSafari', 'AppStore'):
+            if ('exec ' + prog) in text:
+                seen = prog
+                break
+        if seen:
+            break
+        time.sleep(10)
+    shot('native-app-after.png')
+    if seen:
+        print('[*] app launched:', seen, '(exec seen in the guest console)')
+        return 0
+    print('[!] no app exec within %d s; registration is still missing ' % wait
+          + '(see docs/PERF_FIXES.md 8)', file=sys.stderr)
+    return 5
 
 
 def self_test():
@@ -132,6 +172,8 @@ def main(argv=None):
                     help='how long to watch the VM after launch')
     ap.add_argument('--shot-secs', type=int, default=60)
     ap.add_argument('--out', default='artifacts/device-test')
+    ap.add_argument('--native-app-check', action='store_true',
+                    help='after the run, watch the guest console while you open Settings')
     ap.add_argument('--self-test', action='store_true',
                     help='check the SWEETLOG decoder on synthetic rings and exit')
     a = ap.parse_args(argv)
@@ -232,6 +274,8 @@ def main(argv=None):
                   'and that the APK is the rebuilt one', file=sys.stderr)
     pull_guest_log(adb, 'dev.hackios.sweetvm', a.out)
     print('[*] logs and screenshots in', a.out)
+    if a.native_app_check:
+        return native_app_check(adb, 'dev.hackios.sweetvm', a.out)
     return 0
 
 

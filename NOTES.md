@@ -42,6 +42,10 @@ SWEET FB swaps, and sampler blocks for SpringBoard **65 threads**, backboardd
 system threads on 1-2 vCPUs time-shared on one host core (plus present cost),
 and native apps have never been exec'd (registration).
 
+**Native-app check:** `tools/sweetvm-device-test.py --native-app-check` waits for
+you to tap Settings/Photos and polls the guest ring for `exec Preferences`
+etc.; no exec within 120 s means registration is still missing (exit 5).
+
 **MTTCG is now an explicit toggle** (advanced options, default off): it appends
 `tcgmulti=1`, VmEngine adds the 2 s lock timeouts and reserves the boot-arg
 space for them, and the exit dialog says to turn it off if the guest log shows

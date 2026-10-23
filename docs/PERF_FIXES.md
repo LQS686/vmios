@@ -252,7 +252,8 @@ D: 目前只剩 7.8 GB，之后不要再整盘复制 17 GB 镜像；测试请用
 
 **剩余工作的最短路径**
 
-1. 接手机 → `python3 tools/sweetvm-device-test.py`（含 SWEETLOG 拉取），用 `fps=` 判断
+1. 接手机 → `python3 tools/sweetvm-device-test.py --native-app-check`（含 SWEETLOG
+   拉取与"点开设置/照片"时的 `exec` 监视），用 `fps=` 判断
    流畅度是否达标；不达标时优先看 `capture` 是否 30、`accel` 是否 single、
    Guest 是否在 `SWEET FB: swap` 之外大量等待。
 2. 原生 App：抓 `installd`/`mobile_installation_proxy` 的同步 XPC（参考 NOTES 里
