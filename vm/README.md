@@ -13,12 +13,21 @@ Two additional QEMU core changes are required:
 
 `qemu/qemu-sweet.patch`, `qemu/sweet_ufs.c` and `qemu/sweet_touch.c` are the
 source. `sweet_touch` models GCC, TLMM and GENI SE7 plus a synthetic Goodix
-GT9896; its input is a 5-byte chardev packet (type, x LE16, y LE16). Use:
+GT9896; its input is a 5-byte record (type, x LE16, y LE16), either over a
+chardev or from a state file:
 
 ```sh
 -chardev socket,id=sweet_touch,path=/tmp/touch.sock,server=on,wait=off
 -device sweet-touch,chardev=sweet_touch
+# or, without chardev flow control:
+-device sweet-touch,touchfile=/tmp/touch.bin
 ```
+
+`tools/qemu-sweet.py --touchfile FILE` writes the latter. A paused VM can be
+saved and resumed with QEMU's file migration transport (no block device
+needed): `migrate` to `file:/path/vmstate` over QMP, then start with
+`-incoming file:/path/vmstate` (`tools/qemu-sweet.py --incoming FILE`). This
+skips a 15-20 minute TCG boot and is what the Android app's quick start uses.
 
 The kernel's `sweet_touch.c` requires the L11C RPMh vote to succeed; QEMU has
 no RPMh block, so run `tools/patch-qemu-input.py` on the kernel (it replaces

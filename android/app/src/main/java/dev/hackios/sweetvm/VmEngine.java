@@ -36,6 +36,8 @@ public final class VmEngine {
     private volatile long frames;
     private File guestRam;
     private File logFile;
+    private File qmpSocket;
+    private String engineId = "";
     private FramebufferView view;
     private int fps = 4;
 
@@ -55,12 +57,20 @@ public final class VmEngine {
         return logFile;
     }
 
+    public File qmpSocket() {
+        return qmpSocket;
+    }
+
+    public String engineId() {
+        return engineId;
+    }
+
     public void setView(FramebufferView v) {
         view = v;
     }
 
     public void start(File payloadFile, File rootFile, String cmdline, int fps,
-                      Listener listener) throws Exception {
+                      boolean resume, Listener listener) throws Exception {
         stop();
         this.fps = Math.max(1, Math.min(15, fps));
         File vmDir = new File(ctx.getFilesDir(), "vm");
@@ -86,7 +96,13 @@ public final class VmEngine {
         File stub = new File(vmDir, "stub.bin");
         payload.writeImages(ram, stub, cmdline);
 
-        guestRam = new File(BootConfig.externalDir(ctx), "guest-ram.bin");
+        // Keep the 3 GB RAM file on internal storage: the old external path is
+        // FUSE-backed and makes every guest RAM access pay a FUSE round trip.
+        File oldRam = new File(BootConfig.externalDir(ctx), "guest-ram.bin");
+        if (oldRam.isFile()) {
+            oldRam.delete();
+        }
+        guestRam = new File(vmDir, "guest-ram.bin");
         try (RandomAccessFile rf = new RandomAccessFile(guestRam, "rw")) {
             if (rf.length() != RAM_BYTES) {
                 rf.setLength(RAM_BYTES);
@@ -101,6 +117,7 @@ public final class VmEngine {
         serial.delete();
 
         EngineAssets.Engine eng = EngineAssets.ensure(ctx);
+        engineId = eng.version;
         String qemu = eng.qemu.getAbsolutePath();
 
         List<String> cmd = new ArrayList<>();
@@ -110,10 +127,15 @@ public final class VmEngine {
         cmd.add("-smp"); cmd.add(Integer.toString(cpus));
         cmd.add("-m"); cmd.add(RAM_GIB + "G");
         // MTTCG deadlocks SWEET's pset0 ticket lock under install/Setup load.
-        cmd.add("-accel"); cmd.add("tcg,thread=single");
+        // A large TB cache matters for the multi-hundred-MB dyld shared cache.
+        cmd.add("-accel"); cmd.add("tcg,thread=single,tb-size=512");
         cmd.add("-display"); cmd.add("none");
         cmd.add("-serial"); cmd.add("file:" + serial.getAbsolutePath());
         cmd.add("-monitor"); cmd.add("none");
+        qmpSocket = new File(vmDir, "qmp.sock");
+        qmpSocket.delete();
+        cmd.add("-qmp");
+        cmd.add("unix:" + qmpSocket.getAbsolutePath() + ",server=on,wait=off");
         cmd.add("-no-reboot");
         cmd.add("-nic"); cmd.add("none");
         cmd.add("-L"); cmd.add(qemuShare.getAbsolutePath());
@@ -135,6 +157,10 @@ public final class VmEngine {
             }
             cmd.add("-device");
             cmd.add("sweet-ufs,file=" + rootFile.getAbsolutePath() + ",mmio-base=0xe000000");
+            if (resume) {
+                cmd.add("-incoming");
+                cmd.add("file:" + Snapshot.stateFile(ctx).getAbsolutePath());
+            }
         }
         File touchFile = new File(vmDir, "touch.bin");
         touchFile.delete();

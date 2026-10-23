@@ -24,9 +24,11 @@ public final class EngineAssets {
     public static final class Engine {
         public final File dir;
         public final File qemu;
-        Engine(File dir, File qemu) {
+        public final String version;
+        Engine(File dir, File qemu, String version) {
             this.dir = dir;
             this.qemu = qemu;
+            this.version = version;
         }
     }
 
@@ -36,7 +38,7 @@ public final class EngineAssets {
     public static Engine ensure(Context ctx) throws IOException {
         String abi = supportedAbi();
         File dir = new File(ctx.getFilesDir(), "engine-" + abi);
-        String version = engineVersion(ctx) + "-" + abi;
+        String version = currentVersion(ctx);
         File marker = new File(dir, ".version");
         if (!marker.isFile() || !version.equals(readSmall(marker))) {
             deleteTree(dir);
@@ -55,7 +57,12 @@ public final class EngineAssets {
         if (!qemu.setExecutable(true)) {
             throw new IOException("无法给 QEMU 设置执行权限");
         }
-        return new Engine(dir, qemu);
+        return new Engine(dir, qemu, version);
+    }
+
+    /** Identifies the extracted engine; snapshots are only valid for the same one. */
+    public static String currentVersion(Context ctx) throws IOException {
+        return engineVersion(ctx) + "-" + supportedAbi();
     }
 
     public static String supportedAbi() throws IOException {

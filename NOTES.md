@@ -259,6 +259,17 @@ The app cached the extracted engine by versionCode only, so a rebuilt engine
 could be masked by a stale `files/engine-<abi>`; `EngineAssets` now includes
 `lastUpdateTime` in the marker.
 
+**Quick resume:** QEMU's `file:` migration transport saves the paused VM
+(guest RAM + device state) and `-incoming file:...` restores it. Verified on
+the host with the custom UFS/touch devices: a 4 GB VM snapshot is 1.1 GB after
+zero-page skipping, saving takes ~18 s at ~530 MB/s, and restoring the
+Setup-greeting state took ~20 s instead of a 19-minute TCG boot. The app's
+stop dialog now offers "保存快照并退出"; the home screen shows
+"快速启动 iOS（快照）" when the payload/root mtime, cmdline and engine
+fingerprint still match (`Snapshot.java`, QMP socket `vm/qmp.sock`).
+The 3 GB guest RAM file moved from external FUSE storage to internal
+`files/vm/guest-ram.bin`, and TCG now runs with `thread=single,tb-size=512`.
+
 App side: `VmEngine` now derives `-smp N` and `tcg,thread=multi` from the
 payload's `cpus=N`, and `ensureQemuArgs` no longer forces `cpus=1`, so the
 imported 2-vCPU iOS payload runs with the configuration proven here. The APK

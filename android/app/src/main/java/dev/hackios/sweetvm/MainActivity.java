@@ -77,6 +77,7 @@ public final class MainActivity extends Activity {
     private TextView vmPill;
     private boolean vmActive;
     private boolean vmStopping;
+    private String lastCmdline = "";
     private long vmStartedAt;
     private long lastFrames;
     private long lastFrameTime;
@@ -352,13 +353,18 @@ public final class MainActivity extends Activity {
         status.addView(infoRow("内核 payload", payload == null ? "未选择" :
                 BootConfig.shortPath(payload), payload != null && BootConfig.looksLikePayload(payload)));
         status.addView(gap(14));
-        TextView note = text("根镜像放在应用专属外部存储，QEMU 直接读写，不复制到系统分区。",
-                11, DIM, false);
+        TextView note = text("根镜像与 3GB 客户机内存放在应用内部存储，QEMU 直接读写。"
+                + "启动后可在“停止”里保存快照，下次秒开。", 11, DIM, false);
         status.addView(note);
         c.addView(status);
         c.addView(gap(14));
 
-        c.addView(action("启动 iOS 虚拟机", true, v -> startIos()), wide());
+        c.addView(action(canResume() ? "快速启动 iOS（快照）" : "启动 iOS 虚拟机",
+                true, v -> startIos()), wide());
+        if (canResume()) {
+            c.addView(gap(10));
+            c.addView(action("冷启动 iOS（不使用快照）", false, v -> startIos(false)), wide());
+        }
         c.addView(gap(10));
         c.addView(action("运行引擎自检（无需 iOS）", false, v -> startDemo()), wide());
         c.addView(gap(20));
@@ -392,7 +398,7 @@ public final class MainActivity extends Activity {
                         + "在 Linux/macOS 上用 tools/mkiosroot.sh 生成 HFS+ 根镜像；payload 用 "
                         + "tools/mkadt.py --qemu 和 tools/mkpayload.py 构建。\n\n"
                         + "首次启动建议先跑“引擎自检”，确认显示链路正常。\n\n"
-                        + "当前版本是只读显示：触摸与硬件按键的 QEMU 输入设备尚未接入。",
+                        + "触摸已通过 sweet-touch（GENI SE7 + GT9896）接入；电源/音量键尚未接入。",
                 12, DIM, false);
         legal.setLineSpacing(dp(3), 1.2f);
         c.addView(legal);
@@ -579,7 +585,26 @@ public final class MainActivity extends Activity {
         return -1;
     }
 
+    private boolean canResume() {
+        File root = cfg.rootFile();
+        File payload = cfg.payloadFile();
+        if (root == null || !root.isFile() || payload == null || !payload.isFile()) {
+            return false;
+        }
+        String engineVersion;
+        try {
+            engineVersion = EngineAssets.currentVersion(this);
+        } catch (IOException e) {
+            return false;
+        }
+        return Snapshot.isUsable(this, payload, root, iosCmdline(payload), engineVersion);
+    }
+
     private void startIos() {
+        startIos(canResume());
+    }
+
+    private void startIos(boolean resume) {
         File root = cfg.rootFile();
         File payload = cfg.payloadFile();
         if (root == null || !root.isFile()) {
@@ -595,14 +620,14 @@ public final class MainActivity extends Activity {
         if (!BootConfig.looksLikeHfs(root)) {
             dialog("根镜像格式未确认",
                     "在 offset 1024 没有找到 HFS+ 卷头（H+ / HX）。继续启动可能失败。",
-                    "仍然启动", () -> launch(payload, root, iosCmdline(payload)));
+                    "仍然启动", () -> launch(payload, root, iosCmdline(payload), resume));
             return;
         }
         if (!BootConfig.looksLikePayload(payload)) {
             dialog("payload 格式错误", "文件不是 SWEETXNU payload，请重新生成。");
             return;
         }
-        launch(payload, root, iosCmdline(payload));
+        launch(payload, root, iosCmdline(payload), resume);
     }
 
     private String iosCmdline(File payload) {
@@ -688,10 +713,10 @@ public final class MainActivity extends Activity {
             dialog("演示 payload 损坏", "assets/demo/payload.bin 不是 SWEETXNU payload。");
             return;
         }
-        launch(payload, null, demoCmdline(payload));
+        launch(payload, null, demoCmdline(payload), false);
     }
 
-    private void launch(File payload, File root, String cmd) {
+    private void launch(File payload, File root, String cmd, boolean resume) {
         try {
             Payload p = Payload.load(payload);
             if (p.physBase != 0xb0000000L) {
@@ -705,6 +730,7 @@ public final class MainActivity extends Activity {
             return;
         }
         showVmScreen();
+        lastCmdline = cmd;
         touch = new TouchSender(new File(getFilesDir(), "vm/touch.bin"));
         touch.start();
         acquireWake();
@@ -718,7 +744,7 @@ public final class MainActivity extends Activity {
         ui.post(ticker);
         new Thread(() -> {
             try {
-                engine.start(payload, root, cmd, cfg.fps, new VmEngine.Listener() {
+                engine.start(payload, root, cmd, cfg.fps, resume, new VmEngine.Listener() {
                     @Override
                     public void onExit(int code, String logTail) {
                         ui.post(() -> {
@@ -860,10 +886,55 @@ public final class MainActivity extends Activity {
         }
         new AlertDialog.Builder(this)
                 .setTitle("停止虚拟机？")
-                .setMessage("未保存的 iOS 状态会丢失（HFS+ 已写入的部分会保留）。")
+                .setMessage("保存快照会把当前 RAM 和设备状态写入磁盘，下次启动只需几秒；"
+                        + "直接停止会丢失未保存的 iOS 状态（HFS+ 已写入的部分保留）。")
                 .setNegativeButton("继续运行", null)
-                .setPositiveButton("停止", (d, w) -> stopVm(true))
+                .setNeutralButton("直接停止", (d, w) -> stopVm(true))
+                .setPositiveButton("保存快照并退出", (d, w) -> saveAndStop())
                 .show();
+    }
+
+    private void saveAndStop() {
+        if (!vmActive) {
+            showHome();
+            return;
+        }
+        final File payload = cfg.payloadFile();
+        final File root = cfg.rootFile();
+        final String cmd = lastCmdline;
+        final String engineVersion;
+        try {
+            engineVersion = EngineAssets.currentVersion(this);
+        } catch (IOException e) {
+            toast("保存快照失败: " + e.getMessage());
+            return;
+        }
+        final AlertDialog progress = new AlertDialog.Builder(this)
+                .setTitle("正在保存快照")
+                .setMessage("写入客户机内存与设备状态，请稍候…")
+                .setCancelable(false)
+                .show();
+        vmStopping = true;
+        vmActive = false;
+        ui.removeCallbacks(ticker);
+        new Thread(() -> {
+            String err = null;
+            try {
+                Snapshot.save(engine.qmpSocket(), Snapshot.stateFile(this));
+                Snapshot.writeMeta(this, payload, root, cmd, engineVersion);
+            } catch (Exception e) {
+                err = e.getMessage() == null ? e.toString() : e.getMessage();
+            }
+            engine.stop();
+            final String fe = err;
+            ui.post(() -> {
+                progress.dismiss();
+                releaseWake();
+                getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                showHome();
+                toast(fe == null ? "快照已保存，下次可秒开" : "保存快照失败: " + fe);
+            });
+        }, "sweetvm-snapshot").start();
     }
 
     private void stopVm(boolean home) {

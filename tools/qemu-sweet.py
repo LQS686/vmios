@@ -240,6 +240,8 @@ def main():
                     help='enable vm/qemu/sweet_touch.c and listen on this Unix socket')
     ap.add_argument('--touchfile', metavar='FILE',
                     help='feed sweet-touch from a 5-byte state file instead of a chardev')
+    ap.add_argument('--incoming', metavar='FILE',
+                    help='restore a VM state written by QMP migrate file:...')
     a = ap.parse_args()
 
     if a.check_env:
@@ -287,7 +289,7 @@ def main():
     ram_gib = max(4, -(-(phys_base + mem_size - 0x40000000) // (1 << 30)))
     cmd = [a.qemu, '-M', 'virt,gic-version=3', '-cpu', a.cpu,
            '-smp', str(a.smp), '-m', f'{ram_gib}G',
-           '-accel', 'tcg,thread=single' if a.tcg_single or a.smp == 1 else 'tcg,thread=multi',
+           '-accel', ('tcg,thread=single' if a.tcg_single or a.smp == 1 else 'tcg,thread=multi') + ',tb-size=512',
            '-nographic', '-serial', f'file:{out}/serial.txt', '-qmp', f'unix:{mon},server,nowait',
            '-d', 'int,guest_errors,unimp', '-D', f'{out}/qemu.log', '-no-reboot']
     if a.shared_ram:
@@ -306,6 +308,8 @@ def main():
     cmd += ['-device', f'loader,file={out}/ram.bin,addr={phys_base:#x},force-raw=on',
             '-device', f'loader,file={out}/stub.bin,addr={STUB_PA:#x},force-raw=on',
             '-device', f'loader,addr={STUB_PA:#x},cpu-num=0']
+    if a.incoming:
+        cmd += ['-incoming', f'file:{os.path.abspath(a.incoming)}']
     if a.gdb:
         cmd += ['-S', '-gdb', 'tcp::1234']
 
