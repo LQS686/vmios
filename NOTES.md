@@ -16,8 +16,11 @@ causes. All the ones that live outside the guest are fixed; the APK is rebuilt.
    core while the guest crawled. MTTCG was briefly made the default, then a
    second cold boot PANICKED on pset0's ticket lock after 3,000,001 ticks
    (=125 ms at 24 MHz, owner on CPU 1, no debugger handshake), so the default
-   is single again and `tcgmulti=1` stays an experiment. This needs the kernel
-   fix in docs/PERF_FIXES.md 5.2.
+   is single again and `tcgmulti=1` stays an experiment. The timeout is a
+   boot-arg: XNU parses `tlto_us`/`slto_us` (us) in ml_init_lock_timeout; with
+   2 s the same MTTCG boot ran 460 s without a panic (owner was just slow, not
+   dead). tcgmulti=1 now appends both automatically. No measured MTTCG speed
+   win yet, so single stays the default.
 4. **Guest RAM page faults inside the vCPU thread** (507k minflt, RSS
    149 MB -> 1.78 GB in 5 min). `memory-backend-file,...,prealloc=on,
    prealloc-threads=4` moves that to startup.

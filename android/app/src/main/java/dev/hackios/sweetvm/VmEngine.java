@@ -126,15 +126,17 @@ public final class VmEngine {
         cmd.add("-cpu"); cmd.add("cortex-a76");
         cmd.add("-smp"); cmd.add(Integer.toString(cpus));
         cmd.add("-m"); cmd.add(RAM_GIB + "G");
-        // Single-threaded TCG is the only stable mode. MTTCG looks tempting
-        // (two real vCPUs instead of two time-shared on one host core) but it
-        // panics on pset0's ticket lock: 2026-10-24, 2 vCPUs, prealloc on,
-        // timeout after 3,000,001 ticks (125 ms at 24 MHz), ticket 0xca/0xcb/
-        // 0xce with the owner on CPU 1 and no debugger handshake. That is a
-        // real hang of the lock owner, not a short timeout, and it happens
-        // with or without prealloc. Keep the experiment behind tcgmulti=1;
-        // the real fix is a kernel-side lock/timeout change.
+        // Single-threaded TCG stays the default. MTTCG gives two real vCPUs
+        // but panicked on pset0's ticket lock: 2 vCPUs, timeout after
+        // 3,000,001 ticks (125 ms at 24 MHz), owner on CPU 1, no debugger
+        // handshake. That owner was not dead: XNU's timeout is tlto_us and a
+        // TCG vCPU can exceed 125 ms while the owner blocks on host I/O. The
+        // same boot with tlto_us/slto_us=2000000 ran 460 s without a panic.
+        // Enable the experiment with tcgmulti=1; it appends the tunables.
         boolean mttcg = cpus >= 2 && cmdline.contains("tcgmulti=1");
+        if (mttcg && !cmdline.contains("tlto_us=")) {
+            cmdline += " tlto_us=2000000 slto_us=2000000";
+        }
         android.util.Log.i("sweetvm", "engine cpus=" + cpus + " accel="
                 + (mttcg ? "tcg,thread=multi" : "tcg,thread=single")
                 + " prealloc=" + !resume + " capture=" + this.fps + "fps");

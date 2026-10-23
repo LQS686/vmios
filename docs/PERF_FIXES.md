@@ -135,9 +135,26 @@ handshake structure not initialized
 
 24 MHz 计数下 3,000,001 tick = **125 ms**。票据 0xca..0xce 说明已有 4 个 CPU
 在等 0xcb，持有者在 CPU 1 上 125 ms 没有释放，而且 panic 时拿不到它的
-handshake/栈。这不是"超时太短被误伤"，而是持有者真的卡住了；prealloc
-并不能消除它。因此 `VmEngine` 恢复 **`thread=single` 默认**，`tcgmulti=1`
-只保留为试验开关。要真正用上第二颗核，必须做 §5.2 的内核工作。
+handshake/栈。prealloc 并不能消除它，因此 `VmEngine` 恢复 `thread=single`
+默认。
+
+**但 125 ms 不是死锁的证据。** 反汇编 `_ml_init_lock_timeout` 后确认 XNU 的
+两个 boot-arg 就是锁超时：
+
+```
+slto_us   自旋锁超时（微秒）
+tlto_us   ticket 锁超时（微秒，默认约 125 ms）
+```
+
+`_hw_lck_ticket_contended` 用 `_hw_spin_compute_timeout(policy)` 把
+`tlto_us` 换成 absolutetime 作为 deadline。把 `tlto_us`/`slto_us` 提到
+**2 s** 后，同一个 2 vCPU MTTCG 配置跑了 **460 s 没有 panic**（此前 ~3 分钟
+必 panic），停在 userland 中段。也就是说：持有者只是被宿主 I/O / 调度拖过了
+125 ms，2 s 足够它回来——这更像"TCG 下临界区被拉长"，不是内核死锁。
+
+目前仍不把 MTTCG 设为默认：460 s 内没有进入 GUI，也还没有测到交互帧率，
+无法证明 2 vCPU 的收益。`tcgmulti=1` 现在会自动追加
+`tlto_us=2000000 slto_us=2000000`（`VmEngine`），保持一个开关即可试验。
 
 ### 4.3 其它两次失败的对照（避免误导后来人）
 
@@ -155,12 +172,11 @@ handshake/栈。这不是"超时太短被误伤"，而是持有者真的卡住�
    真正的修法是让 App 直接读 CA 的 surface（内核把 surface 的 PA/stride/seq
    写进 boot_args 的空字段，App 用 GPU 缩放上屏），Guest 不再拷。
    这需要一次内核构建，`xnu/patches/0087-*`。
-2. **pset0 ticket lock**：见 §4.2，MTTCG 下 2 vCPU 冷启动即会 panic。需要
-   一次内核构建：(a) 把 `LOCK_TICKET_TIMEOUT` 做成 boot-arg（默认加大到
-   1 s 量级）；(b) 修好 `hw_lck_ticket_timeout_panic` 的 CPU handshake，让
-   panic 能打印持有 CPU 的 PC/LR（现在是 `handshake structure not
-   initialized`，什么都看不到）；(c) 若持有者确实卡死，再按 (b) 的栈定位。
-   在 (a)(b) 落地前，`thread=single` 是唯一可发布的模式。
+2. **pset0 ticket lock**：见 §4.2。`tlto_us`/`slto_us` 已经是现成的 tunable，
+   不需要内核构建就能把 125 ms 提到 2 s 并避开 panic。仍建议一次内核构建
+   修好 `hw_lck_ticket_timeout_panic` 的 CPU handshake（现在 panic 里拿不到
+   持有 CPU 的 PC/LR，无法判断 2 s 以后是否还会卡）。在真机上测到
+   MTTCG 的交互帧率收益之前，默认保持 `thread=single`。
 
 ## 6. 复现
 
