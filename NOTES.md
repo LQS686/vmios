@@ -35,6 +35,13 @@ and MTTCG is not shippable until the kernel lock work lands. Prealloc stays for
 runtime smoothness but has no measured boot effect. App input is
 still unverified on the phone (no device attached this session).
 
+**Phone ring read offline (2026-10-24):** `.tools/ios16-root.img`'s SWEETLOG
+holds two boots and 108 KB: 0 panic / 0 backboardd crash / 0 app execs, 16
+SWEET FB swaps, and sampler blocks for SpringBoard **65 threads**, backboardd
+22, Setup 9, lsd 7. So the phone's stutter is not a crash loop; it is 87
+system threads on 1-2 vCPUs time-shared on one host core (plus present cost),
+and native apps have never been exec'd (registration).
+
 **Guest log on the phone:** QEMU runs without a console chardev, so
 `vm/serial.log` is empty and the app's log screen showed nothing. `SweetLog`
 reads the kernel's 4 MiB SWEETLOG ring out of the root image (header block +

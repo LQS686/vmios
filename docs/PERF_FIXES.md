@@ -20,6 +20,22 @@ L1 单独就能解释"不是画面渲染的卡"：Guest 哪怕跑 16 fps，App �
 但画面反馈的节奏是 App 定的。这一条此前被"16.5 fps"的 Guest 测量掩盖了，
 因为那个数字量的是 Guest 的 swap，不是屏幕上的帧。
 
+### 1.1 手机侧的真实证据（从根镜像尾部的 SWEETLOG 环离线读出）
+
+`.tools/ios16-root.img` 的环里覆盖最近 **2 次启动**、108 KB：
+
+| 观测 | 数值 | 含义 |
+|---|---|---|
+| panic / `CRASH backboardd` / 未捕获异常 | **0 / 0 / 0** | 手机上的卡顿**不是**崩溃循环 |
+| `SWEET FB: swap` 明细 | 16 | GUI 能 present，锁屏/主屏出得来 |
+| 采样到的线程数 | SpringBoard **65**、backboardd 22、Setup 9、lsd 7、containermanager 5 | iOS 是重多线程系统 |
+| `exec Preferences/MobileSlideShow/MobileSafari/AppStore` | **0** | 这些日志里原生 App 从未被拉起 |
+
+65 个 SpringBoard 线程 + 22 个 backboardd 线程挤在 1–2 个 vCPU 上，而单线程
+TCG 又把所有 vCPU 放在**一个宿主核**上时间片轮转——这就是"不是渲染"的那部分
+卡顿：每次动画/触摸都可能排在这些线程后面。同一份日志也说明原生 App 的问题
+是注册/拉起（0 次 exec），不是性能。
+
 ## 2. 怎么测的
 
 宿主 WSL（12 核）跑同一套镜像与 payload，参数对齐 App：

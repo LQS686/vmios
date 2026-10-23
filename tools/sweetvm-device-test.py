@@ -43,6 +43,29 @@ RING = 4 << 20
 HEADER_BLOCK = 4096
 
 
+def decode_ring(blob, max_bytes=262144):
+    """Decode a 4 KiB SWEETLOG header + ring blob into its last max_bytes.
+
+    Returns None when the magic is missing. Handles a ring that has wrapped
+    and a requested tail shorter than the ring (which can still wrap).
+    """
+    if len(blob) < HEADER_BLOCK + 24 or blob[:8] != b'SWEETLOG':
+        return None
+    ring = int.from_bytes(blob[12:16], 'little') or RING
+    total = int.from_bytes(blob[16:24], 'little')
+    ring = min(ring, RING)
+    if len(blob) < HEADER_BLOCK + ring:
+        ring = len(blob) - HEADER_BLOCK
+    n = min(total, ring, max_bytes)
+    if n <= 0:
+        return b''
+    pos = int((total - n) % ring)
+    data = blob[HEADER_BLOCK:HEADER_BLOCK + ring]
+    if pos + n <= ring:
+        return data[pos:pos + n]
+    return data[pos:] + data[:n - (ring - pos)]
+
+
 def pull_guest_log(adb, pkg, outdir):
     """Pull the last 4 MiB + 4 KiB of the image and decode the SWEETLOG ring.
 
@@ -53,30 +76,48 @@ def pull_guest_log(adb, pkg, outdir):
     r = run([adb, 'shell', 'run-as', pkg, 'stat', '-c', '%s', 'files/ios16-root.img'])
     size = r.stdout.strip()
     if not size.isdigit():
+        # toybox stat is present on every recent Android; ls -l is the fallback
+        r = run([adb, 'shell', 'run-as', pkg, 'ls', '-l', 'files/ios16-root.img'])
+        parts = r.stdout.split()
+        size = parts[4] if len(parts) > 4 else ''
+    if not size.isdigit():
         print('[!] cannot stat the root image on the device; no guest log', file=sys.stderr)
         return
     base = int(size) - RING - HEADER_BLOCK
     if base < 0:
         return
     skip = (base + HEADER_BLOCK - 1) // HEADER_BLOCK
+    # exec-out execs dd directly (no shell), so no redirection here.
     r = subprocess.run([adb, 'exec-out', 'run-as', pkg, 'dd',
                         'if=files/ios16-root.img', 'bs=4096', 'skip=%d' % skip,
-                        'count=1025', '2>/dev/null'], capture_output=True, timeout=180)
-    blob = r.stdout
-    if len(blob) < HEADER_BLOCK + 16 or blob[:8] != b'SWEETLOG':
+                        'count=1025'], capture_output=True, timeout=180)
+    out = decode_ring(r.stdout)
+    if out is None:
         print('[!] no SWEETLOG header in the pulled tail', file=sys.stderr)
         return
-    ring = int.from_bytes(blob[12:16], 'little') or RING
-    total = int.from_bytes(blob[16:24], 'little')
-    ring = min(ring, RING)
-    n = min(total, ring, 262144)
-    pos = int((total - n) % ring)
-    data = blob[HEADER_BLOCK:HEADER_BLOCK + ring]
-    out = data[pos:] + data[:pos] if n == ring else data[pos:pos + n]
     path = os.path.join(outdir, 'guestlog.txt')
     with open(path, 'wb') as f:
         f.write(out)
     print('[*] guest console ->', path, '(%d bytes of %d)' % (len(out), total))
+
+
+def self_test():
+    """Synthetic rings: no wrap, full wrap, capped tail that wraps, bad magic."""
+    ring = RING
+    data = bytes((i * 7) & 0xff for i in range(ring))
+
+    def blob(total):
+        h = (b'SWEETLOG' + (1).to_bytes(4, 'little') + ring.to_bytes(4, 'little')
+             + total.to_bytes(8, 'little') + (0).to_bytes(8, 'little'))
+        return h + b'\x00' * (HEADER_BLOCK - len(h)) + data
+
+    ok = True
+    ok &= decode_ring(blob(1000)) == data[:1000]
+    ok &= decode_ring(blob(ring + 500), 10 ** 9) == data[500:] + data[:500]
+    ok &= decode_ring(blob(2 * ring + 500), 1000) == data[ring - 500:] + data[:500]
+    ok &= decode_ring(b'nope' + data[:5000]) is None
+    print('[*] SWEETLOG decoder self-test:', 'OK' if ok else 'FAILED')
+    return 0 if ok else 1
 
 
 def main(argv=None):
@@ -91,7 +132,12 @@ def main(argv=None):
                     help='how long to watch the VM after launch')
     ap.add_argument('--shot-secs', type=int, default=60)
     ap.add_argument('--out', default='artifacts/device-test')
+    ap.add_argument('--self-test', action='store_true',
+                    help='check the SWEETLOG decoder on synthetic rings and exit')
     a = ap.parse_args(argv)
+
+    if a.self_test:
+        return self_test()
 
     adb = find_adb(a.adb)
     if not adb:
