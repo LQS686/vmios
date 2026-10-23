@@ -42,6 +42,8 @@ SWEET FB swaps, and sampler blocks for SpringBoard **65 threads**, backboardd
 system threads on 1-2 vCPUs time-shared on one host core (plus present cost),
 and native apps have never been exec'd (registration).
 
+**Boot-args regression test (no device):** `python3 tools/test-bootargs.py` compiles the shipped `Payload` on the JVM, packs a real payload, and asserts the lock timeouts and `cpus=2` land in boot_args, including at MainActivity's 607-byte limit. This is the bug that shipped once (timeouts appended after writeImages).
+
 **Native-app check:** `tools/sweetvm-device-test.py --native-app-check` waits for
 you to tap Settings/Photos and polls the guest ring for `exec Preferences`
 etc.; no exec within 120 s means registration is still missing (exit 5).
