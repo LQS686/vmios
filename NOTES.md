@@ -48,7 +48,12 @@ the Setup-skip prefs cannot be written into an image on this host. The
 qrun-setup1 snapshot cannot be restored any more: "Missing section footer for
 arm_gicv3" (the GIC migration format changed since 17:29). A shipping-config
 run (2 vCPU, thread=single, prealloc) stayed on console text at 300 s; an
-MTTCG+2 s-timeout run survived 460 s with no panic but also no GUI.
+MTTCG+2 s-timeout run survived 460 s and then a full 900 s with no panic but no
+GUI: that image's backboardd crash-loops on
+`-[NSURL initFileURLWithPath:]: nil string parameter` (3 crashes / 15 min, 0
+SWEET FB swaps), right after IOHIDKeyboardFilter dlopen / SweetHIDButtons. An
+incomplete data volume, not the performance change; the phone (Setup run) did
+render the lock/home screen.
 
 **Environment incident 2026-10-24:** three 17 GB image copies filled host D: to
 0 bytes and WSL died with EIO. Recovered by sparse-converting the VHD, setting

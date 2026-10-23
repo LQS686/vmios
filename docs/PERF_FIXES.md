@@ -152,7 +152,21 @@ tlto_us   ticket 锁超时（微秒，默认约 125 ms）
 必 panic），停在 userland 中段。也就是说：持有者只是被宿主 I/O / 调度拖过了
 125 ms，2 s 足够它回来——这更像"TCG 下临界区被拉长"，不是内核死锁。
 
-目前仍不把 MTTCG 设为默认：460 s 内没有进入 GUI，也还没有测到交互帧率，
+后续又跑了 900 s：**全程无 panic**（CPU 约 33%，两条 TCG 线程），但也没有
+进入 GUI。这个镜像上 `backboardd` 每几分钟崩溃一次：
+
+```
+Terminating app due to uncaught exception 'NSInvalidArgumentException',
+reason: '-[NSURL initFileURLWithPath:]: nil string parameter'
+... 紧跟 IOHIDKeyboardFilter.plugin 的 dlopen 和 SweetHIDButtons 服务创建
+```
+
+900 s 内 3 次 `CRASH backboardd[...]`、`SWEET FB: swap` 0 次。这是**镜像/数据卷
+状态问题**（宿主镜像是跳过 Setup、数据卷不完整的镜像；手机上数据卷初始化过，
+UI 能起来），不是本次性能改动导致的，也不是 TCG 速度问题——它意味着宿主镜像
+上 WindowServer 根本活不到出画面。
+
+目前仍不把 MTTCG 设为默认：900 s 内没有进入 GUI，也还没有测到交互帧率，
 无法证明 2 vCPU 的收益。`tcgmulti=1` 现在会自动追加
 `tlto_us=2000000 slto_us=2000000`（`VmEngine`），保持一个开关即可试验。
 
