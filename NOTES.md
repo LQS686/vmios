@@ -212,6 +212,17 @@ stalls in an `installd` sync XPC. Workaround under test: 2 vCPUs with
 `VmEngine` now always passes `-accel tcg`), which serializes vCPUs so the
 scheduler lock cannot deadlock. Setup is booting at `qrun-setup3`.
 
+**Host touch reconnects:** the QEMU socket chardev delivers only the first
+client; after that client disconnects, later connections are not delivered to
+`sweet-touch` (the Setup language taps were lost for this reason, not a guest
+bug). The Android app keeps its socket open, so it is unaffected. For host
+gesture scripts use `tools/sweet-touch-proxy.py QEMU_SOCKET CONTROL_SOCKET`:
+it holds one QEMU connection and forwards 5-byte packets from short-lived
+clients on the control socket. jprx/darwin-vm, the reference iOS/macOS QEMU
+project, also runs with a single vCPU (no `-smp` in `run.sh`); our
+2-vCPU single-threaded TCG Setup test (`qrun-setup4`) continues to see whether
+serialized TCG avoids the pset0 ticket lock without falling back to 1 vCPU.
+
 App side: `VmEngine` now derives `-smp N` and `tcg,thread=multi` from the
 payload's `cpus=N`, and `ensureQemuArgs` no longer forces `cpus=1`, so the
 imported 2-vCPU iOS payload runs with the configuration proven here. The APK
