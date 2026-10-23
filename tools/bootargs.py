@@ -82,6 +82,11 @@ VM = " ".join([
     "sweetfb_hz=30",
     "ufscache=1",
     "ufswait=1",
+    # A TCG vCPU can hold a lock through a >125 ms host I/O stall; XNU's
+    # default ticket/spin timeouts (tlto_us/slto_us) then fire a misleading
+    # "Ticket spinlock timeout" panic. 2 s is enough to ride out the stall.
+    "tlto_us=2000000",
+    "slto_us=2000000",
 ])
 
 PROFILES = {
@@ -91,11 +96,7 @@ PROFILES = {
     "vm-sample": VM + " sweetsample=SpringBoard,backboardd,lsd,containermanagerd",
     # Same as `vm` with two vCPUs that actually run in parallel: VmEngine turns
     # `tcgmulti=1` into -accel tcg,thread=multi (XNU ignores the token).
-    # tlto_us/slto_us raise XNU's ticket/spin lock timeouts (parsed by
-    # ml_init_lock_timeout); the defaults are 125/250 ms, which a TCG vCPU can
-    # exceed when the lock owner blocks on host I/O, and the panic then looks
-    # like a deadlock. 2 s is still short enough to catch a real one.
-    "vm-mttcg": VM + " tcgmulti=1 tlto_us=2000000 slto_us=2000000",
+    "vm-mttcg": VM + " tcgmulti=1",
     # Touch is dead under SweetVM until kernel patch 0085 (the RPMh rail vote
     # fails with ENODEV and used to abort the GT9896 probe). Until that kernel
     # is built, sweethidtest drives a Home press every N seconds through

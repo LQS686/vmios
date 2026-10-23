@@ -126,17 +126,21 @@ public final class VmEngine {
         cmd.add("-cpu"); cmd.add("cortex-a76");
         cmd.add("-smp"); cmd.add(Integer.toString(cpus));
         cmd.add("-m"); cmd.add(RAM_GIB + "G");
-        // Single-threaded TCG stays the default. MTTCG gives two real vCPUs
-        // but panicked on pset0's ticket lock: 2 vCPUs, timeout after
-        // 3,000,001 ticks (125 ms at 24 MHz), owner on CPU 1, no debugger
-        // handshake. That owner was not dead: XNU's timeout is tlto_us and a
-        // TCG vCPU can exceed 125 ms while the owner blocks on host I/O. The
-        // same boot with tlto_us/slto_us=2000000 ran 460 s without a panic.
-        // Enable the experiment with tcgmulti=1; it appends the tunables.
-        boolean mttcg = cpus >= 2 && cmdline.contains("tcgmulti=1");
-        if (mttcg && !cmdline.contains("tlto_us=")) {
+        // Keep XNU's ticket/spin lock timeouts generous. The defaults are
+        // ~125/250 ms (tlto_us/slto_us, parsed by ml_init_lock_timeout), but a
+        // TCG vCPU can exceed that while the lock owner blocks on host I/O;
+        // the kernel then panics with a "Ticket spinlock timeout" that looks
+        // like a deadlock (seen: 3,000,001 ticks, owner on CPU 1). With 2 s
+        // the same boot ran 460 s without a panic. Normal operation is
+        // unaffected; only a genuinely stuck lock waits longer before
+        // panicking, and it still panics.
+        if (!cmdline.contains("tlto_us=")) {
             cmdline += " tlto_us=2000000 slto_us=2000000";
         }
+        // Single-threaded TCG stays the default; tcgmulti=1 turns on MTTCG
+        // (two real vCPUs). One MTTCG boot reached the iOS Setup GUI at 300 s;
+        // another stalled in userland, so the speed win is not proven yet.
+        boolean mttcg = cpus >= 2 && cmdline.contains("tcgmulti=1");
         android.util.Log.i("sweetvm", "engine cpus=" + cpus + " accel="
                 + (mttcg ? "tcg,thread=multi" : "tcg,thread=single")
                 + " prealloc=" + !resume + " capture=" + this.fps + "fps");

@@ -19,8 +19,8 @@ causes. All the ones that live outside the guest are fixed; the APK is rebuilt.
    is single again and `tcgmulti=1` stays an experiment. The timeout is a
    boot-arg: XNU parses `tlto_us`/`slto_us` (us) in ml_init_lock_timeout; with
    2 s the same MTTCG boot ran 460 s without a panic (owner was just slow, not
-   dead). tcgmulti=1 now appends both automatically. No measured MTTCG speed
-   win yet, so single stays the default.
+   dead). VmEngine now always appends both (2 s), and tools/bootargs.py `vm`
+   carries them. No measured MTTCG speed win yet, so single stays the default.
 4. **Guest RAM page faults inside the vCPU thread** (507k minflt, RSS
    149 MB -> 1.78 GB in 5 min). `memory-backend-file,...,prealloc=on,
    prealloc-threads=4` moves that to startup.
@@ -38,14 +38,17 @@ still unverified on the phone (no device attached this session).
 **Resume:** prealloc is skipped on `-incoming` (a snapshot restore writes the
 whole RAM block anyway); logcat gets `engine cpus=N accel=... prealloc=...
 capture=Nfps` so a device session can confirm the config. The app also logs
-`fps=N frames=N uptime=N` every 5 s. APK 00:12; `tools/sweetvm-device-test.py`
+`fps=N frames=N uptime=N` every 5 s. APK 00:46; `tools/sweetvm-device-test.py`
 installs it, boots, samples those lines, and swipes once (`--reinstall` if the
 signature changed; it does NOT push the 16 GB image).
 
 **Also tried:** the 1-vCPU-era image with a 2-vCPU payload stalls at the Apple
 logo for 11 min (mismatched pairing, no panic); WSL has no hfsplus module, so
-the Setup-skip prefs cannot be written into an image on this host. A shipping
-config run (2 vCPU, thread=single, prealloc, matching image) is in h4/.
+the Setup-skip prefs cannot be written into an image on this host. The
+qrun-setup1 snapshot cannot be restored any more: "Missing section footer for
+arm_gicv3" (the GIC migration format changed since 17:29). A shipping-config
+run (2 vCPU, thread=single, prealloc) stayed on console text at 300 s; an
+MTTCG+2 s-timeout run survived 460 s with no panic but also no GUI.
 
 **Environment incident 2026-10-24:** three 17 GB image copies filled host D: to
 0 bytes and WSL died with EIO. Recovered by sparse-converting the VHD, setting
