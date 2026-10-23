@@ -647,6 +647,11 @@ public final class MainActivity extends Activity {
         }
         cmd = ensureQemuArgs(cmd);
         cmd = enableTouch(cmd);
+        if (cfg.mttcg && !cmd.contains("tcgmulti=1")) {
+            // VmEngine turns this into -accel tcg,thread=multi and adds
+            // the 2 s ticket/spin lock timeouts that keep XNU from panicking.
+            cmd = (cmd + " tcgmulti=1").trim();
+        }
         return truncateCmdline(cmd);
     }
 
@@ -693,13 +698,17 @@ public final class MainActivity extends Activity {
         return b.toString().trim();
     }
 
+    /** VmEngine appends " tlto_us=2000000 slto_us=2000000" for MTTCG. */
+    private static final int MTTCG_LOCK_ARGS = 34;
+
     private String truncateCmdline(String cmd) {
-        if (cmd.length() <= 607) {
+        int limit = cfg.mttcg ? 607 - MTTCG_LOCK_ARGS : 607;
+        if (cmd.length() <= limit) {
             return cmd;
         }
-        int cut = cmd.lastIndexOf(' ', 607);
+        int cut = cmd.lastIndexOf(' ', limit);
         if (cut < 0) {
-            cut = 607;
+            cut = limit;
         }
         return cmd.substring(0, cut);
     }
@@ -960,9 +969,14 @@ public final class MainActivity extends Activity {
         if (tail.length() > 2400) {
             tail = tail.substring(tail.length() - 2400);
         }
+        String msg = "退出码：" + code + "\n\n" + tail;
+        if (cfg.mttcg && (tail.contains("panic(") || tail.contains("Ticket spinlock"))) {
+            msg = "检测到内核 panic：多线程 TCG 可能不稳定。\n"
+                    + "请在高级选项关闭「多线程 TCG」后重试，并复制日志。\n\n" + msg;
+        }
         AlertDialog d = new AlertDialog.Builder(this)
                 .setTitle(code == 0 ? "虚拟机已退出" : "虚拟机异常退出")
-                .setMessage("退出码：" + code + "\n\n" + tail)
+                .setMessage(msg)
                 .setNegativeButton("复制日志", (dd, w) -> {
                     ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
                     cm.setPrimaryClip(ClipData.newPlainText("SweetVM log", log == null ? "" : log));
@@ -993,6 +1007,12 @@ public final class MainActivity extends Activity {
         box.addView(et, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, dp(150)));
         box.addView(gap(14));
+        android.widget.CheckBox mttcgBox = new android.widget.CheckBox(this);
+        mttcgBox.setText("多线程 TCG（试验：2 个 vCPU 真并行，更快但可能 panic）");
+        mttcgBox.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        mttcgBox.setTextColor(TEXT);
+        mttcgBox.setChecked(cfg.mttcg);
+        box.addView(mttcgBox);
         TextView fpsLabel = text("画面采样：" + cfg.fps + " fps", 12, DIM, false);
         SeekBar seek = new SeekBar(this);
         // 15..60 fps in steps of 5. The old 1..11 range capped the whole VM
@@ -1024,6 +1044,7 @@ public final class MainActivity extends Activity {
                 })
                 .setPositiveButton("保存", (dd, w) -> {
                     cfg.cmdline = et.getText().toString().trim();
+                    cfg.mttcg = mttcgBox.isChecked();
                     cfg.fps = 15 + seek.getProgress() * 5;
                     cfg.save(this);
                     showHome();

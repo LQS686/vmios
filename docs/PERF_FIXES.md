@@ -79,6 +79,11 @@ SWEETLOG total @300s: 67,709 B
 
 - `BootConfig.fps`：默认 4 → 30；读取时把 <15 的旧值重置为 30（老安装也能修好）。
 - `MainActivity.showAdvanced()`：滑块 1–11 → 15–60（步长 5）。
+- **多线程 TCG 变成显式开关**：高级选项里一个复选框（默认关）。勾选后
+  `iosCmdline()` 追加 `tcgmulti=1`，`VmEngine` 转成 `thread=multi` 并自动带
+  2 s 锁超时；参数截断给这 34 字节留了空间。退出时若日志里出现 `panic(` /
+  `Ticket spinlock`，对话框直接提示"关闭多线程 TCG 后重试"。
+  这样真机上能用同一个 `fps=` 计数做 single/multi A/B，而不赌默认值。
 - `VmEngine.start()`：clamp 10–60；`memory-backend-file` 加 `prealloc=on`
   （快照恢复时跳过：`-incoming` 本来就会写满整块 RAM）；
   `-accel` 仍是 `thread=single`：`tcgmulti=1` 打开多线程 TCG（试验开关）。

@@ -16,11 +16,13 @@ public final class BootConfig {
     private static final String KEY_PAYLOAD = "payload";
     private static final String KEY_CMDLINE = "cmdline";
     private static final String KEY_FPS = "fps";
+    private static final String KEY_MTTCG = "mttcg";
 
     public String rootPath = "";
     public String payloadPath = "";
     public String cmdline = "";
     public int fps = 30;
+    public boolean mttcg;
 
     public static BootConfig load(Context ctx) {
         SharedPreferences p = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
@@ -33,6 +35,7 @@ public final class BootConfig {
         // 15 fps floor is a leftover of the old default: reset it to 30.
         int savedFps = p.getInt(KEY_FPS, 30);
         c.fps = savedFps < 15 ? 30 : Math.min(60, savedFps);
+        c.mttcg = p.getBoolean(KEY_MTTCG, false);
         return c;
     }
 
@@ -42,6 +45,7 @@ public final class BootConfig {
                 .putString(KEY_PAYLOAD, payloadPath)
                 .putString(KEY_CMDLINE, cmdline)
                 .putInt(KEY_FPS, fps)
+                .putBoolean(KEY_MTTCG, mttcg)
                 .apply();
     }
 
