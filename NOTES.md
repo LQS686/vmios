@@ -42,6 +42,11 @@ SWEET FB swaps, and sampler blocks for SpringBoard **65 threads**, backboardd
 system threads on 1-2 vCPUs time-shared on one host core (plus present cost),
 and native apps have never been exec'd (registration).
 
+**App-vs-guest metric:** the 5 s logcat line now carries `ticks=`, `copies=`,
+`copy_avg_us=` and `copy_max_us=` next to `fps=`. A high `fps` with a low copy
+time means the guest is the limit; a high copy time means the app's 10.4 MB
+blit is. The device script parses and reports both.
+
 **Low-RAM guard:** 3 GB prealloc is only used when the phone reports >= 6 GB
 of RAM (and never on snapshot resume), so the app cannot be killed for taking
 resident memory on a small device.
@@ -73,7 +78,7 @@ the device test script pulls the same tail with `run-as dd` into
 **Resume:** prealloc is skipped on `-incoming` (a snapshot restore writes the
 whole RAM block anyway); logcat gets `engine cpus=N accel=... prealloc=...
 capture=Nfps` so a device session can confirm the config. The app also logs
-`fps=N frames=N uptime=N` every 5 s. APK 07:37; `tools/sweetvm-device-test.py`
+`fps=N frames=N uptime=N` every 5 s. APK 07:38; `tools/sweetvm-device-test.py`
 installs it, boots, samples those lines, and swipes once (`--reinstall` if the
 signature changed; it does NOT push the 16 GB image).
 

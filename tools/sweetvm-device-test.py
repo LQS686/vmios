@@ -219,6 +219,7 @@ def main(argv=None):
     t0 = time.time()
     config_seen = False
     fps = []
+    copies = []
     last_shot = 0
     proc = subprocess.Popen([adb, 'logcat', '-s', 'sweetvm:I', 'SWEET:I', '*:S'],
                             text=True, stdout=subprocess.PIPE, errors='replace')
@@ -232,11 +233,13 @@ def main(argv=None):
             if 'engine cpus=' in line:
                 config_seen = True
                 print('[*]', line.strip())
-            m = re.search(r'fps=(\d+) frames=(\d+) uptime=(\d+)', line)
+            m = re.search(r'fps=(\d+) ticks=(\d+) copies=(\d+) '
+                          r'copy_avg_us=(\d+) copy_max_us=(\d+) uptime=(\d+)', line)
             if m:
                 fps.append(int(m.group(1)))
+                copies.append(int(m.group(4)))
                 if len(fps) % 6 == 0:
-                    print('[*] t+%ss fps=%s' % (m.group(3), m.group(1)))
+                    print('[*] t+%ss fps=%s copy_avg_us=%s' % (m.group(6), m.group(1), m.group(4)))
             if time.time() - last_shot >= a.shot_secs:
                 last_shot = time.time()
                 shot = os.path.join(a.out, 'shot-%03d.png' % int(time.time() - t0))
@@ -269,6 +272,9 @@ def main(argv=None):
         nz = [f for f in fps if f > 0]
         print('[*] fps samples=%d median=%s max=%s' %
               (len(fps), sorted(nz)[len(nz) // 2] if nz else 0, max(fps)))
+        if copies:
+            print('[*] app-side copy median=%d us max=%d us' %
+                  (sorted(copies)[len(copies) // 2], max(copies)))
         if max(fps) <= 12:
             print('[!] still capped near 12 fps - check the 高级选项 slider '
                   'and that the APK is the rebuilt one', file=sys.stderr)

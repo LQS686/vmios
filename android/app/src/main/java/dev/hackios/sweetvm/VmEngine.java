@@ -35,6 +35,9 @@ public final class VmEngine {
     private volatile boolean running;
     private volatile boolean stopping;
     private volatile long frames;
+    private volatile long ticks;
+    private volatile long copyNanos;
+    private volatile long copyMaxNanos;
     private File guestRam;
     private File rootFile;
     private File logFile;
@@ -53,6 +56,18 @@ public final class VmEngine {
 
     public long frames() {
         return frames;
+    }
+
+    public long ticks() {
+        return ticks;
+    }
+
+    public long copyNanos() {
+        return copyNanos;
+    }
+
+    public long copyMaxNanos() {
+        return copyMaxNanos;
     }
 
     public File logFile() {
@@ -224,6 +239,9 @@ public final class VmEngine {
         running = true;
         stopping = false;
         frames = 0;
+        ticks = 0;
+        copyNanos = 0;
+        copyMaxNanos = 0;
 
         monitor = new Thread(() -> {
             int code = -1;
@@ -294,11 +312,18 @@ public final class VmEngine {
             boolean haveLast = false;
             try {
                 while (running) {
+                    ticks++;
                     FramebufferView v = view;
                     if (map != null && v != null && changed(map, probe, lastProbe, haveLast)) {
                         System.arraycopy(probe, 0, lastProbe, 0, probe.length);
                         haveLast = true;
+                        long t0 = System.nanoTime();
                         v.copyFromBuffer(map);
+                        long dt = System.nanoTime() - t0;
+                        copyNanos += dt;
+                        if (dt > copyMaxNanos) {
+                            copyMaxNanos = dt;
+                        }
                         frames++;
                     }
                     long now = System.nanoTime();

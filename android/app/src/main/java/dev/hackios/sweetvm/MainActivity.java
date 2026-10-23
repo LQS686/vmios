@@ -112,7 +112,11 @@ public final class MainActivity extends Activity {
                 vmTimer.setText(String.format(Locale.US, "%02d:%02d · %d fps", s / 60, s % 60, fps));
             }
             if (s % 5 == 0) {
-                android.util.Log.i("sweetvm", "fps=" + fps + " frames=" + f + " uptime=" + s);
+                long copies = engine.frames();
+                long avgUs = copies > 0 ? engine.copyNanos() / copies / 1000 : 0;
+                android.util.Log.i("sweetvm", "fps=" + fps + " ticks=" + engine.ticks()
+                        + " copies=" + copies + " copy_avg_us=" + avgUs
+                        + " copy_max_us=" + engine.copyMaxNanos() / 1000 + " uptime=" + s);
             }
             if (vmStatus != null) {
                 vmStatus.setText(engine.isRunning() ? "运行中 · 软件 CPU" : "正在停止…");
