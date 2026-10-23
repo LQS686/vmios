@@ -8,3 +8,16 @@ shim/out/
 xnu/out/
 xnu/out-*/
 __pycache__/
+# Android build outputs and the staged QEMU engine (rebuild with android/build-engine.sh)
+android/.gradle/
+android/local.properties
+android/app/build/
+android/app/src/main/jniLibs/
+android/app/src/main/assets/engine/
+android/app/src/main/assets/demo/payload.bin
+android/build/
+*.apk
+*.img
+*.simg
+artifacts/
+vm/qemu/qemu/

@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">SweetVM</string>
+    <string name="notif_channel">虚拟机运行中</string>
+    <string name="notif_title">SweetVM 正在运行</string>
+    <string name="notif_text">iOS 虚拟机在后台运行</string>
+</resources>

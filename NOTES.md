@@ -1,5 +1,212 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+### >>> ANDROID VM / QEMU PATH (2026-10-23, separate from the phone port) <<<
+
+**State:** added an experimental Android app (`android/`, SweetVM) that runs the
+same SWEET kernel under QEMU TCG. A new QEMU sysbus device
+(`vm/qemu/sweet_ufs.c`) presents the raw 16 GB HFS+ root as GPT `userdata`, so
+the unmodified `sweet_ufs.c` driver mounts it. Guest RAM is file-backed
+(`guest-ram.bin`); the app reads the 1080x2400 panel at offset `0x5c000000`.
+Host/root build notes are in `vm/README.md` and `docs/IOS_ROOT_WSL.md`.
+
+**Verified:** x86_64 Android 15 AVD: demo payload reaches
+`*** SWEET userspace: init running as PID 1 ***`; a 64 MB HFS+ test root through
+the app's `-device sweet-ufs` logs `SWEET UFS: "userdata" ... 64 MiB`, mounts,
+and runs PID 1; immersive display, controls auto-hide and stop work. Host QEMU:
+the iPhone X 16.7.16 root built from IPSW mounts via the UFS device and
+SpringBoard/backboardd start (single-core TCG; clean lock-screen render not
+confirmed). APK: `android/app/build/outputs/apk/debug/app-debug.apk`
+(arm64-v8a + x86_64 engine assets, targetSdk 28, debug signed).
+
+**Fixes made along the way:** Android QEMU cannot use patchelf-rewritten Termux
+libs (linker segfault in `prelink_image`); the engine is extracted unchanged and
+targetSdk 28 keeps exec-from-app-data. `mkadt.py` now emits the QEMU
+`/sweet-ufs` node and has `--no-product`; `qemu-sweet.py` has
+`--qemu/--ufs/--shared-ram`. `tools/validate-repo.py` now works on Windows
+(UTF-8 output, Git Bash instead of WSL bash). The iOS data ark needed
+`-ActivationState Activated` after the first boot.
+
+**Update 2026-10-23 late:** touch is now implemented as a QEMU GENI SE7 +
+GT9896 model (`vm/qemu/sweet_touch.c`, chardev 5-byte packets), the kernel's
+RPMh vote is stubbed with `tools/patch-qemu-input.py`, and the app (v0.2.0)
+reaches `SWEET TOUCH: selected GT9896 Yellowstone` end to end. SMP: PSCI is
+switched SMC->HVC by `tools/patch-qemu-psci.py`; QEMU MPIDRs use Aff1 via a
+virt affinity patch; 8/8 CPUs start, but full iOS with 6/8 vCPUs hits lock
+timeouts. 2 vCPUs is the stable bring-up choice. Full iOS renders surfaces
+(`SWEET FB: swap ... surface ...`) but stalls at the boot logo; disabling
+Control Center bundles and thermalmonitord and patching IOMFB `fPowerOff=0`
+did not produce a home screen. Next: backboardd/SpringBoard scene/display-link
+and activation/power path; keys via SPMI/PMIC; then home-screen verification.
+
+**Latest display diagnosis (2 vCPU):** the `/dev/null` tee
+(`sweetnull=backboardd,SpringBoard`) shows only duplicate HID plugin class
+warnings from backboardd and `SWEET Sandbox: SpringBoard privilege 1007
+denied`; SpringBoard asks AKS and then goes idle. backboardd creates two
+1125x2436 surfaces and swaps (`SWEET FB: swap ... surface ...`), then sends
+display off; disabling Control Center bundles and thermalmonitord removed
+the earlier LaunchServices/CCS lock but the panel still shows the Apple boot
+logo. A binary patch that forces the IOMFB `fPowerOff` store to 0
+(`SweetFramebuffer.cpp` case 12, kernel VA 0x7a69bfc in 0081) prevents the
+fade-to-black but does not produce a lock/home scene. The next probe is a
+sampler for `mobileactivationd` and an IOKit trace around FrontBoard/
+backboardd, plus a real power-key path; `sweetnull` did not yield SpringBoard
+error text beyond the sandbox line.
+
+**Stack diagnosis (2026-10-23, 2 vCPU, `ipsw dyld a2s` with each process's
+live shared-cache slide):** the earlier "boot logo" is not a display bug.
+SpringBoard's main thread waits in `FBSystemShell -> BKSSystemShellService ->
+BKSDisplayServicesStart -> BKSDisplayGetMainScreenInfo` (sync XPC to
+backboardd) while backboardd's WindowServer main thread retries
+`CAMetalContextCreate` on the never-present `IOAcceleratorES`. After that
+retry ends, SpringBoard proceeds to `SBApplicationController init ->
+LSApplicationWorkspace addObserver -> LaunchServices DMFSupport::
+reloadAllPolicies -> _LSContextInitCommon`, then blocks on the LaunchServices
+database lock. lsd's own stack shows why: `_LSServerMain ->
++[_LSInstallProgressService beginListening] -> performJournalRecovery ->
+dispatch_sync`, whose worker is in
+`MIInstalledInfoGatherer _groupContainersDictionary ->
++[MIContainer groupContainerURLsForBundleIdentifier:persona:error:]` and is
+waiting for a synchronous XPC reply; `/private/var/db/lsd` stays empty and
+lsd makes no progress for 15+ guest minutes. CPU goes idle. Sampling lsd
+with its slide then pinpointed the wait: `__GenerateBuiltInAppInstallSessionID
+-> MGCopyAnswer("re6Zb+zwFKJNlkQTUeT+/w")` enters libMobileGestalt's
+`MGIOKitSupport` path, `IOServiceMatching("IONetworkController")`, and spins
+forever in a CFRunLoop notification wait (no network controller exists in
+QEMU; the notification source never fires, so the "giving up" timeout is
+never reached). This is why lsd's journal recovery never finishes.
+
+The image also had **no `systemgroup.com.apple.mobilegestaltcache`
+container or MG cache plist**, because `MobileGestaltMigrator` never ran
+(the root has `com.apple.migration LastSystemVersion` set from the start).
+Seeding a synthetic cache with the right CacheVersion/CacheUUID/length did
+not stop the live IOKit query. Workaround now under test: patch the shared
+cache function `sub_19c57c430` (cache file `.09`, file offset 0xe24430,
+unslid VA 0x19c57c430) to `mov x0, xzr; ret` so that IOKit getter returns
+nil instead of waiting. Expected: MI records get a nil device ID, lsd
+finishes recovery, SpringBoard's `_LSContextInitCommon` returns. Verify by
+sampling lsd/SpringBoard and watching for new swaps/scene rendering.
+Next: if MG then writes a valid cache, drop the patch; otherwise also
+implement SPMI/PMIC or an IONetworkController stub for parity with the phone.
+
+**Setup / data-volume progress (2026-10-23 later):** the QEMU root had been
+built with the Setup-skip prefs from its very first boot, while the phone
+reached Setup on v12/v13 and only skipped it from v14. The empty data volume
+showed no `/private/var/db/dslocal` user records, no personas and no
+`systemgroup.com.apple.mobilegestaltcache`, so the user/identity chain could
+never initialize. Removed `com.apple.purplebuddy.plist`,
+`com.apple.purplebuddy.notbackedup.plist`, `com.apple.migration.plist` and the
+managed-configuration override to let Setup run. The synthetic MG cache and
+the `.09` IOKit-getter patch above stay in the image for now; MG never
+rewrote the seeded plist.
+
+With Setup enabled, usermanagerd still failed with "Set Foreground ID +
+multiuser in commpage" because `_host_set_multiuser_config_flags` in this
+kernel is a stub returning KERN_NOT_SUPPORTED (46) - the build has
+CONFIG_MULTIUSER off. `tools/patch-kernel-multiuser.py` rewrites that 8-byte
+stub (`mov w0,#46; ret` -> `mov w0,#0; ret`); it fakes success without
+programming the commpage, so it is a bring-up workaround. After the patch
+usermanagerd logs success and containermanagerd's MCMUserIdentityCache stops
+blocking: lsd completes `performJournalRecovery` (main thread returns to its
+CFRunLoop) and SpringBoard moves from `BKSDisplayServicesStart` to
+`-[BKSSystemShellService _checkIn]`, where it waits for backboardd.
+
+**`_checkIn` is a data-migration wait, not a display deadlock:** disassembly
+shows `-[BKSSystemShellService _checkIn]` calls
+`-[remoteTarget checkInAndWaitForDataMigration:completionBlock:]`. Deleting
+`com.apple.migration.plist` to enable Setup also removed
+`LastSystemVersion`, so the boot ran the full upgrade migration from an empty
+version and SpringBoard waited for it; the backboardd CFPreferences KVO stack
+was unrelated. The display kept swapping (~19000 at 30 Hz) throughout.
+`/private/var/db/lsd` and `dslocal/nodes/Default/users` stay empty, so user
+records are not persisted yet.
+
+Fix under test: keep Setup enabled (no purplebuddy prefs) but restore
+`LastSystemVersion=20H392` in `com.apple.migration.plist`, so
+`checkInAndWaitForDataMigration` returns immediately. The same kernel now has
+the `tools/patch-kernel-multiuser.py` success stub and the MG IOKit-getter
+patch; with lsd/MCM unblocked this should let SpringBoard create its scene and
+launch Setup. The proper source fix for the multiuser host call is
+`xnu/patches/0082-sweet-multiuser-host-flags.patch` (use the iOS branch that
+calls `commpage_update_multiuser_config`), matching Apple's XNU host.c; it
+needs a CI kernel build. Replace the binary stub with it once the QEMU path
+reaches the desktop.
+
+**MILESTONE 2026-10-23: real iOS lock screen rendered in QEMU.** With
+LastSystemVersion restored (skips `checkInAndWaitForDataMigration`), Setup
+enabled, the multiuser kernel stub and the MG IOKit-getter patch, SpringBoard
+created surfaces and rendered the iPhone X lock screen (clock, 2% battery,
+Emergency, "iPhone Unavailable"), and Setup launched as pid 183
+(`artifacts/cap-setup2.png`). This is the first real iOS UI under QEMU beyond
+the boot logo. Touch downs reach the kernel (`SWEET HID: touch 0 down at
+540,2150`), but the unavailable lock screen ignored both a slow swipe-up and
+an Emergency tap, so the next wall is the lock/disabled state rather than
+rendering.
+
+The QEMU-specific lock prefs from the earlier display experiments
+(`SBAutoLockTime`, `SBDeviceLockBlocked`, `SBDisableAutoLock`,
+`SBLockScreenAutoLockTime` = 0) were not present on the working phone image
+and caused the "iPhone Unavailable" lock state; removing them let SpringBoard
+dismiss the lock screen and bring Setup to the foreground. The next boot
+rendered the Setup Assistant "你好 / 向上轻扫以打开" Hello screen, and a tap
+plus a swipe-up animated it through the multi-language greetings
+(`artifacts/cap-info.png`, `artifacts/cap-lang2.png`). Touch injection works:
+a tap on the (i) button triggered the Hello animation, and a swipe advanced
+it. The lock-screen keybag state itself was fine (keybagd first-unlock
+analytics; AKS lock state 0x4).
+
+Setup was then skipped the same way as the working phone v14: wrote
+`com.apple.purplebuddy.plist` (SetupDone/SetupFinishedAllSteps/SetupVersion
+11/daemonizeNeedsToRun false), the purplebuddy.notbackedup mini-buddy flags
+false and the managed-configuration cloud-config flag false, keeping
+LastSystemVersion=20H392 and the patched kernel/MG cache. That boot reached a
+normal no-passcode lock screen; a swipe-up unlocked it and the **SpringBoard
+home screen** rendered with Photos, App Store, Settings and the
+Phone/Safari/Messages dock (`artifacts/cap-unlock.png`). Two app slots still
+show "Waiting..." placeholders because skipping `LastSystemVersion` also
+skipped the SystemAppMigrator that installs/registers the system apps.
+The current boot (`qrun-migrate`) re-enables that migration with
+`installd`/datamigrator sampling; if it hangs again in a CA commit, the next
+fixes are the display-filter/CFPreferences stall or installing through
+MobileInstallation directly.
+
+**2-vCPU migration panic:** re-enabling the migration with 2 vCPUs panicked
+the kernel after ~4 minutes: `Ticket spinlock(0xfffffe0007689880) timeout
+after 300000 ticks ... current owner ... (on CPU 0)... handshake structure
+not initialized @lock_ticket.c:386`; panicked task backboardd pid 55. The
+home-screen boot with the migration skipped is stable on 2 vCPUs. The
+one-time install is therefore retried with `cpus=1` / `-smp 1` (payload
+`payload-ios-mig1.bin` = kernel-mu + 1-CPU ADT) to avoid the cross-CPU ticket
+lock; expect a much slower install. If it completes, restore
+LastSystemVersion=20H392 and go back to 2 vCPUs for interaction.
+
+**APK + 1-vCPU install status:** the APK rebuilt successfully with the
+cpus/MTTCG change
+(`android/app/build/outputs/apk/debug/app-debug.apk`, 81.9 MB) using
+`ANDROID_HOME=/opt/android-sdk` and JDK 17 (`jlink` is missing from the
+Java 21 JRE). The 1-vCPU migration ran 12 minutes without a panic, but never
+reached SpringBoard: `installd` (pid 141) sat in a synchronous XPC and the
+job was respawned repeatedly (~26 mentions), so the system-app install is an
+XPC/MobileInstallation stall, not just TCG slowness. Stopped it and restored
+LastSystemVersion=20H392 for the stable 2-vCPU home. The new APK installs
+and launches on the x86_64 AVD (UI up; a System UI ANR was emulator load,
+not the app); the demo-run smoke test remains.
+
+App side: `VmEngine` now derives `-smp N` and `tcg,thread=multi` from the
+payload's `cpus=N`, and `ensureQemuArgs` no longer forces `cpus=1`, so the
+imported 2-vCPU iOS payload runs with the configuration proven here. The APK
+rebuild is pending: the Gradle wrapper cannot download AGP 8.7.3 offline
+(cached Gradle lives at `/opt/gradle/gradle-8.9`, but the plugin marker is
+not in the local cache). A datamigrator
+stackshot from the
+migration-enabled boot confirms it was blocked in a CoreAnimation
+transaction commit (`CA::Render::Message::send_message`) while backboardd's
+main thread sat in CFPreferences KVO delivery; `_checkIn` was waiting for
+this migration, not for the display.
+
+**Remaining:** home screen/interaction proof, hardware keys, native IPA
+install, bundling (16 GB + Apple licensing), Xiaomi 14 Pro device test;
+phone-side USB networking/GPU/black-app leftovers untouched.
+
 ## Agent handoff / active work (2026-10-15, latest)
 
 ### >>> UPDATE 2026-10-18 (read first, then the 10-17 handoff below) <<<

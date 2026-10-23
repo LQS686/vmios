@@ -14,6 +14,14 @@ Checks:
 """
 import argparse, glob, os, py_compile, re, subprocess, sys
 
+# Windows consoles default to a legacy code page (GBK on this host); the
+# check marks and ANSI sequences below otherwise abort the validator.
+try:
+    sys.stdout.reconfigure(encoding='utf-8')
+    sys.stderr.reconfigure(encoding='utf-8')
+except Exception:
+    pass
+
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
@@ -99,6 +107,22 @@ def validate_python_scripts(verbose=False):
     return True
 
 
+def find_bash():
+    """Git Bash on Windows; WSL's bash cannot open E:\\... paths (and its
+    argv translation mangles backslashes)."""
+    if os.name == 'nt':
+        candidates = [
+            os.environ.get('BASH'),
+            r'C:\Program Files\Git\bin\bash.exe',
+            r'C:\Program Files\Git\usr\bin\bash.exe',
+        ]
+        for c in candidates:
+            if c and os.path.isfile(c):
+                return c
+    import shutil
+    return shutil.which('bash') or 'bash'
+
+
 def validate_shell_scripts(verbose=False):
     sh_files = sorted(
         glob.glob(os.path.join(REPO_ROOT, 'tools/*.sh')) +
@@ -106,12 +130,17 @@ def validate_shell_scripts(verbose=False):
         glob.glob(os.path.join(REPO_ROOT, 'xnu/patches/*.sh'))
     )
     errors = []
+    bash = find_bash()
 
     for path in sh_files:
         rel = os.path.relpath(path, REPO_ROOT)
-        res = subprocess.run(['bash', '-n', path], capture_output=True, text=True)
+        # Relative POSIX paths work for both Git Bash and Linux bash.
+        arg = rel.replace('\\', '/')
+        res = subprocess.run([bash, '-n', arg], cwd=REPO_ROOT,
+                             capture_output=True,
+                             encoding='utf-8', errors='replace')
         if res.returncode != 0:
-            errors.append(f"{rel}: {res.stderr.strip()}")
+            errors.append(f"{rel}: {(res.stderr or res.stdout or '').strip()}")
         elif verbose:
             print(f"    [OK] {rel}")
 

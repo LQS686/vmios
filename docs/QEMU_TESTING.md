@@ -91,6 +91,24 @@ gdb -ex "set architecture aarch64" -ex "target remote localhost:1234"
 
 ---
 
+## 4.1 UFS root and shared RAM (Android VM path)
+
+A stock QEMU has no Qualcomm UFS host. `vm/qemu/sweet_ufs.c` (built into the
+Android engine; see `vm/README.md`) adds one at `0x0e000000` and wraps a raw
+HFS+ image in a GPT `userdata` partition:
+
+```sh
+python3 tools/qemu-sweet.py payload-ios.bin /tmp/qios --secs 600 \
+    --kernel xnu/out/kernel.development.sweet \
+    --qemu /path/to/qemu-system-aarch64 \
+    --ufs ios16-root.img --shared-ram
+```
+
+`--shared-ram` makes QEMU's guest RAM a file (`guest-ram.bin`). The panel is
+at guest physical `0x9c000000`, i.e. file offset `0x5c000000`; a reader can
+pull 1080×2400×4 bytes without QMP. The app uses the same mechanism. Add
+`rd=ufsroot0 ufsrw=1 rootrw=1` to the payload command line.
+
 ## 5. Output Artifacts
 
 Inside the specified output directory:

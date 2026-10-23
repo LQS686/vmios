@@ -29,9 +29,9 @@ STUB_PA = 0x40200000	# above the dtb QEMU places at RAM base
 BOOT_LINE_LENGTH = 608
 
 
-def check_qemu_dependency(cpu='cortex-a76'):
+def check_qemu_dependency(cpu='cortex-a76', qemu_bin='qemu-system-aarch64'):
     """Verify qemu-system-aarch64 binary and CPU model support."""
-    qemu_bin = shutil.which('qemu-system-aarch64')
+    qemu_bin = shutil.which(qemu_bin) or (qemu_bin if os.path.isfile(qemu_bin) else None)
     if not qemu_bin:
         print('[!] Error: qemu-system-aarch64 not found in PATH.', file=sys.stderr)
         print('    Install instructions:', file=sys.stderr)
@@ -228,10 +228,18 @@ def main():
     ap.add_argument('--fail-on-panic', action='store_true', help='exit 2 for a visible panic, 3 for incomplete/blank decoding; requires --kernel')
     ap.add_argument('--live-serial', action='store_true', help='stream serial console output to stdout in real time')
     ap.add_argument('--check-env', action='store_true', help='check QEMU installation and dependencies without running a payload')
+    ap.add_argument('--qemu', default='qemu-system-aarch64', help='qemu-system-aarch64 binary (default: PATH)')
+    ap.add_argument('--ufs', help='attach vm/qemu/sweet_ufs.c to this HFS+ image (boot with rd=ufsroot0)')
+    ap.add_argument('--shared-ram', action='store_true',
+                    help='back guest RAM with outdir/guest-ram.bin (share=on) for an external framebuffer reader')
+    ap.add_argument('--smp', type=int, default=1,
+                    help='QEMU vCPUs; must match mkadt.py --qemu-cpus N (default: 1)')
+    ap.add_argument('--touch', metavar='SOCKET',
+                    help='enable vm/qemu/sweet_touch.c and listen on this Unix socket')
     a = ap.parse_args()
 
     if a.check_env:
-        ok = check_qemu_dependency(a.cpu)
+        ok = check_qemu_dependency(a.cpu, a.qemu)
         if shutil.which('llvm-nm'):
             print('[*] llvm-nm found in PATH', file=sys.stderr)
         else:
@@ -244,7 +252,7 @@ def main():
     if a.fail_on_panic and not a.kernel:
         ap.error('--fail-on-panic requires --kernel')
 
-    if not check_qemu_dependency(a.cpu):
+    if not check_qemu_dependency(a.cpu, a.qemu):
         return 1
 
     if a.kernel and not check_kernel_tools(a.kernel):
@@ -273,12 +281,22 @@ def main():
     # virt RAM starts at 0x40000000: cover the payload's RAM (mkadt.py --highmem needs 8G).
     mem_size = struct.unpack_from('<Q', payload, 0x40)[0]
     ram_gib = max(4, -(-(phys_base + mem_size - 0x40000000) // (1 << 30)))
-    cmd = ['qemu-system-aarch64', '-M', 'virt,gic-version=3', '-cpu', a.cpu, '-smp', '1', '-m', f'{ram_gib}G',
+    cmd = [a.qemu, '-M', 'virt,gic-version=3', '-cpu', a.cpu,
+           '-smp', str(a.smp), '-m', f'{ram_gib}G',
+           '-accel', 'tcg,thread=multi' if a.smp > 1 else 'tcg',
            '-nographic', '-serial', f'file:{out}/serial.txt', '-qmp', f'unix:{mon},server,nowait',
-           '-d', 'int,guest_errors,unimp', '-D', f'{out}/qemu.log', '-no-reboot',
-           '-device', f'loader,file={out}/ram.bin,addr={phys_base:#x},force-raw=on',
-           '-device', f'loader,file={out}/stub.bin,addr={STUB_PA:#x},force-raw=on',
-           '-device', f'loader,addr={STUB_PA:#x},cpu-num=0']
+           '-d', 'int,guest_errors,unimp', '-D', f'{out}/qemu.log', '-no-reboot']
+    if a.shared_ram:
+        cmd += ['-object', f'memory-backend-file,id=ram,size={ram_gib}G,mem-path={out}/guest-ram.bin,share=on',
+                '-numa', 'node,memdev=ram']
+    if a.ufs:
+        cmd += ['-device', f'sweet-ufs,file={os.path.abspath(a.ufs)},mmio-base=0x0e000000']
+    if a.touch:
+        cmd += ['-chardev', f'socket,id=sweet_touch,path={os.path.abspath(a.touch)},server=on,wait=off',
+                '-device', 'sweet-touch,chardev=sweet_touch']
+    cmd += ['-device', f'loader,file={out}/ram.bin,addr={phys_base:#x},force-raw=on',
+            '-device', f'loader,file={out}/stub.bin,addr={STUB_PA:#x},force-raw=on',
+            '-device', f'loader,addr={STUB_PA:#x},cpu-num=0']
     if a.gdb:
         cmd += ['-S', '-gdb', 'tcp::1234']
 

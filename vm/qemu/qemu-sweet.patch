@@ -1,0 +1,33 @@
+diff --git a/hw/arm/virt.c b/hw/arm/virt.c
+index be2856c..ef4604d 100644
+--- a/hw/arm/virt.c
++++ b/hw/arm/virt.c
+@@ -2947,6 +2947,7 @@ static void virt_machine_class_init(ObjectClass *oc, void *data)
+     machine_class_allow_dynamic_sysbus_dev(mc, TYPE_VFIO_CALXEDA_XGMAC);
+     machine_class_allow_dynamic_sysbus_dev(mc, TYPE_VFIO_AMD_XGBE);
+     machine_class_allow_dynamic_sysbus_dev(mc, TYPE_RAMFB_DEVICE);
++    machine_class_allow_dynamic_sysbus_dev(mc, "sweet-ufs");
+     machine_class_allow_dynamic_sysbus_dev(mc, TYPE_VFIO_PLATFORM);
+ #ifdef CONFIG_TPM
+     machine_class_allow_dynamic_sysbus_dev(mc, TYPE_TPM_TIS_SYSBUS);
+diff --git a/hw/block/meson.build b/hw/block/meson.build
+index 8aa4dc3..85b3beb 100644
+--- a/hw/block/meson.build
++++ b/hw/block/meson.build
+@@ -21,3 +21,4 @@ specific_ss.add(when: 'CONFIG_VIRTIO_BLK', if_true: files('virtio-blk.c', 'virti
+ specific_ss.add(when: 'CONFIG_VHOST_USER_BLK', if_true: files('vhost-user-blk.c', 'virtio-blk-common.c'))
+ 
+ subdir('dataplane')
++system_ss.add(files('sweet_ufs.c'))
+diff --git a/hw/core/sysbus-fdt.c b/hw/core/sysbus-fdt.c
+index eebcd28..2d7d99b 100644
+--- a/hw/core/sysbus-fdt.c
++++ b/hw/core/sysbus-fdt.c
+@@ -495,6 +495,7 @@ static const BindingEntry bindings[] = {
+     TYPE_BINDING(TYPE_TPM_TIS_SYSBUS, add_tpm_tis_fdt_node),
+ #endif
+     TYPE_BINDING(TYPE_RAMFB_DEVICE, no_fdt_node),
++    TYPE_BINDING("sweet-ufs", no_fdt_node),
+     TYPE_BINDING("", NULL), /* last element */
+ };
+ 

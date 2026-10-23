@@ -34,6 +34,33 @@ As of **2026-10-18** the phone boots to the **iOS home screen**. You can unlock 
 - **Slow boot:** about 4 minutes on the Apple logo.
 - **Security is off:** permissive code signing (AMFI) and sandbox policies, a stub AppleKeyStore, no data protection. Do not put anything personal on it.
 
+## Android VM app (experimental)
+
+[`android/`](android/README.md) contains a separate path: the same XNU kernel
+runs inside a normal Android app under QEMU TCG, with a custom
+[`sweet-ufs`](vm/qemu/sweet_ufs.c) controller so the 16 GB HFS+ iOS root
+mounts unchanged and the app reads the 1080×2400 panel through a shared RAM
+file. It does not touch the phone's partitions and is not a replacement for
+the bare-metal port.
+
+The app boots a bundled open-source demo payload to
+`*** SWEET userspace: init running as PID 1 ***` and displays the guest
+framebuffer. A user-supplied iPhone X 16.7.16 root now reaches the iOS lock
+screen and, after skipping Setup, the SpringBoard home screen under host
+QEMU; unlock swipes and Setup taps work through the Geni + Goodix GT9896
+model (`vm/qemu/sweet_touch.c`, payloads built with
+`tools/patch-qemu-input.py`). Getting there needs a few bring-up patches:
+the `host_set_multiuser_config_flags` success stub
+(`tools/patch-kernel-multiuser.py`; proper source fix in
+`xnu/patches/0082-sweet-multiuser-host-flags.patch`), a synthetic
+MobileGestalt cache plus the MG IOKit getter patch, and removal of the
+QEMU-only SpringBoard lock prefs. System-app placeholders can still show
+"Waiting..." until the MobileInstallation/SystemAppMigrator install
+completes. Hardware keys are not modelled. `VmEngine` follows the payload's
+`cpus=N` and uses MTTCG for N > 1. Apple's iOS files are not included; see
+[`android/README.md`](android/README.md) and
+[`docs/IOS_ROOT_WSL.md`](docs/IOS_ROOT_WSL.md).
+
 ## How it boots
 
 ```
@@ -140,7 +167,7 @@ The log contains crash reports with backtraces (`CRASH name ...`), IOKit traces 
 
 ### QEMU
 
-`tools/qemu-sweet.py` boots the same kernel on QEMU `virt` with a test RAM-disk root. It is useful for kernel-only changes; see `NOTES.md`.
+`tools/qemu-sweet.py` boots the same kernel on QEMU `virt` with a test RAM-disk root. It is useful for kernel-only changes; see `NOTES.md`. For the Android VM path, build QEMU with `vm/qemu/sweet_ufs.c` and use `--qemu <binary> --ufs <hfs+ image> --shared-ram`; the device presents the raw image as GPT `userdata`, and `guest-ram.bin` lets an external reader pick up the panel. Build instructions are in [`vm/README.md`](vm/README.md).
 
 ## Repository layout
 
@@ -158,6 +185,8 @@ The log contains crash reports with backtraces (`CRASH name ...`), IOKit traces 
 | `tools/xnu-cc.py` | Local single-file compile check from a CI log |
 | `tools/qemu-sweet.py` | QEMU test boots with framebuffer text decoding |
 | `tools/adt.py`, `remotezip.py`, `unpack_bootv2.py`, `sparsediff.py` | Helpers |
+| `android/` | SweetVM: experimental Android app that runs the kernel under QEMU |
+| `vm/` | QEMU UFS device, QEMU patch, Android engine build notes |
 | `NOTES.md` | Detailed engineering log: every boot, crash and decision, plus hardware facts |
 
 Not in git: partition backups, live device trees, recovery images, Apple firmware and root images, and downloaded or generated build trees. They contain device serials and calibration data, or Apple's copyrighted files.
@@ -186,6 +215,8 @@ Not in git: partition backups, live device trees, recovery images, Apple firmwar
 | 0066–0067 | Fault-region crash info; console mute |
 | 0068 | IOSurface lookup semantics for already-mapped surfaces |
 | 0069 | Batched persistent-log flushes |
+| 0070–0077 | Navigation/PID hibernate, edge-tip touches, USB device mode, CDC-ECM and live console |
+| 0078–0081 | 8-core SMP, display power changes, route/address tracing and Ethernet link state |
 
 ## Key hardware facts
 
@@ -200,4 +231,4 @@ More in [`NOTES.md`](NOTES.md).
 
 ## Credits
 
-Built on Apple's open-source releases (xnu, IOHIDFamily, libpthread, hfs), [BearSSL](https://bearssl.org), [blacktop/darwin-xnu-build](https://github.com/blacktop/darwin-xnu-build), [ipsw](https://github.com/blacktop/ipsw), Qualcomm/Xiaomi's published Linux kernel sources for the hardware details, and [OrangeFox Recovery](https://orangefox.download). iOS itself is Apple's and is not distributed here.
+Built on Apple's open-source releases (xnu, IOHIDFamily, libpthread, hfs), [BearSSL](https://bearssl.org), [blacktop/darwin-xnu-build](https://github.com/blacktop/darwin-xnu-build), [ipsw](https://github.com/blacktop/ipsw), Qualcomm/Xiaomi's published Linux kernel sources for the hardware details, and [OrangeFox Recovery](https://orangefox.download). The Android VM path also uses [QEMU](https://www.qemu.org/) (GPLv2) and Termux's GLib/pixman builds. iOS itself is Apple's and is not distributed here.

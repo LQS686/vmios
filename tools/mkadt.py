@@ -31,8 +31,10 @@ GICR, GICR_SIZE = 0x17a60000, 0x100000
 FB, FB_SIZE = 0x9c000000, 0x1700000
 SWEET_ECID = 0x5357454554000001  # 'SWEET' + 1, synthetic
 FB_W, FB_H, FB_STRIDE = 1080, 2400, 1080 * 4
-# Internal UFS host (ufshc@1d84000 "ufs_mem"); QEMU virt has none
+# Internal UFS host (ufshc@1d84000 "ufs_mem"). QEMU gets a synthetic host in
+# the free MMIO hole below the PCIe window; see vm/qemu/sweet_ufs.c.
 UFS, UFS_SIZE = 0x01d84000, 0x3000
+QEMU_UFS = 0x0e000000
 TIMEBASE = 19200000
 VTIMER_INTID = 19
 # QEMU virt (-M virt,gic-version=3 -cpu cortex-a76): GICD/GICR and the generic timer's CNTFRQ
@@ -74,8 +76,14 @@ def node(name, props=(), children=()):
     return n
 
 
-def build(seed=None, qemu=False, highmem=False):
-    """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
+def build(seed=None, qemu=False, highmem=False, no_product=False, qemu_cpus=1):
+    """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py).
+
+    no_product=True omits the real D22AP /product node (for redistributable
+    test payloads that must not contain Apple device-tree data).
+    qemu_cpus=N: QEMU virt uses Aff0 MPIDRs 0..N-1 (its dumped DTB), not the
+    phone's Aff1 numbering.  The SWEET kernel starts every CPU in this tree,
+    so N must match QEMU's -smp."""
     phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
     # Carve the panic log off the top so the kernel never allocates over it.
     panic_base = phys_base + mem_size - PANIC_LOG_SIZE
@@ -134,12 +142,15 @@ def build(seed=None, qemu=False, highmem=False):
     # and uses cpus=N to select an initial prefix (N <= 8).
     # QEMU retains its original single-CPU tree: its MPIDRs differ from sweet.
     cpu_nodes = []
-    for core in range(1 if qemu else 8):
+    n_cpus = qemu_cpus if qemu else 8
+    for core in range(n_cpus):
         cpu_nodes.append(node(f'cpu{core}', [
             ph(),
             ('device_type', cstr('cpu')),
             ('compatible', cstr('qcom,kryo470') + cstr('ARM,v8')),
-            ('reg', u32(core << 8)),  # actual MPIDR Aff1:Aff0, NOT logical ID
+            # QEMU virt numbers CPUs with Aff0 (dumped DTB reg 0..N-1); sweet
+            # uses Aff1. Both are the real MPIDR, not a logical ID.
+            ('reg', u32(core << 8)),  # Aff1:Aff0; QEMU is patched to the phone's layout
             ('cpu-id', u32(core)),   # descriptive: XNU assigns IDs by DT order
             ('cluster-id', u32(0)),  # descriptive; see ml_parse_cpu_topology
             ('cluster-type', u32(0)),  # homogeneous CLUSTER_TYPE_SMP, not AMP
@@ -197,11 +208,12 @@ def build(seed=None, qemu=False, highmem=False):
         ('stride', u32(FB_STRIDE)),
     ])
 
-    # bsd/dev/sweet_ufs.c: the UFS host ABL leaves running (absolute physical reg).
+    # bsd/dev/sweet_ufs.c: the UFS host ABL leaves running (absolute physical
+    # reg).  On QEMU the same driver talks to vm/qemu/sweet_ufs.c at QEMU_UFS.
     ufs = node('sweet-ufs', [
         ph(),
         ('compatible', cstr('qcom,ufshc')),
-        ('reg', u64(UFS, UFS_SIZE)),
+        ('reg', u64(QEMU_UFS if qemu else UFS, UFS_SIZE)),
     ])
 
     # pmap_compute_max_asids requires the node even when no overrides are set.
@@ -219,7 +231,7 @@ def build(seed=None, qemu=False, highmem=False):
         ('opposed-power-vol-buttons', u32(1)),
     ])
 
-    product_props = d22ap_product()
+    product_props = [] if no_product else d22ap_product()
     product = [node('product', [ph()] + product_props)] if product_props else []
 
     # Panic log region. /pram reg = <phys size>; it sits just above the
@@ -238,11 +250,15 @@ def build(seed=None, qemu=False, highmem=False):
         ('manufacturer', cstr('Apple Inc.')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
-    ], [chosen, defaults, cpus, arm_io, fbcon, buttons, pram] + product + ([] if qemu else [ufs]))
+    ], [chosen, defaults, cpus, arm_io, fbcon, buttons, pram, ufs] + product)
 
 
 if __name__ == '__main__':
-    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv)
+    qemu_cpus = 1
+    if '--qemu-cpus' in sys.argv:
+        qemu_cpus = int(sys.argv[sys.argv.index('--qemu-cpus') + 1])
+    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv,
+                 no_product='--no-product' in sys.argv, qemu_cpus=qemu_cpus)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:
