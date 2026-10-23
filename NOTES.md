@@ -42,6 +42,10 @@ SWEET FB swaps, and sampler blocks for SpringBoard **65 threads**, backboardd
 system threads on 1-2 vCPUs time-shared on one host core (plus present cost),
 and native apps have never been exec'd (registration).
 
+**Low-RAM guard:** 3 GB prealloc is only used when the phone reports >= 6 GB
+of RAM (and never on snapshot resume), so the app cannot be killed for taking
+resident memory on a small device.
+
 **Boot-args regression test (no device):** `python3 tools/test-bootargs.py` compiles the shipped `Payload` on the JVM, packs a real payload, and asserts the lock timeouts and `cpus=2` land in boot_args, including at MainActivity's 607-byte limit. This is the bug that shipped once (timeouts appended after writeImages).
 
 **Native-app check:** `tools/sweetvm-device-test.py --native-app-check` waits for
@@ -69,7 +73,7 @@ the device test script pulls the same tail with `run-as dd` into
 **Resume:** prealloc is skipped on `-incoming` (a snapshot restore writes the
 whole RAM block anyway); logcat gets `engine cpus=N accel=... prealloc=...
 capture=Nfps` so a device session can confirm the config. The app also logs
-`fps=N frames=N uptime=N` every 5 s. APK 07:34; `tools/sweetvm-device-test.py`
+`fps=N frames=N uptime=N` every 5 s. APK 07:37; `tools/sweetvm-device-test.py`
 installs it, boots, samples those lines, and swipes once (`--reinstall` if the
 signature changed; it does NOT push the 16 GB image).
 

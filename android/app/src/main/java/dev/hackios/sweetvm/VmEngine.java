@@ -1,5 +1,6 @@
 package dev.hackios.sweetvm;
 
+import android.app.ActivityManager;
 import android.content.Context;
 
 import java.io.File;
@@ -112,6 +113,17 @@ public final class VmEngine {
             android.util.Log.w("sweetvm", "boot args are " + cmdline.length()
                     + " bytes; the 607-byte boot_args field may truncate the lock timeouts");
         }
+        // 3 GB of resident guest RAM is cheap on a 12-16 GB phone and makes
+        // first-touch faults happen at startup instead of inside the vCPU
+        // thread, but it can get the app killed on a small device. Only
+        // prealloc when there is headroom.
+        ActivityManager am = (ActivityManager) ctx.getSystemService(Context.ACTIVITY_SERVICE);
+        ActivityManager.MemoryInfo mi = new ActivityManager.MemoryInfo();
+        if (am != null) {
+            am.getMemoryInfo(mi);
+        }
+        boolean prealloc = !resume && (am == null || mi.totalMem >= (6L << 30));
+
         File ram = new File(vmDir, "ram.bin");
         File stub = new File(vmDir, "stub.bin");
         payload.writeImages(ram, stub, cmdline);
@@ -152,7 +164,7 @@ public final class VmEngine {
         boolean mttcg = cpus >= 2 && cmdline.contains("tcgmulti=1");
         android.util.Log.i("sweetvm", "engine cpus=" + cpus + " accel="
                 + (mttcg ? "tcg,thread=multi" : "tcg,thread=single")
-                + " prealloc=" + !resume + " capture=" + this.fps + "fps");
+                + " prealloc=" + prealloc + " capture=" + this.fps + "fps");
         // A large TB cache matters for the multi-hundred-MB dyld shared cache.
         cmd.add("-accel");
         cmd.add(mttcg ? "tcg,thread=multi,tb-size=512" : "tcg,thread=single,tb-size=512");
@@ -174,7 +186,7 @@ public final class VmEngine {
         // A resume loads the whole RAM image anyway, so it needs no prealloc.
         cmd.add("memory-backend-file,id=ram,size=" + RAM_GIB
                 + "G,mem-path=" + guestRam.getAbsolutePath() + ",share=on"
-                + (resume ? "" : ",prealloc=on,prealloc-threads=4"));
+                + (prealloc ? ",prealloc=on,prealloc-threads=4" : ""));
         cmd.add("-numa"); cmd.add("node,memdev=ram");
         cmd.add("-device");
         cmd.add(String.format(Locale.US, "loader,file=%s,addr=0x%x,force-raw=on",
