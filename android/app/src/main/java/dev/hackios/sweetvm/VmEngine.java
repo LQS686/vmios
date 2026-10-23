@@ -135,6 +135,9 @@ public final class VmEngine {
         // 2-vCPU home state has run under MTTCG since. `tcgsingle=1` on the
         // command line restores thread=single for compatibility.
         boolean mttcg = cpus >= 2 && !cmdline.contains("tcgsingle=1");
+        android.util.Log.i("sweetvm", "engine cpus=" + cpus + " accel="
+                + (mttcg ? "tcg,thread=multi" : "tcg,thread=single")
+                + " prealloc=" + !resume + " capture=" + this.fps + "fps");
         // A large TB cache matters for the multi-hundred-MB dyld shared cache.
         cmd.add("-accel");
         cmd.add(mttcg ? "tcg,thread=multi,tb-size=512" : "tcg,thread=single,tb-size=512");
@@ -153,8 +156,10 @@ public final class VmEngine {
         // page fault inside the vCPU thread. iOS allocates continuously, so
         // those faults freeze the whole guest for milliseconds - the "stall
         // that is not rendering". Touch all of it once at startup instead.
+        // A resume loads the whole RAM image anyway, so it needs no prealloc.
         cmd.add("memory-backend-file,id=ram,size=" + RAM_GIB
-                + "G,mem-path=" + guestRam.getAbsolutePath() + ",share=on,prealloc=on,prealloc-threads=4");
+                + "G,mem-path=" + guestRam.getAbsolutePath() + ",share=on"
+                + (resume ? "" : ",prealloc=on,prealloc-threads=4"));
         cmd.add("-numa"); cmd.add("node,memdev=ram");
         cmd.add("-device");
         cmd.add(String.format(Locale.US, "loader,file=%s,addr=0x%x,force-raw=on",

@@ -26,6 +26,16 @@ console text with zero `SWEET FB: swap`; the fixed run had two TCG threads, no
 panic, 16 swap log lines and the iOS Setup "Hei" GUI on screen. App input is
 still unverified on the phone (no device attached this session).
 
+**Resume:** prealloc is skipped on `-incoming` (a snapshot restore writes the
+whole RAM block anyway); logcat gets `engine cpus=N accel=... prealloc=...
+capture=Nfps` so a device session can confirm the config. APK 00:11.
+
+**Environment incident 2026-10-24:** three 17 GB image copies filled host D: to
+0 bytes and WSL died with EIO. Recovered by sparse-converting the VHD, setting
+`[wsl2] swap=0` in `.wslconfig` (original 283-byte file was NOT backed up and is
+lost), and deleting the copies. /opt/qemu and /opt/ios-sweet are intact; D: has
+7.8 GB free, so no more full-image copies on this host.
+
 **Still open:** the guest-side present copy (10.9 MB/frame, needs kernel 0087
 offloaded present) and the pset0 ticket-lock timeout under heavy install load
 (needs a rebuild to make the timeout configurable). Native app launch (Settings

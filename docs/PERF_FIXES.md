@@ -63,8 +63,11 @@ SWEETLOG total @300s: 67,709 B
 
 - `BootConfig.fps`：默认 4 → 30；读取时把 <15 的旧值重置为 30（老安装也能修好）。
 - `MainActivity.showAdvanced()`：滑块 1–11 → 15–60（步长 5）。
-- `VmEngine.start()`：clamp 10–60；`memory-backend-file` 加 `prealloc=on`；
+- `VmEngine.start()`：clamp 10–60；`memory-backend-file` 加 `prealloc=on`
+  （快照恢复时跳过：`-incoming` 本来就会写满整块 RAM）；
   `-accel tcg,thread=multi` 成为 `cpus>=2` 时的默认，`tcgsingle=1` 回退单线程。
+  启动时向 logcat 打一行 `engine cpus=N accel=... prealloc=... capture=Nfps`，
+  真机上 `adb logcat -s sweetvm` 就能确认配置生效。
 - `VmEngine.changed()`：采样步长 40 KB → 64 B（每 16 个 word 一个点），
   局部变化不再漏帧；`PROBE_STEP` 常量取代 `PROBE_WORDS`。
 - `TouchSender`：MOVE 8 ms 合并 + 复用 5 字节缓冲；DOWN/UP 不合并。
@@ -82,8 +85,9 @@ SWEETLOG total @300s: 67,709 B
 - APK：`android/app/build/outputs/apk/debug/app-debug.apk`（81.9 MB，arm64-v8a + x86_64）。
 - 宿主 A/B：同镜像、同 payload、同 300 s，唯一差别是 `thread=single`（基线）
   vs `thread=multi + prealloc`（修复）。指标见 §4.1。
-- 真机：本轮没有设备接入，未做。安装后看顶部 `N fps` 是否跟到设定值
-  （默认 30），以及 App 启动/翻页是否还出现整秒级停顿。
+- 真机：本轮没有设备接入（`adb devices` 为空），未做。安装后看顶部 `N fps`
+  是否跟到设定值（默认 30）、logcat 的 `engine ... accel=tcg,thread=multi`，
+  以及 App 启动/翻页是否还出现整秒级停顿。
 
 ### 4.1 A/B 结果（宿主，同镜像同 payload，各 300 s）
 
@@ -126,3 +130,14 @@ python3 tools/qemu-sweet.py payload-ios-2cpu.bin out-base --smp 2 --tcg-single \
 python3 tools/qemu-sweet.py payload-ios-2cpu.bin out-fix --smp 2 \
   --ufs ios16-root-2cpu.img --shared-ram --secs 300
 ```
+
+## 7. 环境事故记录（2026-10-24）
+
+为了做 A/B，在 WSL 里复制了 3 份 17 GB 的根镜像（每份 + 4 GB RAM 文件），
+把宿主 D: 写到 0 字节；WSL 的 ext4 随即报 EIO，`wsl` 无法启动。
+处理：把 WSL 虚拟盘切成稀疏、把 `.wslconfig` 的 swap 关掉（WSL 默认 swap 盘
+不必要地占空间），启动后删掉所有临时镜像；WSL 恢复，`/opt/qemu` 与
+`/opt/ios-sweet` 完好。**注意**：`.wslconfig` 原先 283 字节的内容没有备份，
+现在只剩 `[wsl2] swap=0`，需要按原样恢复 memory/processors 等设置。
+D: 目前只剩 7.8 GB，之后不要再整盘复制 17 GB 镜像；测试请用快照，
+或者先清理空间。
