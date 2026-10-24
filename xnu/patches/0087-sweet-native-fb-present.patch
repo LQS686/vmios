@@ -4,7 +4,7 @@
  #include <pexpert/pexpert.h>
  #include <kern/clock.h>
  #include <sys/proc.h>
-+extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern "C" vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
  
  enum {
  	kSweetFBGetLayerDefaultSurface  = 3,
