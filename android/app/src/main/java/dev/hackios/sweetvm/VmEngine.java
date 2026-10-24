@@ -128,9 +128,6 @@ public final class VmEngine {
         if (!cmdline.contains("tlto_us=")) {
             cmdline = (cmdline + " tlto_us=2000000 slto_us=2000000").trim();
         }
-        if (!cmdline.contains("sweetsample=")) {
-            cmdline = (cmdline + " sweetsample=-").trim();
-        }
         if (cmdline.length() >= 600) {
             android.util.Log.w("sweetvm", "boot args are " + cmdline.length()
                     + " bytes; the 607-byte boot_args field may truncate the lock timeouts");
