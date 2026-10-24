@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetVirtioConsole.cpp
-@@ -0,0 +1,497 @@
+@@ -0,0 +1,491 @@
 +/*
 + * SweetVirtioConsole: minimal modern virtio-mmio console.
 + *
@@ -21,12 +21,6 @@
 +#include <libkern/libkern.h>
 +#include <libkern/c++/OSData.h>
 +#include <pexpert/pexpert.h>
-+
-+extern "C" {
-+kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
-+void thread_deallocate(thread_t);
-+boolean_t PE_parse_boot_argn(const char *, void *, unsigned int);
-+}
 +
 +namespace {
 +
@@ -129,7 +123,7 @@
 +	IOReturn receive(void *data, size_t *bytes);
 +};
 +
-+OSDefineMetaClassAndStructors(SweetVirtioConsole, IOService)
++OSDefineMetaClassAndStructors(SweetVirtioConsole, IOService);
 +
 +IOService *
 +SweetVirtioConsole::probe(IOService *provider, SInt32 *score)

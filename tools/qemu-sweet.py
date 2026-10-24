@@ -241,6 +241,8 @@ def main():
                     help='enable vm/qemu/sweet_touch.c and listen on this Unix socket')
     ap.add_argument('--touchfile', metavar='FILE',
                     help='feed sweet-touch from a 5-byte state file instead of a chardev')
+    ap.add_argument('--gpu-wire', metavar='PORT',
+                    help='bridge the first virtio-mmio console to a host TCP GPU wire server')
     ap.add_argument('--incoming', metavar='FILE',
                     help='restore a VM state written by QMP migrate file:...')
     ap.add_argument('--qemu-debug', action='store_true',
@@ -308,6 +310,11 @@ def main():
     cmdline = payload[0x48:0x48 + 608].split(b'\0', 1)[0]
     if b'sweetfb_offload=1' in cmdline:
         cmd += ['-device', 'sweet-fb']
+    if a.gpu_wire:
+        cmd += ['-global', 'virtio-mmio.force-legacy=false',
+                '-chardev', f'socket,id=gpu_wire,host=127.0.0.1,port={a.gpu_wire}',
+                '-device', 'virtio-serial-device',
+                '-device', 'virtconsole,chardev=gpu_wire,name=offline-transport']
     if a.touch or a.touchfile:
         dev = 'sweet-touch'
         if a.touch:

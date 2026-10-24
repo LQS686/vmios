@@ -136,6 +136,11 @@ public final class MainActivity extends Activity {
         getWindow().getDecorView().setSystemUiVisibility(
                 View.SYSTEM_UI_FLAG_LAYOUT_STABLE | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN);
         cfg = BootConfig.load(this);
+        if (getIntent().getBooleanExtra("gpu_wire", false)) {
+            // Test hook: VmEngine starts this too when the payload cmdline has
+            // gpu_wire=1; the extra lets the host server be exercised alone.
+            GpuWireServer.start(5141);
+        }
         engine = new VmEngine(this);
         rootView = new FrameLayout(this);
         rootView.setBackgroundColor(BG);
