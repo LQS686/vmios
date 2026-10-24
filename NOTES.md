@@ -35,11 +35,17 @@
   signature, log `SWEETMETAL: call <sel>`, and return zero. The ring reader is
   `tools/sweet-log.py artifacts/<name>.bin artifacts/<name>.txt`.
 - **Next blocker: no frame reaches the display.** After context init the guest
-  logs one `queue commandBuffer` and never a `buffer commit`; backboardd's
-  IOMFB client does `display on` at ~98 s then `display off` 0.8 s later.
-  Need to find what CA waits for (drawable/IOSurface from the IOMFB/SweetSurface
-  user client) before it commits, then turn the recorded render/blit commands
-  into host GPU work over the `gpu_wire` protocol.
+  logs one `queue commandBuffer` and never a `buffer commit`; the IOMFB client
+  keeps swapping the software framebuffer (`SWEET FB: 22000 swaps` at 634 s)
+  and the panel still shows the kernel console, not the iOS UI. The Metal
+  context is set up but `CA::OGL::MetalContext::flush()` (the only caller of
+  `commit`/`commitAndWaitUntilSubmitted`/`waitUntilScheduled`) is never
+  reached. QuartzCore's display server created an `EAGLServer`, so the open
+  question is whether CA ever records a display frame at all in this
+  configuration or only uploads textures. Next: instrument the renderer
+  selection (EAGL vs Metal) and the IOMFB surface hand-off
+  (`SweetSurface`/`SWEET SURF` selectors), then turn recorded render/blit
+  commands into host GPU work over the `gpu_wire` protocol.
 
 ### >>> PREVIOUS: VIRTUAL GPU M0 PROVEN ON XIAOMI 14 PRO (2026-10-24) <<<
 
