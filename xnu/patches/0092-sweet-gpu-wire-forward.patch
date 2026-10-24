@@ -1,0 +1,137 @@
+--- a/iokit/Kernel/arm/SweetGPU.cpp
++++ b/iokit/Kernel/arm/SweetGPU.cpp
+@@ -12,6 +12,28 @@
+ #include <IOKit/IOLib.h>
+ #include <IOKit/IOKitKeys.h>
+ #include <kern/task.h>
++#include "SweetSurface.h"
++
++/* Custom user-client selector: fill an IOSurface on the host GPU. */
++#define kSweetGPUClearSurface 0x100
++#define SWEET_GPU_WIRE_MAGIC 0x5550474e
++#define SWEET_GPU_WIRE_VERSION 1
++#define SWEET_GPU_WIRE_FILL 3
++
++extern "C" IOReturn sweet_gpu_wire_send(const void *data, size_t bytes);
++
++struct sweet_gpu_wire_header {
++	uint32_t magic;
++	uint16_t version;
++	uint16_t operation;
++	uint32_t bytes;
++	uint32_t request;
++};
++
++struct sweet_gpu_wire_fill {
++	uint32_t pa_lo, pa_hi;
++	uint32_t width, height, stride, color, x, y;
++};
+ 
+ class SweetGPUUserClient;
+ class IOAcceleratorES;
+@@ -34,6 +56,7 @@
+ OSDefineMetaClassAndStructors(SweetGPUUserClient, IOUserClient);
+ 
+ static uint64_t sweet_gpu_logged;
++static unsigned sweet_gpu_fills;
+ 
+ bool
+ SweetGPUUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type)
+@@ -67,6 +90,57 @@
+ {
+ 	if (args == NULL) {
+ 		return kIOReturnBadArgument;
++	}
++	if (selector == kSweetGPUClearSurface) {
++		struct {
++			uint32_t surface, color, x, y, width, height;
++		} request;
++		if (args->structureInput == NULL ||
++		    args->structureInputSize < sizeof(request)) {
++			return kIOReturnBadArgument;
++		}
++		memcpy(&request, args->structureInput, sizeof(request));
++		SweetSurface *s = sweet_surface_copy(request.surface);
++		if (s == NULL) {
++			return kIOReturnNotFound;
++		}
++		uint32_t bytesPerRow = s->bytesPerRow;
++		uint32_t allocSize = s->allocSize;
++		uint32_t surfaceWidth = s->width;
++		uint32_t surfaceHeight = s->height;
++		IOByteCount segment = 0;
++		addr64_t pa = s->memory != NULL ?
++		    s->memory->getPhysicalSegment(0, &segment) : 0;
++		IOReturn result = kIOReturnOffline;
++		if (pa != 0 && segment >= allocSize) {
++			struct {
++				struct sweet_gpu_wire_header header;
++				struct sweet_gpu_wire_fill fill;
++			} __attribute__((packed)) message;
++			message.header.magic = SWEET_GPU_WIRE_MAGIC;
++			message.header.version = SWEET_GPU_WIRE_VERSION;
++			message.header.operation = SWEET_GPU_WIRE_FILL;
++			message.header.bytes = sizeof(message.fill);
++			message.header.request = request.surface;
++			message.fill.pa_lo = (uint32_t)pa;
++			message.fill.pa_hi = (uint32_t)(pa >> 32);
++			message.fill.width = request.width != 0 ? request.width : surfaceWidth;
++			message.fill.height = request.height != 0 ? request.height : surfaceHeight;
++			message.fill.stride = bytesPerRow;
++			message.fill.color = request.color;
++			message.fill.x = request.x;
++			message.fill.y = request.y;
++			result = sweet_gpu_wire_send(&message, sizeof(message));
++		}
++		s->release();
++		if (sweet_gpu_fills < 8) {
++			sweet_gpu_fills++;
++			IOLog("SWEET GPU: fill surface %u pa 0x%llx seg 0x%llx -> 0x%x
++",
++			    request.surface, (unsigned long long)pa,
++			    (unsigned long long)segment, result);
++		}
++		return result;
+ 	}
+ 	if (selector < 64 && !(sweet_gpu_logged & (1ULL << selector))) {
+ 		sweet_gpu_logged |= 1ULL << selector;
+--- a/iokit/Kernel/arm/SweetVirtioConsole.cpp
++++ b/iokit/Kernel/arm/SweetVirtioConsole.cpp
+@@ -122,6 +122,19 @@
+ 
+ OSDefineMetaClassAndStructors(SweetVirtioConsole, IOService);
+ 
++static SweetVirtioConsole *sweet_wire_console;
++
++/* Called from SweetGPU's user client: send one GPU request to the host. */
++extern "C" IOReturn
++sweet_gpu_wire_send(const void *data, size_t bytes)
++{
++	SweetVirtioConsole *console = sweet_wire_console;
++	if (console == nullptr) {
++		return kIOReturnOffline;
++	}
++	return console->send(data, bytes);
++}
++
+ IOService *
+ SweetVirtioConsole::probe(IOService *provider, SInt32 *score)
+ {
+@@ -438,6 +451,7 @@
+ 		return false;
+ 	}
+ 	registerService();
++	sweet_wire_console = this;
+ 	IOLog("SWEET GPU WIRE: virtio console online mmio=0x%llx\n",
+ 	    (unsigned long long)mapping->getPhysicalAddress());
+ 
+@@ -478,6 +492,9 @@
+ void
+ SweetVirtioConsole::stop(IOService *provider)
+ {
++	if (sweet_wire_console == this) {
++		sweet_wire_console = nullptr;
++	}
+ 	cleanup();
+ 	IOService::stop(provider);
+ }
