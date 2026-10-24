@@ -1,0 +1,531 @@
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetVirtioConsole.cpp
+@@ -0,0 +1,497 @@
++/*
++ * SweetVirtioConsole: minimal modern virtio-mmio console.
++ *
++ * Adapted from UniXNU's NativeVirtioConsole.cpp (BSD-2-Clause-Patent); only
++ * the kernel byte pipe is kept. QEMU exposes a virtio-serial console on the
++ * first virtio-mmio slot and bridges it to the Android host GPU server
++ * (GpuWireServer). The gpuwiretest boot-arg sends one GPU wire clear request
++ * through it and verifies the host reply.
++ */
++#include <IOKit/IOService.h>
++#include <IOKit/IOBufferMemoryDescriptor.h>
++#include <IOKit/IOLib.h>
++#include <IOKit/IOLocks.h>
++#include <IOKit/IOMemoryDescriptor.h>
++#include <kern/clock.h>
++#include <kern/task.h>
++#include <kern/thread.h>
++#include <libkern/libkern.h>
++#include <libkern/c++/OSData.h>
++#include <pexpert/pexpert.h>
++
++extern "C" {
++kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++void thread_deallocate(thread_t);
++boolean_t PE_parse_boot_argn(const char *, void *, unsigned int);
++}
++
++namespace {
++
++constexpr unsigned kQueueSize = 8;
++constexpr unsigned kBufferSize = 4096;
++constexpr unsigned kRingSize = 4096;
++
++struct Descriptor {
++	uint64_t address;
++	uint32_t length;
++	uint16_t flags;
++	uint16_t next;
++};
++
++struct Used {
++	uint32_t id;
++	uint32_t length;
++};
++
++inline void
++dmaBarrier()
++{
++	__asm__ volatile("dmb osh" ::: "memory");
++}
++
++struct Queue {
++	IOBufferMemoryDescriptor *ring = nullptr;
++	IOBufferMemoryDescriptor *buffer = nullptr;
++	uint64_t physical = 0;
++	uint64_t dataPhysical = 0;
++	uint16_t available = 0;
++	uint16_t used = 0;
++	unsigned bytes = 0;
++	unsigned offset = 0;
++	bool pending = false;
++
++	unsigned char *memory() const
++	{
++		return static_cast<unsigned char *>(ring->getBytesNoCopy());
++	}
++	void *data() const
++	{
++		return buffer->getBytesNoCopy();
++	}
++};
++
++struct WireHeader {
++	uint32_t magic;
++	uint16_t version;
++	uint16_t operation;
++	uint32_t bytes;
++	uint32_t request;
++};
++
++constexpr uint32_t kGpuWireMagic = 0x5550474e;
++constexpr uint16_t kGpuWireVersion = 1;
++constexpr uint16_t kGpuWireClear = 1;
++constexpr uint16_t kGpuWireResponse = 0x8000;
++constexpr unsigned kGpuWireReplyBytes = 16 + 32 + 64 * 64 * 4;
++
++} /* namespace */
++
++class SweetVirtioConsole : public IOService {
++	OSDeclareDefaultStructors(SweetVirtioConsole);
++
++	IOMemoryMap *mapping = nullptr;
++	IOLock *gate = nullptr;
++	Queue queues[2];
++	uintptr_t registers = 0;
++	bool online = false;
++
++	uint32_t read32(unsigned offset) const
++	{
++		return *reinterpret_cast<volatile uint32_t *>(registers + offset);
++	}
++	void write32(unsigned offset, uint32_t value)
++	{
++		*reinterpret_cast<volatile uint32_t *>(registers + offset) = value;
++		__asm__ volatile("dsb oshst" ::: "memory");
++	}
++	void address(unsigned offset, uint64_t value)
++	{
++		write32(offset, (uint32_t)value);
++		write32(offset + 4, (uint32_t)(value >> 32));
++	}
++	bool reset();
++	bool configureQueue(unsigned id);
++	bool configure();
++	void post(unsigned id, unsigned bytes);
++	IOReturn complete(unsigned id, unsigned *length);
++	void cleanup();
++
++public:
++	IOService *probe(IOService *provider, SInt32 *score) APPLE_KEXT_OVERRIDE;
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	void stop(IOService *provider) APPLE_KEXT_OVERRIDE;
++	void free() APPLE_KEXT_OVERRIDE;
++
++	IOReturn send(const void *data, size_t bytes);
++	IOReturn receive(void *data, size_t *bytes);
++};
++
++OSDefineMetaClassAndStructors(SweetVirtioConsole, IOService)
++
++IOService *
++SweetVirtioConsole::probe(IOService *provider, SInt32 *score)
++{
++	OSData *compatible = OSDynamicCast(OSData, provider->getProperty("compatible"));
++	if (compatible == nullptr || compatible->getLength() < 12 ||
++	    memcmp(compatible->getBytesNoCopy(), "virtio,mmio", 12) != 0) {
++		return nullptr;
++	}
++	return IOService::probe(provider, score);
++}
++
++bool
++SweetVirtioConsole::reset()
++{
++	online = false;
++	if (registers == 0) {
++		return true;
++	}
++	write32(0x70, 0);
++	uint64_t deadline;
++	clock_interval_to_deadline(1000, kMillisecondScale, &deadline);
++	while (read32(0x70) != 0) {
++		if (mach_absolute_time() >= deadline) {
++			return false;
++		}
++		IODelay(1);
++	}
++	for (unsigned i = 0; i < 2; i++) {
++		queues[i].pending = false;
++	}
++	return true;
++}
++
++bool
++SweetVirtioConsole::configureQueue(unsigned id)
++{
++	Queue &q = queues[id];
++	write32(0x30, id);
++	if (read32(0x44) != 0 || read32(0x34) < kQueueSize) {
++		return false;
++	}
++	IOOptionBits options = static_cast<IOOptionBits>(kIODirectionInOut) |
++	    static_cast<IOOptionBits>(kIOMemoryPhysicallyContiguous);
++	q.ring = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, options,
++	    kRingSize, kRingSize);
++	q.buffer = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, options,
++	    kBufferSize, 4096);
++	if (q.ring == nullptr || q.buffer == nullptr) {
++		OSSafeReleaseNULL(q.ring);
++		OSSafeReleaseNULL(q.buffer);
++		return false;
++	}
++	IOByteCount ringBytes = 0, dataBytes = 0;
++	q.physical = q.ring->getPhysicalSegment(0, &ringBytes);
++	q.dataPhysical = q.buffer->getPhysicalSegment(0, &dataBytes);
++	if (q.physical == 0 || q.dataPhysical == 0 || ringBytes < kRingSize ||
++	    dataBytes < kBufferSize || ((q.physical | q.dataPhysical) & 4095) != 0) {
++		OSSafeReleaseNULL(q.ring);
++		OSSafeReleaseNULL(q.buffer);
++		return false;
++	}
++	bzero(q.memory(), kRingSize);
++	bzero(q.data(), kBufferSize);
++	/* NO_INTERRUPT: the driver polls the used ring. */
++	*reinterpret_cast<volatile uint16_t *>(q.memory() + 128) = 1;
++	dmaBarrier();
++	write32(0x38, kQueueSize);
++	address(0x80, q.physical);
++	address(0x90, q.physical + 128);
++	address(0xa0, q.physical + 256);
++	write32(0x44, 1);
++	return true;
++}
++
++bool
++SweetVirtioConsole::configure()
++{
++	if (!reset()) {
++		return false;
++	}
++	write32(0x70, 1);
++	write32(0x70, 3);
++	write32(0x14, 1);
++	if ((read32(0x10) & 1) == 0) {
++		IOLog("SWEET GPU WIRE: device lacks VIRTIO_F_VERSION_1\n");
++		return false;
++	}
++	write32(0x20, 0);
++	write32(0x24, 1);
++	write32(0x20, 1);
++	write32(0x70, 11);
++	if ((read32(0x70) & (8 | 64 | 128)) != 8) {
++		IOLog("SWEET GPU WIRE: FEATURES_OK rejected, status=0x%x\n", read32(0x70));
++		return false;
++	}
++	if (!configureQueue(0) || !configureQueue(1)) {
++		IOLog("SWEET GPU WIRE: queue setup failed\n");
++		return false;
++	}
++	write32(0x70, 15);
++	online = (read32(0x70) & (15 | 64 | 128)) == 15;
++	return online;
++}
++
++void
++SweetVirtioConsole::post(unsigned id, unsigned bytes)
++{
++	Queue &q = queues[id];
++	Descriptor *descriptor = reinterpret_cast<Descriptor *>(q.memory());
++	descriptor[0] = { q.dataPhysical, bytes, (uint16_t)(id == 0 ? 2 : 0), 0 };
++	volatile uint16_t *available = reinterpret_cast<volatile uint16_t *>(q.memory() + 128);
++	available[2 + (q.available % kQueueSize)] = 0;
++	dmaBarrier();
++	available[1] = ++q.available;
++	dmaBarrier();
++	q.pending = true;
++	write32(0x50, id);
++}
++
++IOReturn
++SweetVirtioConsole::complete(unsigned id, unsigned *length)
++{
++	Queue &q = queues[id];
++	if (!q.pending) {
++		return kIOReturnNotReady;
++	}
++	volatile uint16_t *used = reinterpret_cast<volatile uint16_t *>(q.memory() + 256);
++	uint64_t deadline;
++	clock_interval_to_deadline(2000, kMillisecondScale, &deadline);
++	while (used[1] == q.used) {
++		if (read32(0x70) & (64 | 128)) {
++			online = false;
++			return kIOReturnIOError;
++		}
++		if (mach_absolute_time() >= deadline) {
++			return kIOReturnNotResponding;
++		}
++		IODelay(50);
++	}
++	dmaBarrier();
++	if ((uint16_t)(used[1] - q.used) != 1) {
++		online = false;
++		return kIOReturnIOError;
++	}
++	volatile Used *entries = reinterpret_cast<volatile Used *>(q.memory() + 260);
++	uint32_t index = entries[q.used % kQueueSize].id;
++	uint32_t bytes = entries[q.used % kQueueSize].length;
++	if (index != 0 || bytes > kBufferSize) {
++		online = false;
++		return kIOReturnIOError;
++	}
++	++q.used;
++	q.pending = false;
++	*length = bytes;
++	uint32_t irq = read32(0x60);
++	if (irq & 3) {
++		write32(0x64, irq & 3);
++	}
++	return kIOReturnSuccess;
++}
++
++IOReturn
++SweetVirtioConsole::send(const void *data, size_t bytes)
++{
++	if (data == nullptr || bytes == 0 || bytes > kBufferSize) {
++		return kIOReturnBadArgument;
++	}
++	IOLockLock(gate);
++	IOReturn status = kIOReturnNotReady;
++	Queue &q = queues[1];
++	if (online) {
++		unsigned consumed = 0;
++		/* A timed-out descriptor is still device-owned. Never overwrite it. */
++		if (q.pending) {
++			status = complete(1, &consumed);
++		} else {
++			status = kIOReturnSuccess;
++		}
++		if (status == kIOReturnSuccess) {
++			memcpy(q.data(), data, bytes);
++			post(1, (unsigned)bytes);
++			status = complete(1, &consumed);
++		}
++	}
++	IOLockUnlock(gate);
++	return status;
++}
++
++IOReturn
++SweetVirtioConsole::receive(void *data, size_t *bytes)
++{
++	if (data == nullptr || bytes == nullptr || *bytes == 0 || *bytes > kBufferSize) {
++		return kIOReturnBadArgument;
++	}
++	size_t capacity = *bytes;
++	*bytes = 0;
++	IOLockLock(gate);
++	IOReturn status = kIOReturnNotReady;
++	Queue &q = queues[0];
++	if (online) {
++		status = kIOReturnSuccess;
++		if (q.pending) {
++			unsigned received = 0;
++			status = complete(0, &received);
++			if (status == kIOReturnSuccess) {
++				q.bytes = received;
++				q.offset = 0;
++			}
++		}
++		if (status == kIOReturnSuccess) {
++			unsigned left = q.bytes - q.offset;
++			unsigned copied = left < capacity ? left : (unsigned)capacity;
++			memcpy(data, static_cast<unsigned char *>(q.data()) + q.offset, copied);
++			q.offset += copied;
++			*bytes = copied;
++			if (q.offset == q.bytes) {
++				q.offset = q.bytes = 0;
++				post(0, kBufferSize);
++			}
++		}
++	}
++	IOLockUnlock(gate);
++	return status;
++}
++
++static void
++sweet_gpu_wire_test(void *arg, wait_result_t wait_result)
++{
++	SweetVirtioConsole *console = static_cast<SweetVirtioConsole *>(arg);
++	uint64_t began = mach_absolute_time();
++	(void)wait_result;
++
++	/* The host GPU server needs EGL up before the first request. */
++	IOSleep(10000);
++
++	WireHeader request = { kGpuWireMagic, kGpuWireVersion, kGpuWireClear, 0, 0x5eed0001 };
++	IOReturn status = console->send(&request, sizeof(request));
++	if (status != kIOReturnSuccess) {
++		IOLog("SWEET GPU WIRE: request send failed 0x%x\n", status);
++		return;
++	}
++
++	unsigned char *reply = static_cast<unsigned char *>(IOMalloc(kGpuWireReplyBytes));
++	if (reply == nullptr) {
++		IOLog("SWEET GPU WIRE: reply buffer allocation failed\n");
++		return;
++	}
++	unsigned total = 0;
++	unsigned tries = 0;
++	while (total < kGpuWireReplyBytes && tries < 64) {
++		size_t bytes = kGpuWireReplyBytes - total;
++		status = console->receive(reply + total, &bytes);
++		if (status == kIOReturnSuccess) {
++			total += (unsigned)bytes;
++		}
++		tries++;
++	}
++
++	if (total < kGpuWireReplyBytes) {
++		IOLog("SWEET GPU WIRE: short reply %u/%u status=0x%x tries=%u\n",
++		    total, kGpuWireReplyBytes, status, tries);
++		IOFree(reply, kGpuWireReplyBytes);
++		return;
++	}
++
++	WireHeader header;
++	uint32_t width, height, format, result, pixel;
++	uint64_t gpuStart, gpuEnd;
++	memcpy(&header, reply, sizeof(header));
++	memcpy(&width, reply + 16, 4);
++	memcpy(&height, reply + 20, 4);
++	memcpy(&format, reply + 24, 4);
++	memcpy(&result, reply + 28, 4);
++	memcpy(&gpuStart, reply + 32, 8);
++	memcpy(&gpuEnd, reply + 40, 8);
++	memcpy(&pixel, reply + 48, 4);
++	uint64_t elapsed = 0;
++	absolutetime_to_nanoseconds(mach_absolute_time() - began, &elapsed);
++
++	IOLog("SWEET GPU WIRE: reply magic=0x%08x ver=%u op=0x%04x req=0x%08x\n",
++	    header.magic, header.version, header.operation, header.request);
++	IOLog("SWEET GPU WIRE: %ux%u fmt=%u status=%u gpu_ns=%llu pixel0=0x%08x elapsed_ns=%llu\n",
++	    width, height, format, result, (unsigned long long)(gpuEnd - gpuStart),
++	    pixel, (unsigned long long)elapsed);
++	IOLog("SWEET GPU WIRE: %s\n",
++	    (header.magic == kGpuWireMagic && header.version == kGpuWireVersion &&
++	    header.operation == (kGpuWireClear | kGpuWireResponse) &&
++	    width == 64 && height == 64 && pixel == 0x3f800000) ? "OK" : "UNEXPECTED REPLY");
++
++	IOFree(reply, kGpuWireReplyBytes);
++}
++
++bool
++SweetVirtioConsole::start(IOService *provider)
++{
++	uint64_t sctlr;
++	__asm__ volatile("mrs %0, sctlr_el1" : "=r"(sctlr));
++	if ((sctlr & 1) == 0 || !IOService::start(provider)) {
++		return false;
++	}
++	gate = IOLockAlloc();
++	mapping = provider->mapDeviceMemoryWithIndex(0);
++	if (gate == nullptr || mapping == nullptr || mapping->getLength() < 0x100) {
++		return false;
++	}
++	registers = mapping->getVirtualAddress();
++	if (read32(0) != 0x74726976 || read32(4) != 2 || read32(8) != 3) {
++		return false;
++	}
++	if (!configure()) {
++		return false;
++	}
++	registerService();
++	IOLog("SWEET GPU WIRE: virtio console online mmio=0x%llx\n",
++	    (unsigned long long)mapping->getPhysicalAddress());
++
++	int test = 0;
++	if (PE_parse_boot_argn("gpuwiretest", &test, sizeof(test)) && test != 0) {
++		thread_t thread = nullptr;
++		if (kernel_thread_start((thread_continue_t)sweet_gpu_wire_test, this,
++		    &thread) == KERN_SUCCESS) {
++			thread_deallocate(thread);
++		} else {
++			IOLog("SWEET GPU WIRE: could not start the wire test thread\n");
++		}
++	}
++	return true;
++}
++
++void
++SweetVirtioConsole::cleanup()
++{
++	if (gate != nullptr) {
++		IOLockLock(gate);
++	}
++	bool stopped = reset();
++	if (stopped) {
++		for (unsigned i = 0; i < 2; i++) {
++			OSSafeReleaseNULL(queues[i].ring);
++			OSSafeReleaseNULL(queues[i].buffer);
++		}
++		OSSafeReleaseNULL(mapping);
++		registers = 0;
++	}
++	/* If reset fails, keep device-reachable memory instead of freeing it. */
++	if (gate != nullptr) {
++		IOLockUnlock(gate);
++	}
++}
++
++void
++SweetVirtioConsole::stop(IOService *provider)
++{
++	cleanup();
++	IOService::stop(provider);
++}
++
++void
++SweetVirtioConsole::free()
++{
++	cleanup();
++	if (gate != nullptr) {
++		IOLockFree(gate);
++		gate = nullptr;
++	}
++	IOService::free();
++}
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -15,7 +15,8 @@
+ iokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitcpp
+ iokit/Kernel/arm/SweetSurface.cpp                                optional iokitcpp
+ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
+ iokit/Kernel/arm/SweetGPU.cpp                                  optional iokitcpp
++iokit/Kernel/arm/SweetVirtioConsole.cpp                          optional iokitcpp
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -82,11 +82,17 @@
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = SweetBattery;"
+     "   },"
+     "   {"
+     "     'IOClass'         = IOAcceleratorES;"
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = IOAcceleratorES;"
+     "   },"
++    "   {"
++    "     'IOClass'         = SweetVirtioConsole;"
++    "     'IOProviderClass' = IOPlatformDevice;"
++    "     'IONameMatch'     = 'virtio,mmio';"
++    "     'IOProbeScore'    = 10000:32;"
++    "   },"
+ #endif
+     "   {"
+     "     'IOClass'         = IOPanicPlatform;"

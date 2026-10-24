@@ -182,10 +182,12 @@ public final class VmEngine {
         // another stalled in userland, so the speed win is not proven yet.
         boolean mttcg = cpus >= 2 && cmdline.contains("tcgmulti=1");
         boolean offload = cmdline.contains("sweetfb_offload=1");
+        boolean gpuWire = cmdline.contains("gpu_wire=1");
         android.util.Log.i("sweetvm", "engine cpus=" + cpus + " accel="
                 + (mttcg ? "tcg,thread=multi" : "tcg,thread=single")
                 + " prealloc=" + prealloc
                 + " present=" + (offload ? "native" : "guest")
+                + " gpu_wire=" + gpuWire
                 + " capture=" + this.fps + "fps");
         // A large TB cache matters for the multi-hundred-MB dyld shared cache.
         cmd.add("-accel");
@@ -203,6 +205,17 @@ public final class VmEngine {
         if (offload) {
             cmd.add("-device");
             cmd.add("sweet-fb");
+        }
+        if (gpuWire) {
+            // Guest -> Android host GPU pipe: the ADT's virtio0 node maps the
+            // first virtio-mmio slot at 0x0a000000; the socket chardev connects
+            // to GpuWireServer in this process. QEMU connects at startup, so
+            // the server must be listening before the process is spawned.
+            GpuWireServer.start(5141);
+            cmd.add("-global"); cmd.add("virtio-mmio.force-legacy=false");
+            cmd.add("-chardev"); cmd.add("socket,id=gpu_wire,host=127.0.0.1,port=5141");
+            cmd.add("-device"); cmd.add("virtio-serial-device");
+            cmd.add("-device"); cmd.add("virtconsole,chardev=gpu_wire,name=offline-transport");
         }
         cmd.add("-object");
         // prealloc: without it every first touch of a guest page is a host

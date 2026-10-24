@@ -35,6 +35,7 @@ FB_W, FB_H, FB_STRIDE = 1080, 2400, 1080 * 4
 # the free MMIO hole below the PCIe window; see vm/qemu/sweet_ufs.c.
 UFS, UFS_SIZE = 0x01d84000, 0x3000
 QEMU_UFS = 0x0e000000
+QEMU_VIRTIO = 0x0a000000
 TIMEBASE = 19200000
 VTIMER_INTID = 19
 # QEMU virt (-M virt,gic-version=3 -cpu cortex-a76): GICD/GICR and the generic timer's CNTFRQ
@@ -77,7 +78,7 @@ def node(name, props=(), children=()):
 
 
 def build(seed=None, qemu=False, highmem=False, no_product=False, qemu_cpus=1,
-          fb_w=FB_W, fb_h=FB_H, display_scale=3):
+          fb_w=FB_W, fb_h=FB_H, display_scale=3, gpu_wire=False):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py).
 
     no_product=True omits the real D22AP /product node (for redistributable
@@ -217,6 +218,15 @@ def build(seed=None, qemu=False, highmem=False, no_product=False, qemu_cpus=1,
         ('reg', u64(QEMU_UFS if qemu else UFS, UFS_SIZE)),
     ])
 
+    # First QEMU virt virtio-mmio slot, bridged to the Android host GPU server
+    # (SweetVirtioConsole.cpp). Opt-in: the phone has unrelated MMIO here.
+    virtio = node('virtio0', [
+        ph(),
+        ('compatible', cstr('virtio,mmio')),
+        ('reg', u64(QEMU_VIRTIO, 0x200)),
+        ('dma-coherent', b''),
+    ])
+
     # pmap_compute_max_asids requires the node even when no overrides are set.
     # An absent pmap-max-asids property selects XNU's own MAX_ASIDS default.
     # No effaceable storage: keybagd then reads /private/var/keybags/systembag.kb
@@ -251,7 +261,8 @@ def build(seed=None, qemu=False, highmem=False, no_product=False, qemu_cpus=1,
         ('manufacturer', cstr('Apple Inc.')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
-    ], [chosen, defaults, cpus, arm_io, fbcon, buttons, pram, ufs] + product)
+    ], [chosen, defaults, cpus, arm_io, fbcon, buttons, pram, ufs]
+        + ([virtio] if gpu_wire else []) + product)
 
 
 if __name__ == '__main__':
@@ -265,7 +276,8 @@ if __name__ == '__main__':
     root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv,
                  no_product='--no-product' in sys.argv, qemu_cpus=qemu_cpus,
                  fb_w=arg('--fb-width', FB_W), fb_h=arg('--fb-height', FB_H),
-                 display_scale=arg('--display-scale', 3))
+                 display_scale=arg('--display-scale', 3),
+                 gpu_wire='--gpu-wire' in sys.argv)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:
