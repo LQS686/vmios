@@ -101,7 +101,32 @@ def pull_guest_log(adb, pkg, outdir):
     path = os.path.join(outdir, 'guestlog.txt')
     with open(path, 'wb') as f:
         f.write(out)
-    print('[*] guest console ->', path, '(%d bytes of %d)' % (len(out), total))
+    print('[*] guest console ->', path, '(%d bytes)' % len(out))
+
+
+def start_vm(adb):
+    """Tap the home screen's launch button, which the activity does not do."""
+    remote = '/sdcard/sweetvm-ui.xml'
+    bounds = re.compile(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]')
+    for _ in range(15):
+        r = subprocess.run([adb, 'shell', 'uiautomator', 'dump', remote],
+                           capture_output=True, timeout=30)
+        if r.returncode == 0:
+            r = subprocess.run([adb, 'exec-out', 'cat', remote],
+                               capture_output=True, timeout=30)
+            xml = r.stdout.decode('utf-8', 'replace')
+            for label in ('快速启动 iOS（快照）', '启动 iOS 虚拟机'):
+                i = xml.find(label)
+                m = bounds.search(xml, i, i + 1200) if i >= 0 else None
+                if m:
+                    x = (int(m.group(1)) + int(m.group(3))) // 2
+                    y = (int(m.group(2)) + int(m.group(4))) // 2
+                    run([adb, 'shell', 'input', 'tap', str(x), str(y)])
+                    print('[*] tapped', label, 'at', x, y)
+                    return True
+        time.sleep(1)
+    print('[!] could not find the launch button', file=sys.stderr)
+    return False
 
 
 def native_app_check(adb, pkg, outdir, wait=120):
@@ -223,6 +248,7 @@ def main(argv=None):
     last_shot = 0
     proc = subprocess.Popen([adb, 'logcat', '-s', 'sweetvm:I', 'SWEET:I', '*:S'],
                             text=True, stdout=subprocess.PIPE, errors='replace')
+    start_vm(adb)
     try:
         while time.time() - t0 < a.read_secs:
             line = proc.stdout.readline()
@@ -278,6 +304,11 @@ def main(argv=None):
         if max(fps) <= 12:
             print('[!] still capped near 12 fps - check the 高级选项 slider '
                   'and that the APK is the rebuilt one', file=sys.stderr)
+    gfxinfo = os.path.join(a.out, 'gfxinfo.txt')
+    r = run([adb, 'shell', 'dumpsys', 'gfxinfo', 'dev.hackios.sweetvm',
+             'framestats'])
+    with open(gfxinfo, 'w', encoding='utf-8', errors='replace') as f:
+        f.write(r.stdout)
     pull_guest_log(adb, 'dev.hackios.sweetvm', a.out)
     print('[*] logs and screenshots in', a.out)
     if a.native_app_check:
