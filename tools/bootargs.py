@@ -98,6 +98,9 @@ PROFILES = {
     # `tcgmulti=1` into -accel tcg,thread=multi (XNU ignores the token).
     "vm-mttcg": VM + " tcgmulti=1",
     "vm-offload": VM + " sweetfb_offload=1",
+    # 375x812 points at 2x: the same UIKit layout with 44.5% of the pixels.
+    # Use mkadt.py --fb-width 750 --fb-height 1624 --display-scale 2.
+    "vm-2x": VM + " sweetfb_native=1 sweetfb_w=750 sweetfb_h=1624",
     # Touch is dead under SweetVM until kernel patch 0085 (the RPMh rail vote
     # fails with ENODEV and used to abort the GT9896 probe). Until that kernel
     # is built, sweethidtest drives a Home press every N seconds through

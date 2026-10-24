@@ -22,12 +22,30 @@ public final class Payload {
     public static final long RAM_BASE = 0x40000000L;
     public static final long STUB_PA = 0x40200000L;
     public static final long FB_BASE = 0x9c000000L;
-    public static final int FB_W = 1080;
-    public static final int FB_H = 2400;
-    public static final int FB_STRIDE = FB_W * 4;
+    public static int FB_W = 1080;
+    public static int FB_H = 2400;
+    public static int FB_STRIDE = FB_W * 4;
     public static final int PAGE = 0x4000;
 
     private static final int CMDLINE_LEN = 608;
+
+    public static void configure(String cmdline) {
+        FB_W = 1080;
+        FB_H = 2400;
+        java.util.regex.Matcher w = java.util.regex.Pattern
+                .compile("(?:^| )sweetfb_w=(\\d+)").matcher(cmdline);
+        java.util.regex.Matcher h = java.util.regex.Pattern
+                .compile("(?:^| )sweetfb_h=(\\d+)").matcher(cmdline);
+        if (w.find() && h.find()) {
+            int width = Integer.parseInt(w.group(1));
+            int height = Integer.parseInt(h.group(1));
+            if (width > 0 && height > 0 && width <= 4096 && height <= 4096) {
+                FB_W = width;
+                FB_H = height;
+            }
+        }
+        FB_STRIDE = FB_W * 4;
+    }
 
     public static final class Segment {
         public final long vmaddr, vmsize, fileOff, fileSize;

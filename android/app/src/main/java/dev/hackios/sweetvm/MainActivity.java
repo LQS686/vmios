@@ -745,6 +745,7 @@ public final class MainActivity extends Activity {
             dialog("无法读取 payload", e.getMessage() == null ? "未知错误" : e.getMessage());
             return;
         }
+        Payload.configure(cmd);
         showVmScreen();
         lastCmdline = cmd;
         touch = new TouchSender(new File(getFilesDir(), "vm/touch.bin"));

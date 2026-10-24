@@ -76,7 +76,8 @@ def node(name, props=(), children=()):
     return n
 
 
-def build(seed=None, qemu=False, highmem=False, no_product=False, qemu_cpus=1):
+def build(seed=None, qemu=False, highmem=False, no_product=False, qemu_cpus=1,
+          fb_w=FB_W, fb_h=FB_H, display_scale=3):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py).
 
     no_product=True omits the real D22AP /product node (for redistributable
@@ -113,7 +114,7 @@ def build(seed=None, qemu=False, highmem=False, no_product=False, qemu_cpus=1):
         # from /chosen, the pixel size from IOMobileFramebuffer. Scale 0 makes
         # SpringBoard's FBSDisplayMode "infxinf@0x" invalid. 1080x2400 @3x =
         # 360x800 points (like iPhone X class devices).
-        ('display-scale', u32(3)),
+        ('display-scale', u32(display_scale)),
         # XNU derives IOPlatformUUID (gethostuuid) from these on arm; without
         # them CFPreferences cannot use kCFPreferencesCurrentHost (no ByHost
         # files), so e.g. DataMigration never records LastSystemVersion and
@@ -196,16 +197,16 @@ def build(seed=None, qemu=False, highmem=False, no_product=False, qemu_cpus=1):
             ph(),
             ('device_type', cstr('display-subsystem')),
             ('compatible', cstr('sweet,display')),
-            ('canvas-width', u32(1125)),
-            ('canvas-height', u32(2436)),
+            ('canvas-width', u32(fb_w)),
+            ('canvas-height', u32(fb_h)),
         ])])
 
     fbcon = node('sweet-fbcon', [
         ph(),
         ('reg', u64(FB, FB_SIZE)),
-        ('width', u32(FB_W)),
-        ('height', u32(FB_H)),
-        ('stride', u32(FB_STRIDE)),
+        ('width', u32(fb_w)),
+        ('height', u32(fb_h)),
+        ('stride', u32(fb_w * 4)),
     ])
 
     # bsd/dev/sweet_ufs.c: the UFS host ABL leaves running (absolute physical
@@ -257,8 +258,14 @@ if __name__ == '__main__':
     qemu_cpus = 1
     if '--qemu-cpus' in sys.argv:
         qemu_cpus = int(sys.argv[sys.argv.index('--qemu-cpus') + 1])
+    def arg(name, default):
+        if name not in sys.argv:
+            return default
+        return int(sys.argv[sys.argv.index(name) + 1])
     root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv,
-                 no_product='--no-product' in sys.argv, qemu_cpus=qemu_cpus)
+                 no_product='--no-product' in sys.argv, qemu_cpus=qemu_cpus,
+                 fb_w=arg('--fb-width', FB_W), fb_h=arg('--fb-height', FB_H),
+                 display_scale=arg('--display-scale', 3))
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:
