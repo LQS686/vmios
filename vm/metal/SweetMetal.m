@@ -22,6 +22,7 @@ typedef void (*IMP)(void);
 Class objc_getClass(const char *name);
 Class class_getSuperclass(Class cls);
 const char *class_getName(Class cls);
+const char *object_getClassName(id obj);
 Method *class_copyMethodList(Class cls, unsigned int *outCount);
 SEL method_getName(Method method);
 const char *method_getTypeEncoding(Method method);
@@ -329,6 +330,37 @@ sweet_probe_panel(void)
 	}
 }
 
+/* Does this process actually have UI windows/layers? (SpringBoard only) */
+static void
+sweet_probe_ui(void)
+{
+	Class app_class = objc_getClass("UIApplication");
+	if (app_class == 0) {
+		return;
+	}
+	id app = ((id (*)(id, SEL))objc_msgSend)((id)app_class,
+	    sel_registerName("sharedApplication"));
+	id windows = app != 0 ? sweet_msg_id(app, "windows") : 0;
+	unsigned long count = windows != 0 ? sweet_msg_ul(windows, "count") : 0;
+	dprintf(console_fd, "SWEETMETAL: ui pid=%d app=%p windows=%lu\n",
+	    getpid(), app, count);
+	for (unsigned long i = 0; i < count && i < 8; i++) {
+		id window = sweet_msg_id_idx(windows, "objectAtIndex:", i);
+		id layer = window != 0 ? sweet_msg_id(window, "layer") : 0;
+		id sublayers = layer != 0 ? sweet_msg_id(layer, "sublayers") : 0;
+		unsigned long sub = sublayers != 0 ?
+		    sweet_msg_ul(sublayers, "count") : 0;
+		unsigned long level = window != 0 ?
+		    sweet_msg_ul(window, "windowLevel") : 0;
+		dprintf(console_fd,
+		    "SWEETMETAL: ui win[%lu] %s level=%lu sublayers=%lu\n",
+		    i, window != 0 ? object_getClassName(window) : "(nil)",
+		    level, sub);
+	}
+
+}
+
+
 /* Which graphics stacks does this process actually have loaded? */
 static void
 sweet_probe_images(void *context)
@@ -348,6 +380,7 @@ sweet_probe_images(void *context)
 		}
 	}
 	sweet_probe_panel();
+	sweet_probe_ui();
 }
 
 __attribute__((constructor))

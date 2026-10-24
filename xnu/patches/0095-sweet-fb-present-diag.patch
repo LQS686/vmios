@@ -1,0 +1,38 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -239,6 +239,10 @@
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+ 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
++	int quiet = 0;
++	if (PE_parse_boot_argn("sweetfb_noconsole", &quiet, sizeof(quiet)) && quiet != 0) {
++		sweet_console_muted = 1;
++	}
+ 	registerService();
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+ 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
+@@ -285,6 +289,11 @@
+ 		return;
+ 	}
+ 	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0;
++	if ((count % 600) == 1) {
++		IOLog("SWEET FB: vsync %llu dirty=%d off=%d flush=%d ticks=%u\n",
++		    (unsigned long long)count, fb->fDirty, fb->fPowerOff, flush,
++		    fb->fFlushTicks);
++	}
+ 	uint8_t *rec = NULL;
+ 	if (flush) {
+ 		rec = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
+@@ -384,7 +393,12 @@
+ void
+ AppleCLCD::present(const uint8_t *rec)
+ {
++	static unsigned long long present_count;
+ 	uint32_t mask = get32(rec, 0x104);
++	if ((++present_count % 600) == 1) {
++		IOLog("SWEET FB: present %llu mask=0x%x blits=%u\n",
++		    present_count, mask, get32(rec, 0x38b));
++	}
+ 
+ 	if (fOffload != NULL) {
+ 		fOffload->count = 0;

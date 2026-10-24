@@ -82,6 +82,51 @@
   `EAGLServer::renderer()` selects the Metal renderer when
   `CAMetalContextCreate` succeeds (GL is only the fallback), and backboardd
   has the full OpenGLES stack loaded, so both APIs are in play.
+- **RE tooling (2026-10-24):** Ghidra 12.1.4 + Temurin JDK 21 are installed
+  under `.tools/ghidra` and `.tools/jdk21` (GitHub downloads need the local
+  proxy `-x http://127.0.0.1:7897`; direct is ~60 KB/s). REA's Windows Ghidra
+  provider only accepts PE, so drive Ghidra directly:
+  `.tools/run-ghidra-quick.cmd <addr...>` imports
+  `research/dsc-extract/QuartzCore` with `-noanalysis` and runs
+  `ghidra-scripts/DecompileNoAnalysis.java` (Disassembler + DecompInterface).
+  Windows paths must be ASCII; `E:\hackios` is a junction to the project dir.
+- **CA display link findings (decompiled):** `IOMFBServer::thread_body` only
+  creates a CFRunLoopTimer with `null_timer` and runs the loop.
+  `IOMFBServer::add_vsync_source` has two modes: a CADisplayTimer calling
+  `IOMFBServer::timer_callback`, or a mach-port runloop source from
+  `IOMobileFramebufferGetVSyncRunLoopSource` (which would call
+  `registerNotificationPort`; the 0093 kernel logs show it is never called).
+  CA therefore uses the CADisplayTimer path, and both timer_callback and
+  vsync_callback converge on the server vtable +0x1b8. `present()` and the
+  `sweetfb_noconsole` console mute both live in `AppleCLCD::present`, which
+  runs only from `vsyncFired` when `fDirty && count % fFlushTicks == 0`; the
+  console is still drawing, so present() appears never to run. Patch 0095
+  adds `present`/`vsync` counters (and mutes the console at start) to
+  confirm this.
+- **Measured with 0095/0096 on the phone:**
+  - The console mute now works from boot: the panel is black instead of
+    filling with kernel text, and the host GPU's 200x200 magenta square is
+    the only content (`artifacts/m6-screen1.png`).
+  - `present()` does run (`present 1`, 601, 1201 ... = every ~20 s at 30 Hz)
+    and the first record has `mask=0x80000007`, but the raw dump shows
+    every layer surface id at record+0x54..0x60 is **0** and most of the
+    0x46c record is zero (`rec 050 00000001 00000000 ...`). So CA's
+    WindowServer really is submitting empty swaps; the mask words are stale
+    leftovers, not layer enables.
+  - SpringBoard has real UI: pid 26 reports 3 windows -
+    `_SBWallpaperSecureWindow` (2 sublayers), `SBStatusBarReusePoolWindow`,
+    `SBRootSceneWindow` (1 sublayer). A CATransaction nudge
+    (setNeedsDisplay/setAlpha/commit/flush) produced no server-side Metal
+    work and no non-empty swap.
+  - Rendering the window tree with `-[CALayer renderInContext:]` into the
+    panel surface aborts SpringBoard (removed). Treat UI rendering from the
+    injected dylib as unsafe.
+  - Conclusion: the layer tree exists in SpringBoard, but backboardd's
+    render server never composites it and never submits layers; the Metal
+    renderer stays idle after its 75 s init batch. The next step is to find
+    why the render server receives no usable update (client CA::Context ->
+    server connection, or the server's update/timer path), using Ghidra on
+    `CA::Render::Server` / `CA::Context::commit_transaction`.
 
 ### >>> PREVIOUS: VIRTUAL GPU M0 PROVEN ON XIAOMI 14 PRO (2026-10-24) <<<
 

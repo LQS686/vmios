@@ -20,24 +20,35 @@
  {
 +	char proc[32];
 +	proc_selfname(proc, sizeof(proc));
-+	IOLog("SWEET FB: %s notification port type %u port %u\n", proc, type, port);
++	IOLog("SWEET FB: %s notification port type %u port %p\n", proc, type, (void *)port);
  	mach_port_t old;
  	IOLockLock(fFB->fLock);
  	old = fPort;
-@@ -616,7 +622,15 @@
- 		out[0] = SWEET_FB_DOT_PITCH;
+@@ -568,6 +574,19 @@
+ 
+ static uint64_t sweet_fb_logged;        /* selectors already logged (< 64) */
+ 
++static void
++sweet_fb_log_notification(IOExternalMethodArguments *args)
++{
++	char proc[32];
++	proc_selfname(proc, sizeof(proc));
++	IOLog("SWEET FB: %s notifications n=%u v=%llu,%llu,%llu,%llu\n", proc,
++	    args->scalarInputCount,
++	    args->scalarInputCount > 0 ? args->scalarInput[0] : 0ULL,
++	    args->scalarInputCount > 1 ? args->scalarInput[1] : 0ULL,
++	    args->scalarInputCount > 2 ? args->scalarInput[2] : 0ULL,
++	    args->scalarInputCount > 3 ? args->scalarInput[3] : 0ULL);
++}
++
+ IOReturn
+ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
+     __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target,
+@@ -617,6 +636,7 @@
  		outCount = 1;
  		break;
--	case kSweetFBNotifications:
-+	case kSweetFBNotifications: {
-+		char proc[32];
-+		proc_selfname(proc, sizeof(proc));
-+		IOLog("SWEET FB: %s notifications n=%u v=%llu,%llu,%llu,%llu\n", proc,
-+		    args->scalarInputCount,
-+		    args->scalarInputCount > 0 ? args->scalarInput[0] : 0ULL,
-+		    args->scalarInputCount > 1 ? args->scalarInput[1] : 0ULL,
-+		    args->scalarInputCount > 2 ? args->scalarInput[2] : 0ULL,
-+		    args->scalarInputCount > 3 ? args->scalarInput[3] : 0ULL);
+ 	case kSweetFBNotifications:
++		sweet_fb_log_notification(args);
  		if (args->scalarInputCount >= 3 && args->scalarInput[2] < SWEET_FB_NOTIFY_TYPES) {
  			uint32_t type = (uint32_t)args->scalarInput[2];
  			IOLockLock(fFB->fLock);
