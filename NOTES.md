@@ -1,6 +1,47 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
-### >>> ACTIVE: VIRTUAL GPU M0 PROVEN ON XIAOMI 14 PRO (2026-10-24) <<<
+### >>> ACTIVE: VIRTUAL GPU M2 — GUEST METAL DEVICE IS THE SYSTEM DEFAULT (2026-10-24) <<<
+
+**Measured on Xiaomi 14 Pro (`eb72c928`), payload `.tools/gputest/payload-phone-m2u.bin`
+(m2v adds the compute-pipeline override), image `files/ios16-root.img` in the app.**
+
+- Patch 0091 (PID-1 vfs context) installs the plugin every boot at ~31 s:
+  `install .../AGXMetalA11.bundle/Info.plist (723) -> 0`,
+  `install .../SweetMetal (92336) -> 0`, `bundle install done (0)`.
+- Metal loads it in backboardd: `SWEETMETAL: bundle loaded`,
+  `initWithAcceleratorPort`, and both `_MTLAddDevice` conformance asserts pass.
+- **The probe device is the system default:** a libdispatch self-probe inside
+  backboardd reports `MTLCreateSystemDefaultDevice() = 0x...` with
+  `name=SweetMetal` (iOS has no `MTLCopyAllDevices`; `dlsym` returns NULL).
+  Sampled in ring m2-ring21/30: `probe[queue] default=0x104740000 name=SweetMetal`.
+- CoreAnimation's `CA::WindowServer::EAGLServer::renderer()` ->
+  `CA::OGL::new_metal_context()` now completes its whole setup against the
+  plugin: `newCommandQueue`, `setLabel:`, `setSubmissionQueue:`,
+  `setCompletionQueue:`, `queue.device`, `newDepthStencilStateWithDescriptor:`,
+  `newLibraryWithURL:error:`, `newPipelineLibraryWithFilePath:error:`,
+  `supportsFamily:` Apple1..8, pipeline states by name (`Pw40aXm_*`, `Siri*`),
+  textures/buffers, render+blit encoders, `copyFromTexture:...`,
+  `generateMipmapsForTexture:`, `replaceRegion:...`.
+- SpringBoard's MPSCore also runs: it loads functions by descriptor
+  (`D8F18H`, `U16P3F3H/V`, ...) and builds compute pipeline states. The abort
+  `MPSKernel MTLComputePipelineStateCache unable to load function D8F18H`
+  (message recovered from `MPSCore` `MPSLibrary.mm:550`) was
+  `-[_MTLDevice newComputePipelineStateWithDescriptor:options:reflection:error:]`
+  running the real Metal implementation on the fake device. Overriding the
+  compute/render pipeline creators fixed it: ring m2-ring30 has **0 SpringBoard
+  crashes** through 150 s of boot.
+- All fake objects live in `vm/metal/SweetMetal.m` (device + queue/buffer/
+  encoder/opaque/function traps). Unknown selectors get a wide generic
+  signature, log `SWEETMETAL: call <sel>`, and return zero. The ring reader is
+  `tools/sweet-log.py artifacts/<name>.bin artifacts/<name>.txt`.
+- **Next blocker: no frame reaches the display.** After context init the guest
+  logs one `queue commandBuffer` and never a `buffer commit`; backboardd's
+  IOMFB client does `display on` at ~98 s then `display off` 0.8 s later.
+  Need to find what CA waits for (drawable/IOSurface from the IOMFB/SweetSurface
+  user client) before it commits, then turn the recorded render/blit commands
+  into host GPU work over the `gpu_wire` protocol.
+
+### >>> PREVIOUS: VIRTUAL GPU M0 PROVEN ON XIAOMI 14 PRO (2026-10-24) <<<
 
 **Stable state restored:** phone payload is `.tools/frozen/payload-vm-mttcg.bin`
 one guest CPU, App is at home. The last experimental payload was M0 only.
