@@ -30,10 +30,9 @@ index 57eef20..07a9b31 100644
  	registerService();
 diff --git a/iokit/Kernel/arm/SweetGPUInstaller.cpp b/iokit/Kernel/arm/SweetGPUInstaller.cpp
 new file mode 100644
-index 0000000..940017c
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetGPUInstaller.cpp
-@@ -0,0 +1,256 @@
+@@ -0,0 +1,252 @@
 +/*
 + * SweetGPUInstaller: installs a Metal plugin bundle into the guest root.
 + *
@@ -56,6 +55,11 @@ index 0000000..940017c
 +#include <sys/namei.h>
 +#include <sys/fcntl.h>
 +#include <sys/uio.h>
++
++/* Not exported in the kext-visible namei.h, but it is the stable value. */
++#ifndef WILLBEDIR
++#define WILLBEDIR 0x00080000
++#endif
 +
 +namespace {
 +
@@ -228,27 +232,18 @@ index 0000000..940017c
 +sweet_install_thread(void *arg, wait_result_t wait_result)
 +{
 +	SweetGPUInstaller *installer = static_cast<SweetGPUInstaller *>(arg);
-+	vfs_context_t ctx = vfs_context_kernel();
-+	vnode_t root = NULLVP;
-+	bool mounted = false;
++	errno_t error = ENOENT;
 +
 +	(void)wait_result;
-+	/* IOKit matches before vfs_mountroot; wait for a resolvable "/". */
-+	for (unsigned i = 0; i < 1200; i++) {
-+		if (vnode_lookup("/", 0, &root, ctx) == 0) {
-+			vnode_put(root);
-+			mounted = true;
++	/* IOKit matches before vfs_mountroot; retry until the root is writable. */
++	for (unsigned i = 0; i < 600; i++) {
++		error = sweet_install(installer->basePath(), installer->blobBytes(),
++		    installer->blobLength());
++		if (error == 0) {
 +			break;
 +		}
-+		IOSleep(250);
++		IOSleep(1000);
 +	}
-+	if (!mounted) {
-+		IOLog("SWEET GPU: root never mounted, bundle not installed\n");
-+		installer->release();
-+		return;
-+	}
-+	errno_t error = sweet_install(installer->basePath(), installer->blobBytes(),
-+	    installer->blobLength());
 +	IOLog("SWEET GPU: bundle install %s (%d)\n", error ? "failed" : "done", error);
 +	installer->release();
 +}
