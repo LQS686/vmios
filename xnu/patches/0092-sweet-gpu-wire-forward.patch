@@ -1,9 +1,9 @@
 --- a/iokit/Kernel/arm/SweetGPU.cpp
 +++ b/iokit/Kernel/arm/SweetGPU.cpp
-@@ -12,6 +12,28 @@
- #include <IOKit/IOLib.h>
+@@ -13,6 +13,28 @@
  #include <IOKit/IOKitKeys.h>
  #include <kern/task.h>
+ #include <pexpert/pexpert.h>
 +#include "SweetSurface.h"
 +
 +/* Custom user-client selector: fill an IOSurface on the host GPU. */
@@ -29,7 +29,7 @@
  
  class SweetGPUUserClient;
  class IOAcceleratorES;
-@@ -34,6 +56,7 @@
+@@ -35,6 +57,7 @@
  OSDefineMetaClassAndStructors(SweetGPUUserClient, IOUserClient);
  
  static uint64_t sweet_gpu_logged;
@@ -37,7 +37,7 @@
  
  bool
  SweetGPUUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type)
-@@ -67,6 +90,57 @@
+@@ -68,6 +91,57 @@
  {
  	if (args == NULL) {
  		return kIOReturnBadArgument;
