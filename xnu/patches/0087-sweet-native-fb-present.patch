@@ -14,7 +14,7 @@
  #define SWEET_FB_DOT_PITCH              458     /* ppi, as the iPhone X panel */
 +#define SWEET_FB_OFFLOAD_MMIO           0x0f000000u
 +#define SWEET_FB_OFFLOAD_OFFSET         0x01000000u
-+#define SWEET_FB_OFFLOAD_SIZE           0x00040000u
++#define SWEET_FB_OFFLOAD_SIZE           0x00080000u
 +#define SWEET_FB_OFFLOAD_HEADER         32u
 +#define SWEET_FB_OFFLOAD_MAGIC          0x31424653u
 +#define SWEET_FB_OFFLOAD_MAX            ((SWEET_FB_OFFLOAD_SIZE - SWEET_FB_OFFLOAD_HEADER) / 16u)
@@ -32,7 +32,7 @@
  /*
   * The iOS userland only has status bar / layout data for real iPhone
   * screens (UIKit: "No status bar visual provider for screen", the red
-@@ -116,14 +134,20 @@
+@@ -116,14 +134,19 @@
  	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
  	bool          fPowerOff;      /* RequestPowerChange(0) */
  	uint32_t      fFadeStep;      /* fade-out steps done while off */
@@ -49,7 +49,6 @@
 +	    uint32_t destination, uint32_t length);
  };
  
-+
  OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
  
  class IOMobileFramebufferUserClient : public IOUserClient {
@@ -113,14 +112,13 @@
  /* Copy each enabled layer's surface into the panel memory (no scaling). */
  /*
   * A swap only records the frame: copying 10 MB into the panel on every
-@@ -313,6 +383,10 @@
+@@ -313,6 +383,9 @@
  {
  	uint32_t mask = get32(rec, 0x104);
  
 +	if (fOffload != NULL) {
 +		fOffload->count = 0;
 +	}
-+
  
  	if (!fConsolePaused) {
  		int quiet = 0;
