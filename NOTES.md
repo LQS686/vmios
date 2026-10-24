@@ -87,29 +87,44 @@ kernel/userland ABI panic. The local kernel matches CI `SHA256SUMS`
 (`installer armed for %s`, `SWEET GPU: fill surface`, `SWEET FB: rec mask`,
 `SWEET UFS: statistics`). Decision: keep 8796.141.3 + patches 0001-0096.
 
-**Current display root-cause hypothesis (m3r experiment, running).** The ADT
-`disp0` canvas was 1080x2400 while iOS builds its display mode from the
-iPhone X presented size (1125x2436, kernel fLogicalW/H). CA's
-`fetch_current_iomfb_mode` compares IOMobileFramebufferGetCanvasSizes against
-its mode list; with no match it has no current mode, and
-`IOMFBDisplay::current_page_surface` returns NULL (pipe at
-`[display+0xf4...]`/`+0x3b0` empty or allocate_surface fails), so
-`render_display` never encodes a draw and `finish_update` swaps an empty
-record (mask 0). `mkadt.py` now has `--canvas-width/--canvas-height`; the m3r
-ADT uses canvas 1125x2436 with the panel still 1080x2400, and the payload adds
-`sweethidtest=10` (Home press every 10 s) to keep the display awake. Waiting
-for the ring: expect `SWEET FB: swap ... layer 0 surface N 1125x2436` lines
-(0094 logs them only for real ids) or a new `current_page_surface` failure.
-Next static anchors: `Display::allocate_surface` 0x18837622c,
-`IOMFBDisplay::fetch_current_iomfb_mode` 0x1883a7828,
-`update_display_modes` 0x188530570, vtable slot +0x1c8 =
-`IOMFBDisplay::update_surface`.
+**Current display root cause (2026-10-25, gdb-verified).** The canvas fix
+(`--canvas-width 1125 --canvas-height 2436`; the ADT used to say 1080x2400)
+made CA allocate a real display drawable and stop swapping empty records:
+`SWEET FB: swap ... layer 0 surface 5 1125x2436 fmt 0x62336138 bpr 4544`,
+present mask 0x1. The drawable object is valid (gdb: `+0x18 = 0x465/0x984`
+= 1125x2436, `+0x20 = 0x62336138`, and render_display receives it non-null).
+But `CA::OGL::Renderer::render` is **never called** (breakpoint set at its
+entry is never hit; the next stop is the next frame's render_display).
+`render_display` gates it on `renderer->vtable+0x358(frame)`, which is
+`CA::OGL::MetalContext::make_buffer_current(Surface*)`; that calls
+`MetalContext::get_surface(surface, true)` and returns false when it is NULL.
+gdb at `get_surface` for the 1125-wide drawable shows the failure at
+0x188346e74: `ctx+0xa20` (max renderable size) is **0** while w=1125/h=2436,
+so `max < width` rejects it before any texture is created (no
+`texture from iosurface id=5/6` log). The MetalContext at 0x103808e00 has the
+right vtable (MetalContext+0x10) but its +0xa18/+0xa20/+0xa28 are all zero,
+even though `new_metal_context` writes them at 0x18848871c..0x18848876c and
+clamps +0xa20 to >=0x2000; this instance therefore did not go through that
+initialization block (or bailed inside it). The plugin now reports
+maxTextureDimension2D 16384 / 3D 2048 / cube 16384 / array 2048 and real
+texture width/height/pixelFormat, but the context field stayed 0.
 
-**Next concrete action:** read the m3r ring after boot; if canvas was the
-gate, implement 1125x2436->1080x2400 scaling in the kernel present path
-(currently it clips top-left). If not, inspect the GetBlock(sel 79) block id
-and contents CA expects (1580-byte block at t=54 s) and implement it in
-SweetFramebuffer.
+**Next concrete action:** find which constructor/init path creates the
+display renderer's MetalContext (the fully initialized one from
+`new_metal_context` may be a different object) and why +0xa18/+0xa20 stay 0
+- e.g. break at 0x18848871c and 0x188488728 during boot to see whether they
+are reached at all - then either make the fake device feed the value that
+path reads, or add an in-process shim. Only after get_surface succeeds will
+`Renderer::render` run and the compositor emit Metal draws for surfaces 5/6;
+those draws are then the real work for the virtual GPU (replay/translate
+into the drawable). chronod's own draws into surfaces 7/8 are captured and
+prove the plugin sees client render passes.
+
+**Earlier static findings kept:** `thread_body` only runs a null timer;
+`add_vsync_source` chooses the CADisplayTimer path; the sampler stack shows
+the render loop is `IOMFBServer::vsync_callback -> Server::render_for_time ->
+display render_update -> finish_update -> SwapEnd` (backboardd t6), and
+SpringBoard is healthy inside SetupAssistant (not hung).
 
 **Earlier static findings kept:** `thread_body` only runs a null timer;
 `add_vsync_source` chooses the CADisplayTimer path; `IOMFBServer` never

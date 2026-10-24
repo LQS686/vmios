@@ -871,9 +871,14 @@ sweet_hex32(const char *tag, unsigned int index, const void *pointer)
 /* Texture backed by an IOSurface; keeps the id for the clear forwarder. */
 @interface SweetTexture : SweetOpaque {
 	unsigned int tex_surface;
+	unsigned long tex_width;
+	unsigned long tex_height;
+	unsigned long tex_format;
 }
 - (void)setSurfaceID:(unsigned int)identifier;
 - (unsigned int)surfaceID;
+- (void)setSize:(unsigned long)width height:(unsigned long)height;
+- (void)setFormat:(unsigned long)format;
 @end
 
 @implementation SweetTexture
@@ -886,6 +891,32 @@ sweet_hex32(const char *tag, unsigned int index, const void *pointer)
 - (unsigned int)surfaceID
 {
 	return tex_surface;
+}
+
+- (void)setSize:(unsigned long)width height:(unsigned long)height
+{
+	tex_width = width;
+	tex_height = height;
+}
+
+- (void)setFormat:(unsigned long)format
+{
+	tex_format = format;
+}
+
+- (unsigned long)width
+{
+	return tex_width;
+}
+
+- (unsigned long)height
+{
+	return tex_height;
+}
+
+- (unsigned long)pixelFormat
+{
+	return tex_format;
 }
 
 @end
@@ -1299,6 +1330,36 @@ sweet_texture_surface(id texture)
 	return 1UL << 30;
 }
 
+- (unsigned long)maxTextureDimension2D
+{
+	return 16384;
+}
+
+- (unsigned long)maxTextureDimension3D
+{
+	return 2048;
+}
+
+- (unsigned long)maxTextureDimensionCube
+{
+	return 16384;
+}
+
+- (unsigned long)maxTextureArrayLayers
+{
+	return 2048;
+}
+
+- (unsigned long)maxFramebufferWidth
+{
+	return 16384;
+}
+
+- (unsigned long)maxFramebufferHeight
+{
+	return 16384;
+}
+
 - (unsigned long)maxThreadgroupMemoryLength
 {
 	sweet_log("msg", "maxThreadgroupMemoryLength");
@@ -1446,6 +1507,13 @@ sweet_texture_surface(id texture)
 	unsigned int identifier = sweet_iosurface_id(surface);
 	((void (*)(id, SEL, unsigned int))objc_msgSend)(texture,
 	    sel_registerName("setSurfaceID:"), identifier);
+	if (descriptor != 0) {
+		((void (*)(id, SEL, unsigned long, unsigned long))objc_msgSend)(texture,
+		    sel_registerName("setSize:height:"),
+		    sweet_msg_ul(descriptor, "width"), sweet_msg_ul(descriptor, "height"));
+		((void (*)(id, SEL, unsigned long))objc_msgSend)(texture,
+		    sel_registerName("setFormat:"), sweet_msg_ul(descriptor, "pixelFormat"));
+	}
 	if (sweet_fill_logs < 12) {
 		dprintf(console_fd,
 		    "SWEETMETAL: texture from iosurface id=%u plane=%lu\n",
@@ -1473,7 +1541,15 @@ sweet_texture_surface(id texture)
 - (id)newTextureWithDescriptor:(id)descriptor
 {
 	sweet_log("msg", "newTextureWithDescriptor");
-	return [[SweetOpaque alloc] init];
+	SweetTexture *texture = [[SweetTexture alloc] init];
+	if (descriptor != 0) {
+		((void (*)(id, SEL, unsigned long, unsigned long))objc_msgSend)(texture,
+		    sel_registerName("setSize:height:"),
+		    sweet_msg_ul(descriptor, "width"), sweet_msg_ul(descriptor, "height"));
+		((void (*)(id, SEL, unsigned long))objc_msgSend)(texture,
+		    sel_registerName("setFormat:"), sweet_msg_ul(descriptor, "pixelFormat"));
+	}
+	return texture;
 }
 
 - (id)newSamplerStateWithDescriptor:(id)descriptor
@@ -1555,6 +1631,7 @@ sweet_texture_surface(id texture)
 {
 	sweet_log("initFeatureQueries", 0);
 }
+
 
 - (id)featureProfile
 {
