@@ -37,7 +37,7 @@
  
  bool
  SweetGPUUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type)
-@@ -68,6 +91,57 @@
+@@ -68,6 +91,56 @@
  {
  	if (args == NULL) {
  		return kIOReturnBadArgument;
@@ -86,8 +86,7 @@
 +		s->release();
 +		if (sweet_gpu_fills < 8) {
 +			sweet_gpu_fills++;
-+			IOLog("SWEET GPU: fill surface %u pa 0x%llx seg 0x%llx -> 0x%x
-+",
++			IOLog("SWEET GPU: fill surface %u pa 0x%llx seg 0x%llx result 0x%x",
 +			    request.surface, (unsigned long long)pa,
 +			    (unsigned long long)segment, result);
 +		}
@@ -97,10 +96,12 @@
  		sweet_gpu_logged |= 1ULL << selector;
 --- a/iokit/Kernel/arm/SweetVirtioConsole.cpp
 +++ b/iokit/Kernel/arm/SweetVirtioConsole.cpp
-@@ -122,6 +122,19 @@
+@@ -122,6 +122,21 @@
  
  OSDefineMetaClassAndStructors(SweetVirtioConsole, IOService);
  
++extern "C" IOReturn sweet_gpu_wire_send(const void *data, size_t bytes);
++
 +static SweetVirtioConsole *sweet_wire_console;
 +
 +/* Called from SweetGPU's user client: send one GPU request to the host. */
@@ -117,7 +118,7 @@
  IOService *
  SweetVirtioConsole::probe(IOService *provider, SInt32 *score)
  {
-@@ -438,6 +451,7 @@
+@@ -438,6 +453,7 @@
  		return false;
  	}
  	registerService();
@@ -125,7 +126,7 @@
  	IOLog("SWEET GPU WIRE: virtio console online mmio=0x%llx\n",
  	    (unsigned long long)mapping->getPhysicalAddress());
  
-@@ -478,6 +492,9 @@
+@@ -478,6 +494,9 @@
  void
  SweetVirtioConsole::stop(IOService *provider)
  {
