@@ -2,7 +2,7 @@
 #include "hw/sysbus.h"
 #include "hw/qdev-properties.h"
 #include "exec/address-spaces.h"
-#include "qemu/error-report.h"
+#include "qemu/atomic.h"
 #include "qemu/module.h"
 
 #define TYPE_SWEET_FB "sweet-fb"
@@ -101,6 +101,7 @@ static void sweet_fb_present(SweetFBState *s, uint32_t sequence)
     g_free(descriptors);
     s->completed = ok ? sequence : 0;
     s->status = ok ? 0 : 1;
+    smp_wmb();
     sweet_fb_put32(result, s->completed);
     sweet_fb_put32(result + 4, s->status);
     if (!sweet_fb_dma_write(s->command_base + 12, result, sizeof(result))) {

@@ -8,7 +8,7 @@ partition at LBA 34. The kernel sees the same GPT it sees on the phone.
 
 Two additional QEMU core changes are required:
 
-- allow the `sweet-touch` and `sweet-ufs` sysbus devices on `virt`;
+- allow the `sweet-ufs`, `sweet-touch` and `sweet-fb` sysbus devices on `virt`;
 - give them no-op FDT bindings (the kernel uses the ADT, not QEMU's DTB).
 
 `qemu/qemu-sweet.patch`, `qemu/sweet_ufs.c`, `qemu/sweet_fb.c` and
@@ -46,7 +46,7 @@ Ubuntu 24.04, QEMU 8.2.0:
 sudo apt install build-essential ninja-build pkg-config python3-venv \
     libglib2.0-dev libpixman-1-dev device-tree-compiler
 git clone --depth 1 -b v8.2.0 https://github.com/qemu/qemu.git
-cp vm/qemu/sweet_ufs.c vm/qemu/sweet_fb.c qemu/hw/block/
+cp vm/qemu/sweet_ufs.c vm/qemu/sweet_touch.c vm/qemu/sweet_fb.c qemu/hw/block/
 git -C qemu apply "$PWD/vm/qemu/qemu-sweet.patch"
 mkdir qemu/build && cd qemu/build
 ../configure --target-list=aarch64-softmmu --disable-werror \
