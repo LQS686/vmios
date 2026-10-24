@@ -313,7 +313,7 @@ def main():
     if a.gpu_wire:
         cmd += ['-global', 'virtio-mmio.force-legacy=false',
                 '-chardev', f'socket,id=gpu_wire,host=127.0.0.1,port={a.gpu_wire}',
-                '-device', 'virtio-serial-device',
+                '-device', 'virtio-serial-device,bus=virtio-mmio-bus.0',
                 '-device', 'virtconsole,chardev=gpu_wire,name=offline-transport']
     if a.touch or a.touchfile:
         dev = 'sweet-touch'

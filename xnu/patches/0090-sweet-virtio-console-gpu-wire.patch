@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetVirtioConsole.cpp
-@@ -0,0 +1,491 @@
+@@ -0,0 +1,494 @@
 +/*
 + * SweetVirtioConsole: minimal modern virtio-mmio console.
 + *
@@ -376,6 +376,9 @@
 +	unsigned tries = 0;
 +	while (total < kGpuWireReplyBytes && tries < 64) {
 +		size_t bytes = kGpuWireReplyBytes - total;
++		if (bytes > kBufferSize) {
++			bytes = kBufferSize;
++		}
 +		status = console->receive(reply + total, &bytes);
 +		if (status == kIOReturnSuccess) {
 +			total += (unsigned)bytes;

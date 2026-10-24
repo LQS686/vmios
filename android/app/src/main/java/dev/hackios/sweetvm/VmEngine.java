@@ -214,7 +214,7 @@ public final class VmEngine {
             GpuWireServer.start(5141);
             cmd.add("-global"); cmd.add("virtio-mmio.force-legacy=false");
             cmd.add("-chardev"); cmd.add("socket,id=gpu_wire,host=127.0.0.1,port=5141");
-            cmd.add("-device"); cmd.add("virtio-serial-device");
+            cmd.add("-device"); cmd.add("virtio-serial-device,bus=virtio-mmio-bus.0");
             cmd.add("-device"); cmd.add("virtconsole,chardev=gpu_wire,name=offline-transport");
         }
         cmd.add("-object");
