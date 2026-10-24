@@ -1,0 +1,43 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -251,6 +251,9 @@
+ 	AppleCLCD *fb = (AppleCLCD *)owner;
+ 	uint64_t now = mach_absolute_time();
+ 	uint64_t count = ++fb->fVsyncCount;
++	if (count % 600 == 1) {
++		IOLog("SWEET FB: vsync %llu\n", (unsigned long long)count);
++	}
+ 	uint64_t values[6] = {
+ 		(uint32_t)count, (uint32_t)(count >> 32),
+ 		(uint32_t)now, (uint32_t)(now >> 32),
+@@ -537,9 +540,12 @@
+ }
+ 
+ IOReturn
+-IOMobileFramebufferUserClient::registerNotificationPort(mach_port_t port, __unused UInt32 type,
++IOMobileFramebufferUserClient::registerNotificationPort(mach_port_t port, UInt32 type,
+     __unused io_user_reference_t refCon)
+ {
++	char proc[32];
++	proc_selfname(proc, sizeof(proc));
++	IOLog("SWEET FB: %s notification port type %u port %u\n", proc, type, port);
+ 	mach_port_t old;
+ 	IOLockLock(fFB->fLock);
+ 	old = fPort;
+@@ -616,7 +622,15 @@
+ 		out[0] = SWEET_FB_DOT_PITCH;
+ 		outCount = 1;
+ 		break;
+-	case kSweetFBNotifications:
++	case kSweetFBNotifications: {
++		char proc[32];
++		proc_selfname(proc, sizeof(proc));
++		IOLog("SWEET FB: %s notifications n=%u v=%llu,%llu,%llu,%llu\n", proc,
++		    args->scalarInputCount,
++		    args->scalarInputCount > 0 ? args->scalarInput[0] : 0ULL,
++		    args->scalarInputCount > 1 ? args->scalarInput[1] : 0ULL,
++		    args->scalarInputCount > 2 ? args->scalarInput[2] : 0ULL,
++		    args->scalarInputCount > 3 ? args->scalarInput[3] : 0ULL);
+ 		if (args->scalarInputCount >= 3 && args->scalarInput[2] < SWEET_FB_NOTIFY_TYPES) {
+ 			uint32_t type = (uint32_t)args->scalarInput[2];
+ 			IOLockLock(fFB->fLock);
