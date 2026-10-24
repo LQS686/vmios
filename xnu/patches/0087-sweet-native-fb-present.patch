@@ -1,0 +1,159 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -50,6 +50,7 @@
+ #include <pexpert/pexpert.h>
+ #include <kern/clock.h>
+ #include <sys/proc.h>
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ 
+ enum {
+ 	kSweetFBGetLayerDefaultSurface  = 3,
+@@ -70,6 +71,23 @@
+ #define SWEET_FB_NOTIFY_VSYNC           5
+ #define SWEET_FB_VSYNC_US               16667
+ #define SWEET_FB_DOT_PITCH              458     /* ppi, as the iPhone X panel */
++#define SWEET_FB_OFFLOAD_MMIO           0x0f000000u
++#define SWEET_FB_OFFLOAD_OFFSET         0x01000000u
++#define SWEET_FB_OFFLOAD_SIZE           0x00040000u
++#define SWEET_FB_OFFLOAD_HEADER         32u
++#define SWEET_FB_OFFLOAD_MAGIC          0x31424653u
++#define SWEET_FB_OFFLOAD_MAX            ((SWEET_FB_OFFLOAD_SIZE - SWEET_FB_OFFLOAD_HEADER) / 16u)
++
++struct sweet_fb_offload_header {
++	uint32_t magic, count, submitted, completed, status, reserved[3];
++};
++
++struct sweet_fb_offload_descriptor {
++	uint64_t source;
++	uint32_t destination;
++	uint32_t length;
++};
++
+ /*
+  * The iOS userland only has status bar / layout data for real iPhone
+  * screens (UIKit: "No status bar visual provider for screen", the red
+@@ -116,14 +134,20 @@
+ 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
++	volatile sweet_fb_offload_header *fOffload;
++	volatile uint32_t *fOffloadRegs;
++	uint32_t      fOffloadSeq;
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void addClient(IOMobileFramebufferUserClient *client);
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+ 	void swap(const uint8_t *rec);
+ 	void present(const uint8_t *rec);
++	bool offloadRow(SweetSurface *surface, IOByteCount source,
++	    uint32_t destination, uint32_t length);
+ };
+ 
++
+ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+ 
+ class IOMobileFramebufferUserClient : public IOUserClient {
+@@ -187,6 +211,22 @@
+ 		OSSafeReleaseNULL(fWorkLoop);
+ 		return false;
+ 	}
++	int offload = 0;
++	if (PE_parse_boot_argn("sweetfb_offload", &offload, sizeof(offload)) && offload != 0) {
++		fOffloadRegs = (volatile uint32_t *)ml_io_map(SWEET_FB_OFFLOAD_MMIO, 0x1000);
++		fOffload = (volatile sweet_fb_offload_header *)ml_io_map(
++		    fPhys + SWEET_FB_OFFLOAD_OFFSET, SWEET_FB_OFFLOAD_SIZE);
++		if (fOffloadRegs == NULL || fOffload == NULL) {
++			fOffloadRegs = NULL;
++			fOffload = NULL;
++			IOLog("SWEET FB: native present mapping failed\n");
++		} else {
++			memset((void *)fOffload, 0, SWEET_FB_OFFLOAD_SIZE);
++			fOffload->magic = SWEET_FB_OFFLOAD_MAGIC;
++			IOLog("SWEET FB: native present command at 0x%llx\n",
++			    fPhys + SWEET_FB_OFFLOAD_OFFSET);
++		}
++	}
+ 	fVsync = IOTimerEventSource::timerEventSource(this, &AppleCLCD::vsyncFired);
+ 	if (fVsync == NULL || fWorkLoop->addEventSource(fVsync) != kIOReturnSuccess) {
+ 		IOLog("SWEET FB: no vsync timer\n");
+@@ -289,6 +329,36 @@
+ static uint32_t sweet_fb_swaps_logged;
+ static uint64_t sweet_fb_swap_count;
+ 
++bool
++AppleCLCD::offloadRow(SweetSurface *surface, IOByteCount source,
++    uint32_t destination, uint32_t length)
++{
++	while (length != 0) {
++		uint32_t count = fOffload->count;
++		if (count >= SWEET_FB_OFFLOAD_MAX) {
++			return false;
++		}
++		IOByteCount segment = 0;
++		addr64_t physical = surface->memory->getPhysicalSegment(
++		    source, &segment, kIOMemoryMapperNone);
++		if (physical == 0 || segment == 0) {
++			return false;
++		}
++		uint32_t chunk = (uint32_t)(segment < length ? segment : length);
++		volatile sweet_fb_offload_descriptor *d =
++		    (volatile sweet_fb_offload_descriptor *)(
++		    (uintptr_t)fOffload + SWEET_FB_OFFLOAD_HEADER) + count;
++		d->source = physical;
++		d->destination = destination;
++		d->length = chunk;
++		fOffload->count = count + 1;
++		source += chunk;
++		destination += chunk;
++		length -= chunk;
++	}
++	return true;
++}
++
+ /* Copy each enabled layer's surface into the panel memory (no scaling). */
+ /*
+  * A swap only records the frame: copying 10 MB into the panel on every
+@@ -391,14 +461,39 @@
+ 			src = 0;
+ 		}
+ 		if (src != 0 && bpe == 4) {
+-			for (int32_t y = 0; y < h; y++) {
+-				memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
+-				    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
+-				    (size_t)w * 4);
++			if (fOffload != NULL) {
++				bool ok = true;
++				for (int32_t y = 0; y < h; y++) {
++					IOByteCount source = s->offset +
++					    (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4;
++					uint32_t destination = (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4;
++					if (!offloadRow(s, source, destination, (uint32_t)w * 4)) {
++						ok = false;
++						break;
++					}
++				}
++				if (!ok) {
++					fOffload = NULL;
++					IOLog("SWEET FB: native present descriptor failed; using CPU copy\n");
++					s->release();
++					present(rec);
++					return;
++				}
++			} else {
++				for (int32_t y = 0; y < h; y++) {
++					memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
++					    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
++					    (size_t)w * 4);
++				}
+ 			}
+ 		}
+ 		s->release();
+ 	}
++	if (fOffload != NULL) {
++		fOffload->submitted = ++fOffloadSeq;
++		__sync_synchronize();
++		*fOffloadRegs = fOffloadSeq;
++	}
+ }
+ 
+ bool

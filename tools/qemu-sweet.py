@@ -305,6 +305,9 @@ def main():
                 '-numa', 'node,memdev=ram']
     if a.ufs:
         cmd += ['-device', f'sweet-ufs,file={os.path.abspath(a.ufs)},mmio-base=0x0e000000']
+    cmdline = payload[0x48:0x48 + 608].split(b'\0', 1)[0]
+    if b'sweetfb_offload=1' in cmdline:
+        cmd += ['-device', 'sweet-fb']
     if a.touch or a.touchfile:
         dev = 'sweet-touch'
         if a.touch:

@@ -7,6 +7,8 @@ import java.io.File;
 import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.RandomAccessFile;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.nio.MappedByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
@@ -27,6 +29,8 @@ public final class VmEngine {
     public static final long RAM_GIB = 3;
     public static final long RAM_BYTES = RAM_GIB << 30;
     public static final long FB_OFFSET = Payload.FB_BASE - Payload.RAM_BASE;
+    private static final long OFFLOAD_OFFSET = FB_OFFSET + 0x1000000L;
+    private static final int OFFLOAD_COMPLETED = 12;
 
     private final Context ctx;
     private Process process;
@@ -124,6 +128,9 @@ public final class VmEngine {
         if (!cmdline.contains("tlto_us=")) {
             cmdline = (cmdline + " tlto_us=2000000 slto_us=2000000").trim();
         }
+        if (!cmdline.contains("sweetsample=")) {
+            cmdline = (cmdline + " sweetsample=-").trim();
+        }
         if (cmdline.length() >= 600) {
             android.util.Log.w("sweetvm", "boot args are " + cmdline.length()
                     + " bytes; the 607-byte boot_args field may truncate the lock timeouts");
@@ -177,9 +184,12 @@ public final class VmEngine {
         // (two real vCPUs). One MTTCG boot reached the iOS Setup GUI at 300 s;
         // another stalled in userland, so the speed win is not proven yet.
         boolean mttcg = cpus >= 2 && cmdline.contains("tcgmulti=1");
+        boolean offload = cmdline.contains("sweetfb_offload=1");
         android.util.Log.i("sweetvm", "engine cpus=" + cpus + " accel="
                 + (mttcg ? "tcg,thread=multi" : "tcg,thread=single")
-                + " prealloc=" + prealloc + " capture=" + this.fps + "fps");
+                + " prealloc=" + prealloc
+                + " present=" + (offload ? "native" : "guest")
+                + " capture=" + this.fps + "fps");
         // A large TB cache matters for the multi-hundred-MB dyld shared cache.
         cmd.add("-accel");
         cmd.add(mttcg ? "tcg,thread=multi,tb-size=512" : "tcg,thread=single,tb-size=512");
@@ -193,6 +203,10 @@ public final class VmEngine {
         cmd.add("-no-reboot");
         cmd.add("-nic"); cmd.add("none");
         cmd.add("-L"); cmd.add(qemuShare.getAbsolutePath());
+        if (offload) {
+            cmd.add("-device");
+            cmd.add("sweet-fb");
+        }
         cmd.add("-object");
         // prealloc: without it every first touch of a guest page is a host
         // page fault inside the vCPU thread. iOS allocates continuously, so
@@ -259,7 +273,7 @@ public final class VmEngine {
         monitor.setDaemon(true);
         monitor.start();
 
-        startReader(guestRam, payload, listener);
+        startReader(guestRam, payload, listener, offload);
     }
 
     /** Probe every this many 32-bit words: 16 words = 64 bytes. */
@@ -287,16 +301,23 @@ public final class VmEngine {
         return diff;
     }
 
-    private void startReader(File guestRam, Payload payload, Listener listener) {
+    private void startReader(File guestRam, Payload payload, Listener listener, boolean offload) {
         reader = new Thread(() -> {
             FileChannel ch = null;
             MappedByteBuffer map = null;
+            ByteBuffer completion = null;
+            boolean sequenceMode = offload;
             try {
                 ch = FileChannel.open(guestRam.toPath(),
                         java.nio.file.StandardOpenOption.READ);
                 map = ch.map(FileChannel.MapMode.READ_ONLY, FB_OFFSET,
                         (long) Payload.FB_STRIDE * Payload.FB_H);
+                if (sequenceMode) {
+                    completion = ch.map(FileChannel.MapMode.READ_ONLY, OFFLOAD_OFFSET, 32)
+                            .order(ByteOrder.LITTLE_ENDIAN);
+                }
             } catch (Exception e) {
+                sequenceMode = false;
                 if (listener != null) {
                     listener.onError("无法映射共享显存: " + e.getMessage());
                 }
@@ -307,16 +328,28 @@ public final class VmEngine {
             // only the remainder; if a copy overruns the period, restart it.
             final long period = 1_000_000_000L / Math.max(1, fps);
             long next = System.nanoTime() + period;
-            int[] probe = new int[Payload.FB_STRIDE * Payload.FB_H / 4 / PROBE_STEP];
-            int[] lastProbe = new int[probe.length];
+            int[] probe = sequenceMode ? null
+                    : new int[Payload.FB_STRIDE * Payload.FB_H / 4 / PROBE_STEP];
+            int[] lastProbe = sequenceMode ? null : new int[probe.length];
             boolean haveLast = false;
+            int lastSequence = -1;
             try {
                 while (running) {
                     ticks++;
                     FramebufferView v = view;
-                    if (map != null && v != null && changed(map, probe, lastProbe, haveLast)) {
-                        System.arraycopy(probe, 0, lastProbe, 0, probe.length);
-                        haveLast = true;
+                    boolean newFrame;
+                    if (sequenceMode) {
+                        int sequence = completion.getInt(OFFLOAD_COMPLETED);
+                        newFrame = sequence != lastSequence;
+                        lastSequence = sequence;
+                    } else {
+                        newFrame = changed(map, probe, lastProbe, haveLast);
+                    }
+                    if (map != null && v != null && newFrame) {
+                        if (!sequenceMode) {
+                            System.arraycopy(probe, 0, lastProbe, 0, probe.length);
+                            haveLast = true;
+                        }
                         long t0 = System.nanoTime();
                         v.copyFromBuffer(map);
                         long dt = System.nanoTime() - t0;

@@ -7,6 +7,7 @@ index be2856c..ef4604d 100644
      machine_class_allow_dynamic_sysbus_dev(mc, TYPE_VFIO_AMD_XGBE);
      machine_class_allow_dynamic_sysbus_dev(mc, TYPE_RAMFB_DEVICE);
 +    machine_class_allow_dynamic_sysbus_dev(mc, "sweet-ufs");
++    machine_class_allow_dynamic_sysbus_dev(mc, "sweet-fb");
      machine_class_allow_dynamic_sysbus_dev(mc, TYPE_VFIO_PLATFORM);
  #ifdef CONFIG_TPM
      machine_class_allow_dynamic_sysbus_dev(mc, TYPE_TPM_TIS_SYSBUS);
@@ -19,6 +20,7 @@ index 8aa4dc3..85b3beb 100644
  
  subdir('dataplane')
 +system_ss.add(files('sweet_ufs.c'))
++system_ss.add(files('sweet_fb.c'))
 diff --git a/hw/core/sysbus-fdt.c b/hw/core/sysbus-fdt.c
 index eebcd28..2d7d99b 100644
 --- a/hw/core/sysbus-fdt.c
@@ -28,6 +30,7 @@ index eebcd28..2d7d99b 100644
  #endif
      TYPE_BINDING(TYPE_RAMFB_DEVICE, no_fdt_node),
 +    TYPE_BINDING("sweet-ufs", no_fdt_node),
++    TYPE_BINDING("sweet-fb", no_fdt_node),
      TYPE_BINDING("", NULL), /* last element */
  };
  

@@ -11,8 +11,11 @@ Two additional QEMU core changes are required:
 - allow the `sweet-touch` and `sweet-ufs` sysbus devices on `virt`;
 - give them no-op FDT bindings (the kernel uses the ADT, not QEMU's DTB).
 
-`qemu/qemu-sweet.patch`, `qemu/sweet_ufs.c` and `qemu/sweet_touch.c` are the
-source. `sweet_touch` models GCC, TLMM and GENI SE7 plus a synthetic Goodix
+`qemu/qemu-sweet.patch`, `qemu/sweet_ufs.c`, `qemu/sweet_fb.c` and
+`qemu/sweet_touch.c` are the source. `sweet-fb` executes the kernel's physical
+copy descriptors natively when `sweetfb_offload=1`; its completion sequence at
+framebuffer + 16 MiB lets the Android reader skip pixel probing.
+`sweet_touch` models GCC, TLMM and GENI SE7 plus a synthetic Goodix
 GT9896; its input is a 5-byte record (type, x LE16, y LE16), either over a
 chardev or from a state file:
 
@@ -43,7 +46,7 @@ Ubuntu 24.04, QEMU 8.2.0:
 sudo apt install build-essential ninja-build pkg-config python3-venv \
     libglib2.0-dev libpixman-1-dev device-tree-compiler
 git clone --depth 1 -b v8.2.0 https://github.com/qemu/qemu.git
-cp vm/qemu/sweet_ufs.c qemu/hw/block/
+cp vm/qemu/sweet_ufs.c vm/qemu/sweet_fb.c qemu/hw/block/
 git -C qemu apply "$PWD/vm/qemu/qemu-sweet.patch"
 mkdir qemu/build && cd qemu/build
 ../configure --target-list=aarch64-softmmu --disable-werror \
