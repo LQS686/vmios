@@ -56,10 +56,16 @@
   SweetGPU resolves the surface's physical address and forwards an OP_FILL
   (header + {pa, w, h, stride, colour, x, y}) through
   `sweet_gpu_wire_send()` in SweetVirtioConsole; GpuWireServer paints that
-  rectangle into the guest RAM file. CI run 40094328768 built but
-  **skipped 0092** (context conflict with 0091 in SweetGPU.cpp); the
-  rebased patch is committed (521ef7b) and verified with `git apply
-  --check`, waiting for the next push/CI when github.com is reachable.
+  rectangle into the guest RAM file.
+- **End to end, measured on the phone (kernel 0092, run 40096458536):**
+  the plugin's self-test asks the service to fill panel surface 1 at 200x200:
+  `SWEET GPU: fill surface 1 pa 0x9c000000 seg 0x9e4000 result 0x0` in the
+  guest, `sweetgpu-host: fill request=1 pa=0x9c000000 200x200 color=#ff00ff`
+  on the host, and a magenta square appears in the top-left of the screen
+  (`artifacts/m3-screen1.png`). The same path fires for CA's render-pass
+  clears (`fill surface 7 color=#000000` for chronod). Kernel CI pitfalls
+  fixed on the way: 0092 must be based on post-0091 SweetGPU.cpp, and a
+  literal newline inside the IOLog string breaks the C++ compile.
 - **Next blocker: CA's Metal commands still don't reach that channel.**
   After context init WindowServer encodes one batch and never calls
   `CA::OGL::MetalContext::flush()`; the IOMFB swaps carry an empty layer

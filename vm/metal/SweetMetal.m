@@ -316,6 +316,17 @@ sweet_probe_panel(void)
 	dprintf(console_fd, "SWEETMETAL: panel base=%p %lux%lu bpr=%lu\n",
 	    base, width, height, bpr);
 	unlock(surface, 0, &seed);
+
+	/* End-to-end self-test: ask the host GPU to paint 200x200 on the panel. */
+	if (sweet_accel_port != 0) {
+		unsigned int request[6] = { 1, 0x00ff00ff, 0, 0, 200, 200 };
+		unsigned long output_size = 0;
+		int result = IOConnectCallStructMethod(sweet_accel_port, 0x100,
+		    request, sizeof(request), 0, &output_size);
+		dprintf(console_fd,
+		    "SWEETMETAL: panel fill via gpu service -> 0x%x port=%u\n",
+		    result, sweet_accel_port);
+	}
 }
 
 /* Which graphics stacks does this process actually have loaded? */
