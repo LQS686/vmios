@@ -260,3 +260,57 @@ D: 目前只剩 7.8 GB，之后不要再整盘复制 17 GB 镜像；测试请用
    lsd 的 MG IOKit 等待），目标是让系统 App 的安装/注册完成；这一步与性能无关。
 3. 进一步提升：内核 CI 做 present 零拷贝与 UFS 异步 I/O；MTTCG 已有 2 s 锁超时
    兜底，可在真机上用 `fps=` 对比 single/multi 后再决定是否改默认。
+
+## 9. 小米 14 Pro 真机复测（2026-10-24）
+
+设备为 `23116PN5BC` / shennong / Android 16 / 16 GB RAM。测量期间只改 App、
+payload 和临时命令，不碰分区与 16 GiB 根镜像。
+
+### 9.1 旧版与当前版的对照
+
+| 配置 | 采样时长 | QEMU CPU | vCPU 线程 | 缺页 | RSS | 交互 |
+|---|---|---|---|---|---|---|
+| 旧 APK（MTTCG、无 prealloc） | 187 s | 中位 91.4%，仍只吃一个核 | 86.0% / 1.4% | 563,355 | 154 → 1,878 MiB | 300 s 到 Setup，上滑 7 fps |
+| 当前 APK（MTTCG、15 fps、prealloc） | 436 s | 中位 97.1% | 96.8% / 0.4% | 815,902 | 3,163 → 2,343 MiB | App 绘制仅 0.65% jank |
+| 当前 APK（MTTCG、30 fps、prealloc） | 400 s | — | — | — | — | 取帧 30 tick/s，copy 1.13 ms，50th draw 10 ms |
+
+结论：
+
+- “2 个 vCPU + MTTCG”不保证两个宿主核都忙；这个 Guest 的主要启动/渲染串行，
+  第二个线程接近空闲。单线程 TCG 的默认值得保留，但 MTTCG 不是当前帧率的
+  唯一限制。
+- `prealloc=on` 只把首次触页移到启动。RSS 从 3.16 GiB 回落到 2.34 GiB，运行期
+  仍有约 827 次缺页/秒，说明 Android 会回收文件映射的 guest RAM。`ulimit -l`
+  虽是 unlimited，QEMU 的 `-overcommit mem-lock=on` 仍在启动时报
+  `mlockall: Out of memory`（memcg 限制），所以该方案不可用，已删除。
+- 30 fps 模式下应用取帧线程稳定 30 tick/s，全屏 copy 均值 1.13 ms、最大 11.1 ms；
+  Android `gfxinfo` 50th 10 ms、jank 1.11%。Android View/Bitmap/GPU 上传不是
+  主瓶颈，剩余时间在 Guest 软件光栅 + present。
+
+先前认为“正常 VM 仍默认每 120 s 做线程栈采样”也不成立：手机 payload 的实际
+boot-args 已有 `sweetsample=0`（由 `MainActivity.ensureQemuArgs()` 注入），
+本次启动的 SWEETLOG 段内样本数为 0。该误判及冗余覆盖已撤回。
+
+### 9.2 原生 present offload
+
+新增两条链路：
+
+- XNU `0087-sweet-native-fb-present.patch`：把每层每行的源物理段、目标偏移和
+  长度写进 framebuffer + 16 MiB 的预留命令区；每帧只发一次 MMIO doorbell，
+  不再在 vCPU 内执行 10 MB 的 Guest memcpy。
+- QEMU `sweet-fb`：在宿主执行描述符拷贝，回写 `completed` 序号；Android 在
+  `sweetfb_offload=1` 时只比较序号，不再每 tick 扫描 16 万个采样点。
+
+已验证：
+
+- arm64-v8a 与 x86_64 Android 引擎均编译、链接成功；宿主
+  `qemu-system-aarch64 -device sweet-fb,help` 显示三个属性。
+- 不依赖 XNU 的裸机 payload 实测：64 B 源缓冲被复制到帧区，命令头为
+  `magic/count/submitted/completed/status = 0x31424653/1/1/1/0`。
+- 描述符计数每帧重置，避免第二帧继续追加后耗尽命令区。
+
+**未验证：** XNU 0087 的 GitHub Actions 编译和真机端到端帧率。本轮 CI
+触发后遇到 GitHub 网络中断，不能用设备级通过代替内核集成结论。下一步是下载
+CI 的 `kernel.development.sweet`，用 `.tools/q-vm.adt` 和
+`bootargs.py vm-offload --add tcgmulti=1` 重新打包 payload，再复测 30 fps 与
+Guest `swap` 数。
