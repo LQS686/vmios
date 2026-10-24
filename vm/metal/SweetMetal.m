@@ -661,6 +661,14 @@ static id sweet_pipeline_named(id name);
 	id name = descriptor ? sweet_msg_id(descriptor, "name") : 0;
 	dprintf(console_fd, "SWEETMETAL: library newFunctionWithDescriptor %s\n",
 	    sweet_cstr(name));
+	if (descriptor != 0) {
+		id cv = sweet_msg_id(descriptor, "constantValues");
+		if (cv != 0) {
+			id desc = sweet_msg_id(cv, "description");
+			dprintf(console_fd, "SWEETMETAL:   constants %s", sweet_cstr(desc));
+			dprintf(console_fd, "%c", 10);
+		}
+	}
 	SweetFunction *function = [[SweetFunction alloc] init];
 	((void (*)(id, SEL, id))objc_msgSend)(function,
 	    sel_registerName("setSweetName:"), name);
@@ -1225,6 +1233,7 @@ sweet_texture_surface(id texture)
 				    *(const unsigned int *)(base + 4),
 				    *(const unsigned int *)(base + 8),
 				    *(const unsigned int *)(base + 12));
+				sweet_hex64("fb64_", i, base);
 			}
 		}
 		if (index_buffer != 0) {

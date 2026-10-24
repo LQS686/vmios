@@ -131,15 +131,21 @@ CPU uploads (glyph atlases 552x358 fmt=1 and 763x79 fmt=1, gradient strips
 256x1 fmt=115, icon 32x32 fmt=80). Both vertex and fragment SPIs are now
 recorded in SweetMetal.
 
-**Next concrete action:** run one more capture with the fragment-offset SPI
-to read the real config buffer (texture/blend functions, color, matrices),
-decode the `fc_vertex_layout`/`fc_texcoord_count*` specialization used by
-these draws, and implement a quad compositor for that specialization (CPU
-rasterizer in the plugin using IOSurface CPU mappings, or a kernel-side
-rasterizer) so dest=5 receives the real composited scene instead of only the
-clear. Then the existing swap -> panel path will show the actual iOS UI.
-The metallib + bitcode blobs are in `research/` for further metadata work
-(`research/fixed_vert_lph_spc.bc`, `research/fixed_frag_lph_cpf.bc`).
+**Function constants (2026-10-25).** The display draws are specializations of
+`fixed_vert_lph_spc`/`fixed_frag_lph_cpf`, created through
+`newFunctionWithDescriptor` with an `MTLFunctionConstantValuesInternal`
+object per pipeline. `-description` only prints the object address, so the
+constants (notably `fc_vertex_layout`, `fc_texcoord_count0/1`,
+`fc_has_texture_matrix`) are not visible that way. The per-draw fragment
+config buffer (`setFragmentBufferOffset:atIndex:`) is all zero for the first
+draws, and the vertex buffers hold 4xfloat4 values plus a changing parameter;
+the geometry is generated in the specialized vertex shader. Next: introspect
+the constant-values object's ivars/raw memory from the plugin (private class
+in backboardd) to recover the exact specialization, then implement that
+vertex layout + fragment blend in the compositor. The metallib and both
+shader bitcode blobs are in `research/` (`ca-metallib.bin`,
+`fixed_vert_lph_spc.bc`, `fixed_frag_lph_cpf.bc`); Apple AIR needs Apple's
+LLVM to disassemble.
 
 **Earlier static findings kept:** `thread_body` only runs a null timer;
 `add_vsync_source` chooses the CADisplayTimer path; the sampler stack shows
