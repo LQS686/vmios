@@ -24,10 +24,25 @@ id objc_msgSend(id self, SEL op, ...);
 int open(const char *path, int flags, ...);
 int dprintf(int fd, const char *format, ...);
 
+/*
+ * Metal's _MTLRegisterDevices accepts the plugin class only if it is a
+ * subclass of its expected device class. _MTLDevice is the pure Metal base;
+ * MTLIOAccelDevice adds the IOGPU plumbing. Both variants are built so the
+ * check can be identified without a kernel rebuild.
+ */
+#ifdef SWEETMETAL_ACCEL_BASE
+__attribute__((objc_root_class))
+@interface MTLIOAccelDevice {
+	Class isa;
+}
+#define SWEET_BASE MTLIOAccelDevice
+#else
 __attribute__((objc_root_class))
 @interface _MTLDevice {
 	Class isa;
 }
+#define SWEET_BASE _MTLDevice
+#endif
 - (id)init;
 - (id)retain;
 - (void)release;
@@ -37,7 +52,7 @@ __attribute__((objc_root_class))
 - (void)forwardInvocation:(id)invocation;
 @end
 
-@interface SweetMetalDevice : _MTLDevice
+@interface SweetMetalDevice : SWEET_BASE
 - (id)initWithAcceleratorPort:(io_object_t)port;
 - (id)name;
 @end
@@ -54,6 +69,13 @@ sweet_log(const char *what, const char *sel)
 		dprintf(console_fd, "SWEETMETAL: %s%s%s\n", what,
 		    sel ? " " : "", sel ? sel : "");
 	}
+}
+
+__attribute__((constructor))
+static void
+sweet_loaded(void)
+{
+	sweet_log("bundle loaded", 0);
 }
 
 @implementation SweetMetalDevice

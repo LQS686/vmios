@@ -236,7 +236,7 @@ def build(seed=None, qemu=False, highmem=False, no_product=False, qemu_cpus=1,
         gpu_install = node('sweet-gpu', [
             ph(),
             ('compatible', cstr('sweet,gpu-install')),
-            ('base', cstr('/System/Library/Extensions/SweetMetal.bundle')),
+            ('base', cstr('/System/Library/Extensions/AGXMetalA11.bundle')),
             ('bundle', open(gpu_bundle, 'rb').read()),
         ])
 

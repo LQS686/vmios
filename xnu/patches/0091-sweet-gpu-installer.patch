@@ -1,5 +1,5 @@
 diff --git a/iokit/Kernel/arm/SweetGPU.cpp b/iokit/Kernel/arm/SweetGPU.cpp
-index 57eef20..07a9b31 100644
+index 57eef20..f3e2903 100644
 --- a/iokit/Kernel/arm/SweetGPU.cpp
 +++ b/iokit/Kernel/arm/SweetGPU.cpp
 @@ -12,6 +12,7 @@
@@ -10,19 +10,18 @@ index 57eef20..07a9b31 100644
  
  class SweetGPUUserClient;
  class IOAcceleratorES;
-@@ -99,8 +100,15 @@ IOAcceleratorES::start(IOService *provider)
- 		return false;
+@@ -100,7 +101,15 @@ IOAcceleratorES::start(IOService *provider)
  	}
  	setProperty(kIOUserClientClassKey, "SweetGPUUserClient");
--	setProperty("MetalPluginName", "AGXMetalA11");
+ 	setProperty("MetalPluginName", "AGXMetalA11");
 -	setProperty("MetalPluginClassName", "AGXA11Device");
 +	int sweetmetal = 0;
 +	if (PE_parse_boot_argn("sweetmetal", &sweetmetal, sizeof(sweetmetal)) &&
 +	    sweetmetal != 0) {
-+		setProperty("MetalPluginName", "SweetMetal");
++		/* The bundle directory already exists; the installer writes the
++		 * SweetMetal plugin and Info.plist into it. */
 +		setProperty("MetalPluginClassName", "SweetMetalDevice");
 +	} else {
-+		setProperty("MetalPluginName", "AGXMetalA11");
 +		setProperty("MetalPluginClassName", "AGXA11Device");
 +	}
  	setProperty("built-in", kOSBooleanTrue);
@@ -30,9 +29,10 @@ index 57eef20..07a9b31 100644
  	registerService();
 diff --git a/iokit/Kernel/arm/SweetGPUInstaller.cpp b/iokit/Kernel/arm/SweetGPUInstaller.cpp
 new file mode 100644
+index 0000000..641080c
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetGPUInstaller.cpp
-@@ -0,0 +1,252 @@
+@@ -0,0 +1,295 @@
 +/*
 + * SweetGPUInstaller: installs a Metal plugin bundle into the guest root.
 + *
@@ -42,26 +42,26 @@ new file mode 100644
 + * Metal.framework). The guest root is only writable from inside the guest, so
 + * the ADT carries the bundle as an SGB1 blob and this driver writes it with
 + * the kernel's VFS once the root is mounted.
++ *
++ * Creating a new .bundle directory needs the private nameidata API, which is
++ * not visible to IOKit sources, so the ADT points at the existing
++ * AGXMetalA11.bundle. The original Info.plist is kept as Info.plist.orig and
++ * sweetmetal_restore=1 puts it back.
 + */
 +#include <IOKit/IOService.h>
 +#include <IOKit/IOLib.h>
 +#include <kern/thread.h>
-+#include <kern/clock.h>
 +#include <libkern/libkern.h>
 +#include <libkern/c++/OSData.h>
++#include <pexpert/pexpert.h>
 +#include <sys/errno.h>
 +#include <sys/vnode.h>
-+#include <sys/vnode_internal.h>
-+#include <sys/namei.h>
 +#include <sys/fcntl.h>
 +#include <sys/uio.h>
 +
-+/* Not exported in the kext-visible namei.h, but it is the stable value. */
-+#ifndef WILLBEDIR
-+#define WILLBEDIR 0x00080000
-+#endif
-+
 +namespace {
++
++constexpr unsigned kMaxFileSize = 256 * 1024;
 +
 +const char *
 +data_string(OSData *data)
@@ -69,61 +69,15 @@ new file mode 100644
 +	return data ? static_cast<const char *>(data->getBytesNoCopy()) : nullptr;
 +}
 +
-+errno_t
-+sweet_mkdir(const char *path)
++bool
++sweet_exists(const char *path)
 +{
-+	struct nameidata nd;
-+	struct vnode_attr va;
-+	vnode_t vp;
-+	errno_t error;
-+
-+	NDINIT(&nd, CREATE, OP_MKDIR, LOCKPARENT, UIO_SYSSPACE,
-+	    (user_addr_t)(uintptr_t)path, vfs_context_kernel());
-+	nd.ni_cnd.cn_flags |= WILLBEDIR;
-+	error = namei(&nd);
-+	if (error) {
-+		return error;
++	vnode_t vp = NULLVP;
++	if (vnode_lookup(path, 0, &vp, vfs_context_kernel()) != 0) {
++		return false;
 +	}
-+	vp = nd.ni_vp;
-+	if (vp != NULLVP) {
-+		vnode_put(vp);
-+		nameidone(&nd);
-+		vnode_put(nd.ni_dvp);
-+		return EEXIST;
-+	}
-+	VATTR_INIT(&va);
-+	VATTR_SET(&va, va_mode, 0755);
-+	VATTR_SET(&va, va_type, VDIR);
-+	error = vn_mkdir(nd.ni_dvp, &nd.ni_vp, &nd, &va, vfs_context_kernel());
-+	if (nd.ni_vp != NULLVP) {
-+		vnode_put(nd.ni_vp);
-+	}
-+	nameidone(&nd);
-+	vnode_put(nd.ni_dvp);
-+	return error;
-+}
-+
-+errno_t
-+sweet_mkdirs(const char *path)
-+{
-+	char buffer[512];
-+	size_t length = strlcpy(buffer, path, sizeof(buffer));
-+	if (length >= sizeof(buffer)) {
-+		return ENAMETOOLONG;
-+	}
-+	for (char *p = buffer + 1; *p != 0; p++) {
-+		if (*p != '/') {
-+			continue;
-+		}
-+		*p = 0;
-+		errno_t error = sweet_mkdir(buffer);
-+		*p = '/';
-+		if (error != 0 && error != EEXIST) {
-+			return error;
-+		}
-+	}
-+	errno_t error = sweet_mkdir(buffer);
-+	return error == EEXIST ? 0 : error;
++	vnode_put(vp);
++	return true;
 +}
 +
 +errno_t
@@ -147,6 +101,51 @@ new file mode 100644
 +	return error;
 +}
 +
++errno_t
++sweet_read(const char *path, void *buffer, unsigned int capacity, unsigned int *size)
++{
++	vnode_t vp = NULLVP;
++	vfs_context_t ctx = vfs_context_kernel();
++	errno_t error = vnode_open(path, O_RDONLY, 0, 0, &vp, ctx);
++	*size = 0;
++	if (error) {
++		return error;
++	}
++	int residual = 0;
++	error = vn_rdwr(UIO_READ, vp, (caddr_t)buffer, (int)capacity, 0, UIO_SYSSPACE,
++	    IO_SYNC, vfs_context_ucred(ctx), &residual, NULL);
++	if (error == 0) {
++		*size = capacity - (unsigned int)residual;
++	}
++	vnode_close(vp, FREAD, ctx);
++	return error;
++}
++
++/* Keep the first original next to the file, so one boot can undo the install. */
++errno_t
++sweet_backup(const char *path)
++{
++	char original[1024];
++	if (snprintf(original, sizeof(original), "%s.orig", path) >= (int)sizeof(original)) {
++		return ENAMETOOLONG;
++	}
++	if (sweet_exists(original)) {
++		return 0;
++	}
++	void *buffer = IOMalloc(kMaxFileSize);
++	if (buffer == nullptr) {
++		return ENOMEM;
++	}
++	unsigned int size = 0;
++	errno_t error = sweet_read(path, buffer, kMaxFileSize, &size);
++	if (error == 0) {
++		error = sweet_write(original, buffer, size);
++	}
++	IOLog("SWEET GPU: backup %s (%u bytes) -> %d\n", original, size, error);
++	IOFree(buffer, kMaxFileSize);
++	return error;
++}
++
 +bool
 +unsafe_name(const char *name)
 +{
@@ -165,13 +164,12 @@ new file mode 100644
 +	if (length < 8 || memcmp(blob, "SGB1", 4) != 0) {
 +		return EINVAL;
 +	}
++	if (!sweet_exists(base)) {
++		return ENOENT;
++	}
 +	uint32_t count;
 +	memcpy(&count, blob + 4, sizeof(count));
 +	unsigned int offset = 8;
-+	errno_t error = sweet_mkdirs(base);
-+	if (error) {
-+		return error;
-+	}
 +	for (uint32_t i = 0; i < count; i++) {
 +		if (offset + 2 > length) {
 +			return EINVAL;
@@ -197,6 +195,13 @@ new file mode 100644
 +		if (snprintf(path, sizeof(path), "%s/%s", base, name) >= (int)sizeof(path)) {
 +			return ENAMETOOLONG;
 +		}
++		errno_t error = 0;
++		if (strcmp(name, "Info.plist") == 0) {
++			error = sweet_backup(path);
++			if (error) {
++				return error;
++			}
++		}
 +		error = sweet_write(path, blob + offset, size);
 +		IOLog("SWEET GPU: install %s (%u bytes) -> %d\n", path, size, error);
 +		if (error) {
@@ -205,6 +210,29 @@ new file mode 100644
 +		offset += size;
 +	}
 +	return 0;
++}
++
++errno_t
++sweet_restore(const char *base)
++{
++	char info[1024], original[1024];
++	if (snprintf(info, sizeof(info), "%s/Info.plist", base) >= (int)sizeof(info) ||
++	    snprintf(original, sizeof(original), "%s/Info.plist.orig", base) >=
++	    (int)sizeof(original)) {
++		return ENAMETOOLONG;
++	}
++	void *buffer = IOMalloc(kMaxFileSize);
++	if (buffer == nullptr) {
++		return ENOMEM;
++	}
++	unsigned int size = 0;
++	errno_t error = sweet_read(original, buffer, kMaxFileSize, &size);
++	if (error == 0) {
++		error = sweet_write(info, buffer, size);
++	}
++	IOLog("SWEET GPU: restore %s (%u bytes) -> %d\n", info, size, error);
++	IOFree(buffer, kMaxFileSize);
++	return error;
 +}
 +
 +} /* namespace */
@@ -233,8 +261,22 @@ new file mode 100644
 +{
 +	SweetGPUInstaller *installer = static_cast<SweetGPUInstaller *>(arg);
 +	errno_t error = ENOENT;
++	int restore = 0;
 +
 +	(void)wait_result;
++	if (PE_parse_boot_argn("sweetmetal_restore", &restore, sizeof(restore)) && restore) {
++		for (unsigned i = 0; i < 600; i++) {
++			error = sweet_restore(installer->basePath());
++			if (error == 0) {
++				break;
++			}
++			IOSleep(1000);
++		}
++		IOLog("SWEET GPU: restore %s (%d)\n", error ? "failed" : "done", error);
++		installer->release();
++		return;
++	}
++
 +	/* IOKit matches before vfs_mountroot; retry until the root is writable. */
 +	for (unsigned i = 0; i < 600; i++) {
 +		error = sweet_install(installer->basePath(), installer->blobBytes(),
@@ -274,7 +316,8 @@ new file mode 100644
 +		release();
 +		IOLog("SWEET GPU: could not start the bundle installer\n");
 +	}
-+	IOLog("SWEET GPU: installer armed, %u bytes\n", blob->getLength());
++	IOLog("SWEET GPU: installer armed for %s, %u bytes\n", basePath(),
++	    blob->getLength());
 +	return true;
 +}
 +
