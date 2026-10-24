@@ -1,0 +1,20 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -395,6 +395,17 @@
+ {
+ 	static unsigned long long present_count;
+ 	uint32_t mask = get32(rec, 0x104);
++	static unsigned rec_dumps;
++	if (rec_dumps < 2 && mask != 0) {
++		rec_dumps++;
++		IOLog("SWEET FB: rec mask=0x%x\n", mask);
++		for (uint32_t off = 0x40; off < 0x120; off += 0x10) {
++			IOLog("SWEET FB: rec %03x %08x %08x %08x %08x\n", off,
++			    get32(rec, off), get32(rec, off + 4),
++			    get32(rec, off + 8), get32(rec, off + 12));
++		}
++	}
++
+ 	if ((++present_count % 600) == 1) {
+ 		IOLog("SWEET FB: present %llu mask=0x%x blits=%u\n",
+ 		    present_count, mask, get32(rec, 0x38b));
