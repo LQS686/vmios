@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Pack an xnu kernel Mach-O + ADT into the payload the sweet shim boots.
 
-  mkpayload.py KERNEL ADT OUT [--cmdline "..."] [--ramdisk IMAGE]
+  mkpayload.py KERNEL ADT OUT [--cmdline "..."] [--ramdisk IMAGE] [--qemu-psci]
 
 The kernel is linked as a PIE with LC_DYLD_CHAINED_FIXUPS. Nobody else
 (no kmutil, no iBoot) resolves those for us, and xnu only rebases static
@@ -26,7 +26,7 @@ ADT and boot_args, inside topOfKernelData (never handed to the VM), and the
 ADT gets /chosen/memory-map "RAMDisk" = <phys, size> for IOFindBSDRoot to
 turn into md0 (boot with rd=md0).
 """
-import argparse, os, struct, sys
+import argparse, os, struct, subprocess, sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import adt  # noqa: E402
@@ -200,6 +200,8 @@ if __name__ == '__main__':
     ap.add_argument('--profile',
                     help="named boot-arg set from tools/bootargs.py ('device' for the phone)")
     ap.add_argument('--ramdisk', help='root image for md0 (boot with rd=md0)')
+    ap.add_argument('--qemu-psci', action='store_true',
+                    help='replace the phone SMC PSCI call with HVC for QEMU virt')
     a = ap.parse_args()
     if a.profile:
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -213,6 +215,10 @@ if __name__ == '__main__':
         cmdline = a.cmdline or 'debug=0xc serial=3 cpus=1 keepsyms=1'
     blob, info = build(a.kernel, a.adt, cmdline, a.ramdisk)
     open(a.out, 'wb').write(blob)
+    if a.qemu_psci:
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              'patch-qemu-psci.py')
+        subprocess.check_call([sys.executable, script, a.out, a.out])
     print('cmdline: %s' % cmdline)
     for k, v in info.items():
         if k != 'segs':

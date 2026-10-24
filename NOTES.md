@@ -1,33 +1,49 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
-### >>> ACTIVE: NATIVE PRESENT OFFLOAD, XIAOMI 14 PRO (2026-10-24) <<<
+### >>> ACTIVE: VIRTUAL GPU M0 PROVEN ON XIAOMI 14 PRO (2026-10-24) <<<
 
-**Measured root, not inferred:** on `23116PN5BC` (shennong, Android 16), the old
-APK ran MTTCG with ~91% of one host core busy, while the two vCPU threads were
-86%/1.4%; 187 s produced 563,355 minor faults. The current 30 fps app keeps
-30 capture ticks/s with 1.13 ms average full-frame copies and only 1.11% janky
-Android frames. The remaining stutter is Guest software rendering + present,
-not View/Bitmap/GPU upload. Full numbers and the rejected `mlockall` path are
-in `docs/PERF_FIXES.md` section 9.
+**Stable state restored:** phone payload is `.tools/frozen/payload-vm-mttcg.bin`
+one guest CPU, App is at home. The last experimental payload was M0 only.
 
-**Implemented:** `xnu/patches/0087-sweet-native-fb-present.patch` emits physical
-copy descriptors plus a completion sequence into the existing framebuffer
-reservation (`0x9d000000`); `vm/qemu/sweet_fb.c` executes them natively and the
-app reads only the sequence. `tools/bootargs.py vm-offload` enables it. Both
-Android engines (arm64-v8a, x86_64) and the 106 MB APK are rebuilt.
+**M0 result (measured):** `xnu/patches/0089-sweet-gpu-discovery.patch` registers an
+`IOAcceleratorES` IOService with `MetalPluginName=AGXMetalA11` and
+`MetalPluginClassName=AGXA11Device`. On the phone, CoreAnimation found it and
+made four `IOUserClient` calls before aborting:
 
-**Verified:** host QEMU registers `sweet-fb`; a standalone bare-metal payload
-proved a 64 B copy plus `completed=1/status=0`; XNU patch applies cleanly to
-`research/xnu/work`. **Not yet verified:** XNU 0087 CI build and phone A/B.
-CI: GitHub repo `LQS686/vmios`, run `40047689493` (push) / `40047694889`
-(queued duplicate), kernel artifact name `xnu-kernel`. Network needed the local
-proxy at `127.0.0.1:7897`.
+```
+SWEET GPU: IOAcceleratorES registered
+SWEET GPU: sel=6 struct-in=16
+SWEET GPU: sel=2 struct-out=536
+SWEET GPU: sel=0 struct-out=64
+SWEET GPU: sel=4 struct-out=32
+CRASH backboardd sig 6 ... AGXMetalA11+0x90ad0
+```
 
-**Next:** wait for the kernel artifact, unpack with `.tools/q-vm.adt` and
-`bootargs.py vm-offload --add tcgmulti=1`, push the 16 MB payload (not the root),
-install the current APK, and compare `present=native`, Guest swaps/fps, Android
-copy and gfxinfo against the saved no-offload run. Restore `.tools/frozen/
-payload-vm-mttcg.bin` if the new kernel fails.
+The crash is `AGX::Device<...>::~Device()` during failed initialization (PC is
+inside libsystem_kernel abort; AGX frame at `0x209e7ad0`). Current stub returns
+zero output structures, so this proves service discovery/plugin selection, not
+a working GPU.
+
+**Static ABI evidence:** `Metal` loads a plugin by reading
+`MetalPluginName`/`MetalPluginClassName`; `IOGPU.framework` passes the
+`IOAcceleratorES` connection as `acceleratorPort` to
+`IOGPUMetalDevice initWithAcceleratorPort:`. AGXMetalA11 is the matching plugin.
+There is no `ParavirtualizedGraphics` framework in the iOS 16.7 cache, so no
+Apple paravirtual GPU shortcut.
+
+**Next M1:** reverse `IOGPUDevice` create/config/shared-memory selectors and
+return valid 536/64/32-byte structures plus shared-memory mappings, so
+`AGXA11Device` completes init. Only after that implement command queue/resource
+calls and host GLES/Vulkan clear/blit. Host GPU cannot be used before the Guest
+Metal device exists.
+
+**Other experiments (not shipped):** 2x 750x1624 makes `backboardd` turn the
+display off with no swaps (iOS rejects the mode). MTTCG with two guest CPUs
+starts both 2/2 CPUs but stalls post-userland without FB swaps. Gunyah crosvm is
+blocked by SELinux on `/dev/gunyah`; QEMU's Gunyah accelerator needs a custom
+kernel and is not available on stock. QEMU 11.1.2 host port is in progress
+(custom device API migration). Full performance numbers remain in
+`docs/PERF_FIXES.md` section 9.
 
 ### >>> STUTTER ROOT CAUSED AND FIXED (2026-10-23 late): docs/PERF_FIXES.md <<<
 
