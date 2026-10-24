@@ -1,6 +1,6 @@
 # 卡顿定位与修复（2026-10-23 晚）
 
-开机与触摸已经打通，但 iOS 在 SweetVM / 真机上"能用但很卡"。这份记录只回答三个问题：
+开机与触摸已经打通，但 iOS 在 vmios / 真机上"能用但很卡"。这份记录只回答三个问题：
 卡在哪几层、每层怎么证明、改了什么。所有数字都是本机实测（K70 Pro 的日志 +
 WSL 宿主 QEMU 对照跑），不是估计。
 
@@ -233,7 +233,7 @@ python3 tools/qemu-sweet.py payload-ios-2cpu.bin out-fix --smp 2 \
 把宿主 D: 写到 0 字节；WSL 的 ext4 随即报 EIO，`wsl` 无法启动。
 处理：把 WSL 虚拟盘切成稀疏、把 `.wslconfig` 的 swap 关掉（WSL 默认 swap 盘
 不必要地占空间），启动后删掉所有临时镜像；WSL 恢复，`/opt/qemu` 与
-`/opt/ios-sweet` 完好。**注意**：`.wslconfig` 原先 283 字节的内容没有备份，
+`/opt/vmios` 完好。**注意**：`.wslconfig` 原先 283 字节的内容没有备份，
 现在只剩 `[wsl2] swap=0`，需要按原样恢复 memory/processors 等设置。
 D: 目前只剩 7.8 GB，之后不要再整盘复制 17 GB 镜像；测试请用快照，
 或者先清理空间。

@@ -1,4 +1,4 @@
-package dev.hackios.sweetvm;
+package dev.vmios.sweetvm;
 
 import android.app.Activity;
 import android.app.AlertDialog;
@@ -334,7 +334,7 @@ public final class MainActivity extends Activity {
         head.addView(logo, logoLp);
         LinearLayout titles = new LinearLayout(this);
         titles.setOrientation(LinearLayout.VERTICAL);
-        titles.addView(text("SweetVM", 29, TEXT, true));
+        titles.addView(text("vmios", 29, TEXT, true));
         TextView sub = text("iOS 16 · XNU 虚拟机", 13, DIM, false);
         sub.setPadding(0, dp(2), 0, 0);
         titles.addView(sub);
@@ -838,7 +838,7 @@ public final class MainActivity extends Activity {
         LinearLayout stack = new LinearLayout(this);
         stack.setOrientation(LinearLayout.VERTICAL);
         stack.setPadding(dp(6), 0, 0, 0);
-        TextView title = text("SweetVM", 14, TEXT, true);
+        TextView title = text("vmios", 14, TEXT, true);
         vmStatus = text("启动中 · 软件 CPU", 10, DIM, false);
         stack.addView(title);
         stack.addView(vmStatus);
@@ -989,7 +989,7 @@ public final class MainActivity extends Activity {
                 .setMessage(msg)
                 .setNegativeButton("复制日志", (dd, w) -> {
                     ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
-                    cm.setPrimaryClip(ClipData.newPlainText("SweetVM log", log == null ? "" : log));
+                    cm.setPrimaryClip(ClipData.newPlainText("vmios log", log == null ? "" : log));
                     toast("日志已复制");
                 })
                 .setPositiveButton("返回", (dd, w) -> showHome())
@@ -1088,7 +1088,7 @@ public final class MainActivity extends Activity {
                 .setNegativeButton("关闭", null)
                 .setPositiveButton("复制", (d, w) -> {
                     ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
-                    cm.setPrimaryClip(ClipData.newPlainText("SweetVM log", shown));
+                    cm.setPrimaryClip(ClipData.newPlainText("vmios log", shown));
                     toast("已复制");
                 })
                 .show();
@@ -1119,7 +1119,7 @@ public final class MainActivity extends Activity {
                         + "unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin "
                         + "launchd_unsecure_cache=1 wdt=-1 sweetfb_hz=30\"\n\n"
                         + "4. 在 App 里导入 payload 和根镜像。根镜像也可放到 "
-                        + "Android/data/dev.hackios.sweetvm/files/ios16-root.img。\n\n"
+                        + "Android/data/dev.vmios.sweetvm/files/ios16-root.img。\n\n"
                         + "注意：kernel 必须用 QEMU ADT（--qemu），phys_base 必须是 0xb0000000，"
                         + "不能使用 --highmem。");
     }
@@ -1143,7 +1143,7 @@ public final class MainActivity extends Activity {
     private void acquireWake() {
         if (wake == null) {
             PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
-            wake = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "SweetVM:vm");
+            wake = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "vmios:vm");
             wake.setReferenceCounted(false);
         }
         wake.acquire(12L * 60 * 60 * 1000);

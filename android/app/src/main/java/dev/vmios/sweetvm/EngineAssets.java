@@ -1,4 +1,4 @@
-package dev.hackios.sweetvm;
+package dev.vmios.sweetvm;
 
 import android.content.Context;
 import android.content.pm.PackageInfo;

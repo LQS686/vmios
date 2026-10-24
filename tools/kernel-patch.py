@@ -31,7 +31,7 @@ CMDLINE, SEG_TABLE = 0x48, 0x2A8
 
 PRESETS = {
     # bsd/dev/sweet_touch.c, sweet_touch_init(): the L11C rail vote aborts the
-    # whole GT9896 bring-up when it fails. Under SweetVM the RPMh block is not
+    # whole GT9896 bring-up when it fails. Under vmios the RPMh block is not
     # emulated and every register reads back 0xffffffff, so the vote returns
     # ENODEV and touch never appears - not even a tap. Turn the conditional
     # branch into an unconditional jump to the probe path (kernel 0085 does the

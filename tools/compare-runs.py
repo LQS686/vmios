@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare two SweetVM boot runs by guest time, not wall time.
+"""Compare two vmios boot runs by guest time, not wall time.
 
 The kernel's log thread flushes the ring every ufslogsecs (10 s), and the flush
 sequence number in the SWEETLOG header counts those intervals, so (seq, total)

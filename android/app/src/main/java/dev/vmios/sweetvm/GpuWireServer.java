@@ -1,4 +1,4 @@
-package dev.hackios.sweetvm;
+package dev.vmios.sweetvm;
 
 import android.opengl.EGL14;
 import android.opengl.EGLConfig;

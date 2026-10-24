@@ -315,10 +315,10 @@ python3 tools/dsc-frames.py logs/boot.txt --only lsd
 
 ---
 
-## 8. SweetVM 上的实测 A/B：这两个共享缓存补丁到底有没有用
+## 8. vmios 上的实测 A/B：这两个共享缓存补丁到底有没有用
 
 2026-10-23 晚，K70 Pro 接入后补做的实验。**先纠正一个前提**：`artifacts/` 里全部的启动日志都不是
-Redmi Note 10 Pro 硬件，而是这台手机上的 SweetVM（QEMU TCG）。判据是三行日志：
+Redmi Note 10 Pro 硬件，而是这台手机上的 vmios（QEMU TCG）。判据是三行日志：
 
 ```
 SWEET CPU: requested=1 selected=1 (limit=8)          # 不是 cpus=6/8
@@ -584,7 +584,7 @@ profile 见 `tools/bootargs.py vm-mttcg`（`cpus=2 tcgmulti=1`）。
 
 | 产物 | 位置 | sha256 |
 |---|---|---|
-| SweetVM APK（fps≤30 / 帧未变不拷贝 / `tcgmulti` 开关） | `.tools/frozen/sweetvm-0.2.0-mttcg-debug.apk` | `94a4d709c968c2038ad365815bbb8bc2abfaed7a4528dcd0da48597d29cf059f` |
+| vmios APK（fps≤30 / 帧未变不拷贝 / `tcgmulti` 开关） | `.tools/frozen/sweetvm-0.2.0-mttcg-debug.apk` | `94a4d709c968c2038ad365815bbb8bc2abfaed7a4528dcd0da48597d29cf059f` |
 | payload：2 核 + MTTCG + 触摸双补丁 | `.tools/frozen/payload-vm-mttcg.bin` | `2101873d820a0493d12062afc7b974f488fbe82fb8e8b3f3cce96dc16736bfed` |
 | payload：1 核 + 触摸双补丁（保守） | `.tools/frozen/payload-vm-touch.bin` | `f8946745caef11e40fa53909ceb832a767ae0a49a86cfcd31a6a84722c0f5d4f` |
 | 根镜像（已打 §1 的两处共享缓存补丁） | `.tools/ios16-root.img`（undo: `*.undo.json`） | 原地 8 字节，未记录哈希 |

@@ -26,7 +26,7 @@ from dsc_patch_sites import BRINGUP, PRESETS  # noqa: E402
 ADB = os.environ.get("ADB") or next(
     (p for p in ("./.tools/platform-tools/adb.exe", "./.tools/platform-tools/adb",
                  "adb", "adb.exe") if shutil.which(p) or os.path.exists(p)), "adb")
-PKG = "dev.hackios.sweetvm"
+PKG = "dev.vmios.sweetvm"
 GUEST = "files/ios16-root.img"
 BLOCK = 4096
 # image offset -> preset, from tools/image-patch.py find

@@ -3,11 +3,11 @@ plugins {
 }
 
 android {
-    namespace 'dev.hackios.sweetvm'
+    namespace 'dev.vmios.sweetvm'
     compileSdk 35
 
     defaultConfig {
-        applicationId 'dev.hackios.sweetvm'
+        applicationId 'dev.vmios.sweetvm'
         minSdk 26
         // Keep 28: Android 10+ rejects exec from app data for targetSdk >= 29,
         // and jniLibs cannot carry Termux's versioned SONAMEs. The engine is

@@ -51,10 +51,10 @@ python3 tools/dsc-patch.py <cache_dir> --preset metal-wait-300ms
 
 ## 2. 启动时间线（实测，不是估计）
 
-> **⚠️ 2026-10-23 晚间更正：这些数据全部来自 SweetVM（QEMU TCG），不是 Redmi Note 10 Pro 硬件。**
+> **⚠️ 2026-10-23 晚间更正：这些数据全部来自 vmios（QEMU TCG），不是 Redmi Note 10 Pro 硬件。**
 > 每一份 `artifacts/*log*.txt` 都写着 `SWEET CPU: requested=1 selected=1 (limit=8)`（`lock-log` 是 `cpus=2`）、
 > `vm_page_bootstrap: 76090 free pages`（≈1.19 GB）、DMA 在 `0xb33d8000`（低内存 ADT）、userdata `first block 0x22`
-> ——这是 K70 Pro 上跑的 SweetVM，单核 TCG。
+> ——这是 K70 Pro 上跑的 vmios，单核 TCG。
 > 所以下面的 31.5s 和 ≥200s 都是**一核模拟**下的数字，不代表真机性能；`cpus=8` 只适用于硬件，
 > VM 应该用 `cpus=2`（`NOTES.md` 已记录 2 vCPU 稳定，6/8 会撞锁超时，而 `lock-log` 那次正是 `cpus=2` 到锁屏）。
 > 见 `BOOT_FIXES.md` §8 的 A/B 实测。

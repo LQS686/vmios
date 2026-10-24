@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Minimal Mach-O / dyld-cache-dylib inspector for the ios-sweet bring-up.
+"""Minimal Mach-O / dyld-cache-dylib inspector for the vmios bring-up.
 
 The project analyses iOS binaries on Windows/Linux, where Apple's nm/otool and
 REA's macOS provider are unavailable. This reads a thin arm64 Mach-O (a dylib

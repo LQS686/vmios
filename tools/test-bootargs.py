@@ -14,11 +14,11 @@ Exit codes: 0 pass, 1 no JDK, 2 compile/run failure, 3 assertion failure.
 import json, os, shutil, subprocess, sys, tempfile
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-PKG = 'dev/hackios/sweetvm'
+PKG = 'dev/vmios/sweetvm'
 LOCKS = ' tlto_us=2000000 slto_us=2000000'
 LIMIT = 607 - len(LOCKS)          # MainActivity.MTTCG_LOCK_ARGS
 
-TEST_JAVA = '''package dev.hackios.sweetvm;
+TEST_JAVA = '''package dev.vmios.sweetvm;
 import java.io.File;
 import java.io.RandomAccessFile;
 
@@ -119,7 +119,7 @@ def main():
             print((r.stdout + r.stderr).decode('utf-8', 'replace'), file=sys.stderr)
             return 2
         r = subprocess.run([java, '-Dfile.encoding=UTF-8', '-cp', out,
-                            'dev.hackios.sweetvm.BootArgsTest', os.path.abspath(payload)],
+                            'dev.vmios.sweetvm.BootArgsTest', os.path.abspath(payload)],
                            capture_output=True)
         print(r.stdout.decode('utf-8', 'replace'), end='')
         if r.returncode:

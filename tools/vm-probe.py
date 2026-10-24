@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Poll a running SweetVM's kernel log ring through adb, for A/B boot timing.
+"""Poll a running vmios's kernel log ring through adb, for A/B boot timing.
 
 The kernel's persistent log lives in the last 1025 blocks of the userdata
 image (kernel patch 0047): block 0 is "SWEETLOG" + total bytes written + flush
@@ -20,7 +20,7 @@ import time
 ADB = os.environ.get("ADB") or next(
     (p for p in ("./.tools/platform-tools/adb.exe", "./.tools/platform-tools/adb",
                  "adb", "adb.exe") if shutil.which(p) or os.path.exists(p)), "adb")
-PKG = "dev.hackios.sweetvm"
+PKG = "dev.vmios.sweetvm"
 GUEST = "files/ios16-root.img"
 BLOCK = 4096
 IMAGE = 17179869184

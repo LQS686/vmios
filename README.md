@@ -1,248 +1,96 @@
-# ios-sweet
+# vmios
 
-**Apple's iOS 16 running on a Redmi Note 10 Pro.**
+**在虚拟机里运行真实的 iOS 16。**
 
-This project ports Apple's open-source XNU kernel (xnu-8796, the iOS 16 generation) to the Xiaomi Redmi Note 10 Pro (`sweet`, Qualcomm SM7150 / Snapdragon 732G). On top of it runs the **unmodified iOS 16.7.16 (20H392) userland of the iPhone X**: launchd, the system daemons, backboardd, SpringBoard and the stock apps.
+vmios 让 Apple 原版的 iOS 16.7.16（20H392，iPhone X / `iPhone10,3` / D22AP）
+用户态运行在打了补丁的开源 XNU 8796 内核之上。客户机里是**真实的 iOS 根文件
+系统与共享缓存**：launchd、系统守护进程、backboardd、SpringBoard 和系统自带
+应用，而不是重写或伪造的界面。
 
-As of **2026-10-18** the phone boots to the **iOS home screen**. You can unlock it, open Settings, pull down Control Center and the notification center, and use the touchscreen and the hardware buttons. Rendering runs entirely on the CPU; there is no GPU driver.
+同一套内核与客户机镜像支持两个目标：
 
-> Experimental bring-up, not a usable phone OS. Many things are missing or stubbed (see below), and Apple's security model is mostly switched off. It installs into the `userdata` partition and so **erases Android's user data**.
-
-## What works
-
-| Area | State |
+| 目标 | 状态 |
 | --- | --- |
-| Boot | Stock Xiaomi bootloader → `fastboot boot` of our shim → XNU. Nothing is flashed to the boot partitions |
-| CPU | 6 of the 8 cores (the six Cortex-A55s) via PSCI, 16K pages, GICv3 interrupts, timers |
-| Memory | About 3.95 GiB of the upper DDR bank |
-| Storage | Own UFS host driver; the iOS root is a journaled HFS+ volume in `userdata`, read/write |
-| iOS userland | Real iPhone X 16.7.16 root filesystem and shared cache; launchd and the system daemons run |
-| Display | Kernel IOSurface + IOMobileFramebuffer (`AppleCLCD`) services; CoreAnimation renders in software; frames are copied into the bootloader's framebuffer. Presented to iOS as an iPhone X panel (1125×2436) |
-| GUI | backboardd, SpringBoard, lock screen, home screen, Control Center, notification center, Settings |
-| Touch | Goodix GT9896 over I²C (GENI), rail enabled through RPMh, delivered as HID digitizer events |
-| Buttons | Power, volume up/down (PMIC through SPMI) as HID consumer keys; lock/wake works |
-| Battery | IOPMPowerSource service (static 100 %, charging icon; real fuel-gauge readout prepared) |
-| Device identity | iPhone X (`iPhone10,3` / `D22AP`): no Home button, gesture UI |
-| Activation | Native "Hactivation" path of mobileactivationd, chosen through device-tree security status. No Apple servers involved |
+| **Android 应用**（`android/`，`dev.vmios.sweetvm`） | QEMU TCG + 自定义 UFS 控制器 + 面向宿主 Adreno GPU 的 virtio GPU 线缆 + 共享内存面板；可启动真实 iOS 用户态 |
+| **裸机 shim**（`shim/`） | 早期 Redmi Note 10 Pro（`sweet`，SM7150）移植；保留作参考，当前暂停 |
 
-## What does not work (yet)
-
-- **Navigation:** you cannot leave an app (the home gesture and AssistiveTouch Home do nothing yet).
-- **No Wi-Fi, Bluetooth, cellular, audio, camera, sensors, GPS or SEP / Face ID.** Daemons for them start and fail or keep relaunching.
-- **No GPU.** Everything is drawn by the CPU at roughly 20–30 fps. The two Cortex-A76 cores are not used yet.
-- **Few apps.** The image has only what is on the system volume. There is no App Store, no Apple ID, and some Settings pages are empty.
-- **Slow boot:** about 4 minutes on the Apple logo.
-- **Security is off:** permissive code signing (AMFI) and sandbox policies, a stub AppleKeyStore, no data protection. Do not put anything personal on it.
-
-## Android VM app (experimental)
-
-[`android/`](android/README.md) contains a separate path: the same XNU kernel
-runs inside a normal Android app under QEMU TCG, with a custom
-[`sweet-ufs`](vm/qemu/sweet_ufs.c) controller so the 16 GB HFS+ iOS root
-mounts unchanged and the app reads the 1080×2400 panel through a shared RAM
-file. It does not touch the phone's partitions and is not a replacement for
-the bare-metal port.
-
-The app boots a bundled open-source demo payload to
-`*** SWEET userspace: init running as PID 1 ***` and displays the guest
-framebuffer. A user-supplied iPhone X 16.7.16 root now reaches the iOS lock
-screen and, after skipping Setup, the SpringBoard home screen under host
-QEMU; unlock swipes and Setup taps work through the Geni + Goodix GT9896
-model (`vm/qemu/sweet_touch.c`, payloads built with
-`tools/patch-qemu-input.py`). Getting there needs a few bring-up patches:
-the `host_set_multiuser_config_flags` success stub
-(`tools/patch-kernel-multiuser.py`; proper source fix in
-`xnu/patches/0082-sweet-multiuser-host-flags.patch`), a synthetic
-MobileGestalt cache plus the MG IOKit getter patch, and removal of the
-QEMU-only SpringBoard lock prefs. System-app placeholders can still show
-"Waiting..." until the MobileInstallation/SystemAppMigrator install
-completes. Hardware keys are not modelled. `VmEngine` follows the payload's
-`cpus=N` and uses MTTCG for N > 1. Apple's iOS files are not included; see
-[`android/README.md`](android/README.md) and
-[`docs/IOS_ROOT_WSL.md`](docs/IOS_ROOT_WSL.md).
-
-## How it boots
+## 结构
 
 ```
-ABL (stock Xiaomi bootloader, unlocked)
-  -> fastboot boot shim-boot.img              (temporary; nothing is flashed to boot)
-     -> shim: own MMU setup, reads the live FDT, loads the payload from the ramdisk
-        -> XNU Mach-O + generated Apple Device Tree (ADT) + boot-args
-           -> XNU -> UFS driver -> HFS+ root in the userdata partition
-              -> dyld + shared cache -> launchd -> daemons -> backboardd + SpringBoard
++--------------------- Android 应用（或 PC 上的 QEMU） ---------------------+
+|  QEMU virt，1~2 个 vCPU，TCG                                             |
+|   SWEETXNU payload：XNU 8796 + Apple 设备树 + 可选根镜像                  |
+|   存储：sweet-ufs -> HFSX 格式 iOS 根镜像（userdata 中的 16 GiB 文件）      |
+|   显示：共享客户机内存中的 sweet-fb 面板                                   |
+|   GPU：virtio console 线缆 -> 宿主 EGL/GLES（Adreno）                      |
++---------------------------------------------------------------------------+
+        内核补丁位于 xnu/patches，Metal 插件位于 vm/metal
 ```
 
-There is no serial port (the debug UART is wired as SPI on this board). The kernel draws its console into the framebuffer that ABL leaves at `0x9c000000`, and keeps a persistent 4 MiB log ring at the end of `userdata`. You read that log from OrangeFox recovery with `tools/sweet-log-pull.sh`, so you don't have to film the screen.
+内核补丁补齐真实 iOS 用户态所需的存储、显示、触摸、HID、AppleKeyStore、电源
+和 GPU 基础服务。`vm/metal` 构建 `SweetMetal`：内核把它安装进客户机的
+`AGXMetalA11.bundle`，向 CoreAnimation 注册一个虚拟 `MTLDevice`，再把渲染
+pass 通过 GPU 线缆转发给宿主。
 
-## How to do it yourself
+## 当前进度
 
-You need a Redmi Note 10 Pro (`sweet`, global or Indian variant, SM7150) with an **unlocked bootloader**, a Linux PC, and a GitHub account for the kernel build. This is the exact path used for the screenshots above; other variants or firmware may need changes. **Everything on `userdata` is lost.** Bootloaders, recovery, modem and persist partitions are never touched.
+- **启动**：真实 iOS 16.7.16 用户态可在 QEMU TCG 下启动；launchd、backboardd、
+  SpringBoard 和 Setup 进程都能运行，SpringBoard 会创建窗口树。
+- **显示**：面板由客户机内存提供；内核控制台可静音，把面板让给合成器。
+- **GPU**：虚拟 Metal 设备是客户机的系统默认设备，CoreAnimation 的 Metal
+  上下文能完成初始化；客户机用户态已经可以经内核线缆驱动宿主 GPU 完成填充
+  （已在真机上端到端验证）。
+- **待解决**：CoreAnimation 的 WindowServer 仍提交空 swap（没有 layer
+  surface），iOS 界面尚未上屏；宿主端的 draw/blit 翻译也还没实现。当前
+  handoff、证据与下一步见 `NOTES.md`。
 
-### 0. Back up the phone
+早期裸机里程碑（官方主页、触摸、按键）记录在 `docs/` 与 `NOTES.md`。
 
-Boot OrangeFox (or any recovery with adb root) temporarily and pull at least `persist`, `modemst1`, `modemst2`, `fsg`, `fsc` and `boot`, `dtbo`, `vbmeta`. They contain per-device calibration data. Keep them off git; `.gitignore` already excludes `backup/`, `dtb/` and `recovery/`.
+## 目录
 
-The shim needs the stock DTB. Unpack your phone's stock `boot.img`:
-
-```sh
-python3 tools/unpack_bootv2.py backup/boot.img dtb/boot_unpacked   # -> dtb/boot_unpacked/dtb
-```
-
-### 1. Build the kernel
-
-The kernel builds on GitHub's macOS runners with [blacktop/darwin-xnu-build](https://github.com/blacktop/darwin-xnu-build). The workflow fetches xnu-8796, applies `xnu/patches/` in order, and also stages the pinned open-source libpthread, HFS and BearSSL sources it needs. Fork the repo (public repos get free macOS minutes) and run:
-
-```sh
-gh workflow run xnu.yml -R YOU/ios-sweet
-gh run download RUN_ID -R YOU/ios-sweet -n xnu-kernel -D xnu/out
-```
-
-To check a patch locally before spending a CI run, `tools/xnu-cc.py` replays the compile commands of a previous CI log for single files.
-
-### 2. Build the iOS root image
-
-Download the iPhone X (iPhone10,3) iOS 16.7.16 (20H392) IPSW from Apple. Then, on Linux, with `apfs-fuse`, `hfsprogs` and sudo:
-
-```sh
-# OS, SystemOS and AppOS disk images from the IPSW (see BuildManifest.plist for their names)
-tools/mkiosroot.sh OS.dmg SystemOS.dmg AppOS.dmg ios16-root.img 16G
-sudo fsck.hfsplus -fy ios16-root.img
-sudo mount -t hfsplus -o loop,force ios16-root.img /mnt/iosroot
-sudo python3 tools/sweet-root-tweaks.py /mnt/iosroot
-sudo umount /mnt/iosroot
-img2simg ios16-root.img ios16-root.simg
-```
-
-`mkiosroot.sh` copies the OS volume and both cryptexes into one case-sensitive journaled HFS+ volume. It adds the dyld cache links, the plain system keybag and the log directories the daemons expect. `sweet-root-tweaks.py` applies the bring-up changes: it skips Setup, seeds the activation state, removes the baseband daemon, disables the watchdogs that kill slow apps and the crash-looping media paths, and so on. The script's header explains each change.
-
-The device tree builder copies `/product` from the real iPhone X device tree, which MobileGestalt needs. Extract it once, without downloading the whole IPSW:
-
-```sh
-python3 tools/remotezip.py IPSW_URL DeviceTree.d22ap.im4p research/ipsw-x/dt
-ipsw img4 im4p extract research/ipsw-x/dt/Firmware/all_flash/DeviceTree.d22ap.im4p -o research/ipsw-x/d22ap.adt
-```
-
-### 3. Build the boot image
-
-Needs `aarch64-linux-gnu-gcc` and `mkbootimg`.
-
-```sh
-python3 tools/mkadt.py shim/out/sweet.adt --highmem
-python3 tools/mkpayload.py xnu/out/kernel.development.sweet shim/out/sweet.adt shim/out/payload.bin \
-    --profile device
-shim/build.sh ../shim/out/payload.bin      # -> shim/out/shim-boot.img
-```
-
-The boot-args live in [`tools/bootargs.py`](tools/bootargs.py): `--profile device` is the phone, `vm`/`vm-sample`/`vm-mttcg` are for SweetVM (the Android app under QEMU; `vm-mttcg` adds `tcgmulti=1`, which switches the app from `thread=single` to real MTTCG), `timing` adds console timestamps and UFS counters, `sample` adds the stack sampler, `qemu`/`probe` are kernel-only. Print one with `python3 tools/bootargs.py timing`. What the less obvious ones do:
-
-| Boot-arg | Effect |
+| 路径 | 用途 |
 | --- | --- |
-| `rd=ufsroot0 ufsrw=1 rootrw=1` | Root on the `userdata` partition, writable |
-| `cpus=8` | All eight cores (6x A55 + 2x A76); `cpus=1` is the safe fallback |
-| `ufscache=1` | Clean only the DMA ranges a command touches instead of syncing the whole bounce buffer |
-| `ufswait=1` | Sleep in the command wait instead of `delay(1)` spinning, when the caller may block |
-| `sweetts=1` | Prefix every console line with `[seconds.milliseconds]` from reset (`tools/boot-timeline.py`) |
-| `ufsstats=1 ufsstatsecs=5` | Count UFS commands, bytes, latency and sleep ratio; one log line per interval |
-| `sweetsample=a,b,c` | Sample those processes' stacks (0054); `-` turns it off |
-| `launchd_unsecure_cache=1` | launchd accepts its job cache without AMFI |
-| `wdt=-1 wdt_test=no_user_checkin` | No hardware watchdog |
-| `sweetfb_noconsole=1` | Stop drawing kernel text over the GUI. It still goes to the persistent log; panics are drawn |
-| `sweetfb_hz=30` | Panel refresh rate of the CPU copy |
-| `sweettouch=0`, `sweetkeys=0` | Disable the touch or button driver |
+| `xnu/patches/` | 按编号顺序应用的内核补丁；CI 产出 `kernel.development.sweet` |
+| `vm/` | 虚拟硬件：UFS、framebuffer、触摸、GPU 线缆、Metal 插件（`vm/metal`） |
+| `android/` | Android 应用（`dev.vmios.sweetvm`）、QEMU 引擎、宿主 GPU 服务 |
+| `tools/` | payload/ADT 构建、镜像工具、日志与崩溃分析工具 |
+| `shim/` | 裸机启动 shim（旧目标） |
+| `docs/` | 设计、启动分析、性能记录与 `NAMING.md` |
+| `site/` | 项目网站 |
+| `research/`、`artifacts/`、`.tools/` | 本地分析输入与临时产物，不入库 |
 
-### 4. Flash the root and boot
+## 构建
 
-```sh
-fastboot -S 512M flash userdata ios16-root.simg   # ~7 minutes; do not unplug
-# Xiaomi's fastboot often hangs after a large flash: re-enter fastboot with Power + Volume down
-fastboot boot shim/out/shim-boot.img
-```
+内核：修改 `xnu/patches/` 后由 `xnu` 的 GitHub Actions 工作流构建（或使用
+同样的 blacktop 构建树在本地构建）。
 
-The first boot takes about 4–5 minutes on the Apple logo, then the lock screen appears. Swipe up to unlock. To get back to fastboot, hold Power + Volume down. [`docs/BOOT_ANALYSIS.md`](docs/BOOT_ANALYSIS.md) explains where that time goes and [`docs/BOOT_FIXES.md`](docs/BOOT_FIXES.md) what is already applied against it.
-
-### 5. Read the kernel log
+Payload：
 
 ```sh
-fastboot boot recovery/recovery.img        # OrangeFox, temporary
-tools/sweet-log-pull.sh logs/boot.txt      # 4 MiB console ring from the end of userdata
-adb reboot bootloader
+python3 tools/mkadt.py out.adt --qemu --gpu-wire --gpu-bundle vm/metal/build/SweetMetalAccel.sgb
+python3 tools/mkpayload.py xnu/out/kernel.development.sweet out.adt payload.bin --cmdline "..."
 ```
 
-The log contains crash reports with backtraces (`CRASH name ...`), IOKit traces of backboardd and SpringBoard, and the drivers' `SWEET ...` lines. `tools/sweet-crash.py` symbolicates them against the shared cache.
+Android 应用：
 
-### QEMU
+```sh
+cd android && ./gradlew assembleDebug
+```
 
-`tools/qemu-sweet.py` boots the same kernel on QEMU `virt` with a test RAM-disk root. It is useful for kernel-only changes; see `NOTES.md`. For the Android VM path, build QEMU with `vm/qemu/sweet_ufs.c` and use `--qemu <binary> --ufs <hfs+ image> --shared-ram`; the device presents the raw image as GPT `userdata`, and `guest-ram.bin` lets an external reader pick up the panel. Build instructions are in [`vm/README.md`](vm/README.md).
+iOS 根镜像由使用者自行准备；本仓库不包含 Apple 的系统文件。
 
-## Repository layout
+## 鸣谢
 
-| Path | What |
-| --- | --- |
-| `shim/` | Bare-metal boot shim (C + asm) packed as an Android boot.img v2 |
-| `xnu/patches/` | The XNU patch series (applied in order by CI), plus staging scripts for libpthread, HFS and BearSSL |
-| `.github/workflows/xnu.yml` | Kernel CI build |
-| `tools/mkadt.py` | Generates the Apple Device Tree from sweet's MMIO layout and the iPhone X identity |
-| `tools/mkpayload.py` | Packs kernel + ADT + boot-args into the shim payload (`--profile` from `tools/bootargs.py`) |
-| `tools/bootargs.py` | The boot-arg profiles: `device`, `timing`, `sample`, `qemu`, `probe` |
-| `tools/boot-timeline.py` | Turns a `sweetts=1` console log into a boot timeline: the largest silences and what surrounded them |
-| `tools/mkiosroot.sh` | Builds the HFS+ iOS root from the IPSW images, including the shared-cache patches |
-| `tools/dsc-patch.py` | Verifies and rewrites the GPU-wait sites in the split dyld shared cache |
-| `tools/dsc-frames.py` | Resolves sampled raw addresses to `dylib+offset` against the shared cache |
-| `tools/test-sweet-ufs.py` | Compiles and exercises the console-timestamp and UFS-statistics code against stubs |
-| `tools/image-patch.py` | Finds and patches the shared-cache sites inside a raw disk image, no HFS mount needed |
-| `tools/phone-patch.py` | Same patch on the image inside SweetVM's app storage, one 4 KiB block at a time over adb |
-| `tools/kernel-patch.py` | Patch one instruction in a built kernel (or in a packed payload) at a named, byte-checked site - how the touch fixes landed without Xcode |
-| `tools/vm-probe.py`, `tools/compare-runs.py` | Poll a running VM's SWEETLOG ring and compare two boots by guest-time flush sequence |
-| `tools/sweet-root-tweaks.py` | Bring-up changes to the root (Setup skip, activation, daemons) |
-| `tools/sweet-log-pull.sh`, `sweet-log.py` | Read the persistent kernel log from recovery |
-| `tools/sweet-crash.py` | Symbolicate console crash reports |
-| `tools/xnu-cc.py` | Local single-file compile check from a CI log |
-| `tools/qemu-sweet.py` | QEMU test boots with framebuffer text decoding |
-| `tools/adt.py`, `remotezip.py`, `unpack_bootv2.py`, `sparsediff.py` | Helpers |
-| `android/` | SweetVM: experimental Android app that runs the kernel under QEMU |
-| `vm/` | QEMU UFS device, QEMU patch, Android engine build notes |
-| `NOTES.md` | Detailed engineering log: every boot, crash and decision, plus hardware facts |
+见 [CREDITS.md](CREDITS.md)。vmios 建立在 XNU、blacktop 的
+`darwin-xnu-build`、UniXNU 的 virtio console 实现、QEMU、Ghidra，以及更早的
+`hackios` / iOS-on-Android 研究之上。
 
-Not in git: partition backups, live device trees, recovery images, Apple firmware and root images, and downloaded or generated build trees. They contain device serials and calibration data, or Apple's copyrighted files.
+## 命名与约定
 
-## Kernel patches
+项目标识符、前缀与符号规则见 [`docs/NAMING.md`](docs/NAMING.md)。简要原则：
+面向用户与宿主侧统一使用 `vmios`；客户机平台 ABI 保留历史 `sweet` 前缀，
+它是冻结的命名空间，按版本整体迁移，不做零散重命名。
 
-| # | What |
-| --- | --- |
-| 0001–0009 | Toolchain compatibility, SWEET machine config, non-PAC arm64, stubs for Apple-internal pieces |
-| 0010–0018 | Early framebuffer console, physmap fix, PRNG without corecrypto, device-tree platform expert, timer PPI, boot CPU driver |
-| 0019–0020 | Apple open-source libpthread kernel provider; BearSSL AES |
-| 0021–0027 | RAM-disk root, mockfs, SHA-256, minimal AMFI, Apple open-source HFS+, MD5 |
-| 0028–0034 | UFS host driver and root device, read/write root, DMA above 4 GiB |
-| 0035–0045 | Entitlements, bindfs, AppleKeyStore stub, IOWatchdog, console crash reports |
-| 0046 | IOSurface (IOCoreSurfaceRoot) and IOMobileFramebuffer (AppleCLCD) services |
-| 0047–0055 | Diagnostics: persistent log, /dev/null tee, IOKit trace, heap strings and user stack sampler on crash; permissive Sandbox policy; HFS rename-swap; AppleKeyStore selectors |
-| 0056–0057 | Throttled panel copy; no external identity resolver |
-| 0058 | HID event services. Apple's IOHIDFamily-1915.140.3 user client and event queue, matching the iOS 16.7 userland |
-| 0059 | iPhone X identity (`hw.product` / `hw.target` from the device tree) |
-| 0060 | Power and volume keys over SPMI; touch over GENI I²C |
-| 0061 | Present the display as 1125×2436 |
-| 0062 | RPMh regulator vote for the touch rail; battery power source |
-| 0063 | GENI FIFO packing fix and the Goodix GT9896 protocol |
-| 0064 | Grant PRIV_WORK_INTERVAL (UIKit's CoreAnimation work interval) |
-| 0065 | SMP: secondary A55 cores via PSCI CPU_ON |
-| 0066–0067 | Fault-region crash info; console mute |
-| 0068 | IOSurface lookup semantics for already-mapped surfaces |
-| 0069 | Batched persistent-log flushes |
-| 0070–0077 | Navigation/PID hibernate, edge-tip touches, USB device mode, CDC-ECM and live console |
-| 0078–0081 | 8-core SMP, display power changes, route/address tracing and Ethernet link state |
+## 许可证
 
-## Key hardware facts
-
-- RAM: payloads use the upper bank, `0x100000000` + `0xfcc00000` (about 3.95 GiB), above Qualcomm's protected carve-outs.
-- GICv3 with security extensions: the timer goes through Group 1 IRQ (virtual timer INTID 19), not FIQ as on Apple silicon.
-- PSCI through `smc`, 19.2 MHz timer, ARMv8.2 without pointer authentication. MPIDR uses Aff1 for the core number.
-- Panel: 1080×2400 DSC video mode, continuous splash from ABL, no refresh kick needed.
-- Touch: Goodix GT9896 at I²C `0x5d` on QUP SE7 (`0xa84000`), powered by PM6150L LDO11 through RPMh.
-- Buttons: power and volume down on the PM6150 PON block, volume up on PM6150L GPIO2 (SPMI SID 4).
-
-More in [`NOTES.md`](NOTES.md).
-
-## Credits
-
-Built on Apple's open-source releases (xnu, IOHIDFamily, libpthread, hfs), [BearSSL](https://bearssl.org), [blacktop/darwin-xnu-build](https://github.com/blacktop/darwin-xnu-build), [ipsw](https://github.com/blacktop/ipsw), Qualcomm/Xiaomi's published Linux kernel sources for the hardware details, and [OrangeFox Recovery](https://orangefox.download). The Android VM path also uses [QEMU](https://www.qemu.org/) (GPLv2) and Termux's GLib/pixman builds. iOS itself is Apple's and is not distributed here.
+MIT（见 `LICENSE`）。Apple 的 iOS 文件版权归 Apple，本仓库不包含它们。

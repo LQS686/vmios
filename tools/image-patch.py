@@ -20,7 +20,7 @@ in the image has that combination.
 
   # an image on a phone (app-private path, read through run-as): the shell
   # commands to read/patch one 4 KiB block, since adb cannot push into app data
-  python3 tools/image-patch.py phone ios16-root.img dev.hackios.sweetvm files/ios16-root.img
+  python3 tools/image-patch.py phone ios16-root.img dev.vmios.sweetvm files/ios16-root.img
 
 Hard links (mkiosroot.sh links the cryptex cache into
 /System/Library/Caches/com.apple.dyld) share blocks, so one physical site
@@ -171,7 +171,7 @@ def main():
     ap.add_argument("image")
     ap.add_argument("--presets", default="all", help="'all' or comma separated names")
     ap.add_argument("--undo", help="undo sidecar (default IMAGE.undo.json)")
-    ap.add_argument("--pkg", default="dev.hackios.sweetvm")
+    ap.add_argument("--pkg", default="dev.vmios.sweetvm")
     ap.add_argument("--guest", default="files/ios16-root.img")
     ap.add_argument("-y", "--yes", action="store_true")
     a = ap.parse_args()

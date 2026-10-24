@@ -19,7 +19,7 @@ Profiles:
            31 s between the last early-boot line and launchd go", and "is the
            one-command-at-a-time controller the bottleneck".
   sample    timing + the stack sampler, for a boot that stalls in userland.
-  vm       SweetVM (the Android app): cpus=N becomes QEMU's -smp, no rd= (the
+  vm       vmios (the Android app): cpus=N becomes QEMU's -smp, no rd= (the
            app appends rd=ufsroot0 itself). 2 vCPUs is what NOTES.md calls
            stable, but see BOOT_FIXES.md 8.4: -accel tcg,thread=single means the
            extra vCPU only time-shares one host core.
@@ -61,7 +61,7 @@ DEVICE = " ".join([
 
 TIMING = DEVICE + " sweetts=1 ufsstats=1 ufsstatsecs=5"
 
-# SweetVM (the Android app): QEMU's -smp comes from cpus=N here, and one vCPU
+# vmios (the Android app): QEMU's -smp comes from cpus=N here, and one vCPU
 # is the reason LaunchServices looks like it hangs; 2 is the stable bring-up
 # choice (6/8 hit the pset0 ticket lock, see NOTES.md). No rd=: the app appends
 # rd=ufsroot0 itself when the command line has none, so keep it out.
@@ -101,7 +101,7 @@ PROFILES = {
     # 375x812 points at 2x: the same UIKit layout with 44.5% of the pixels.
     # Use mkadt.py --fb-width 750 --fb-height 1624 --display-scale 2.
     "vm-2x": VM + " sweetfb_native=1 sweetfb_w=750 sweetfb_h=1624",
-    # Touch is dead under SweetVM until kernel patch 0085 (the RPMh rail vote
+    # Touch is dead under vmios until kernel patch 0085 (the RPMh rail vote
     # fails with ENODEV and used to abort the GT9896 probe). Until that kernel
     # is built, sweethidtest drives a Home press every N seconds through
     # IOHIDEventService, which needs no PMIC and is what the Setup "Hello"

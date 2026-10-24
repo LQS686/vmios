@@ -26,3 +26,7 @@ vm/qemu/qemu/
 
 # SweetMetal plugin build output
 vm/metal/build/
+
+# local Ghidra projects and assistant scratch
+ghidra-proj/
+.workbuddy/

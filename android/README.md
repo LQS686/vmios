@@ -1,4 +1,4 @@
-# SweetVM — the Android VM front-end (experimental)
+# vmios — the Android VM front-end (experimental)
 
 This directory is a separate, experimental way to run the same SWEET XNU
 kernel: inside an Android app, under QEMU TCG, without touching the phone's
@@ -109,7 +109,7 @@ You need two user-supplied files:
   `sweettouch=1 sweettouchdelay=3`; add `sweetfb_noconsole=1` for the GUI.
 
 Import both in the app, or copy them to
-`/sdcard/Android/data/dev.hackios.sweetvm/files/` and press refresh. The app
+`/sdcard/Android/data/dev.vmios.sweetvm/files/` and press refresh. The app
 copies imports from the system picker into that directory; the root image is
 large, so make sure the device has free space.
 

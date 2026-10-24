@@ -43,7 +43,7 @@ Each mount exposes the volume as `root/`. Run `stat` on
 ## 2. Copy the three volumes into one staging tree
 
 ```sh
-S=/opt/ios-sweet/staging
+S=/opt/vmios/staging
 rm -rf "$S"; mkdir -p "$S"
 rsync -aH --numeric-ids /mnt/apfs-os/root/  "$S/"
 mkdir -p "$S/private/preboot/Cryptexes/OS" "$S/private/preboot/Cryptexes/App"
@@ -65,7 +65,7 @@ The compact version used during bring-up:
 
 ```python
 import os
-root = "/opt/ios-sweet/staging"
+root = "/opt/vmios/staging"
 base = os.path.join(root, "private/preboot/Cryptexes")
 for c in ("OS", "App"):
     src_root = os.path.join(base, c)
@@ -103,7 +103,7 @@ first if it was touched by a VM.
 truncate -s 16G ios16-root.img
 mkfs.hfsplus -s -J -v iOSRoot ios16-root.img
 tar --numeric-owner --sparse -C "$S" -cf root.tar .
-printf 'run\nmount-options force /dev/sda /\ntar-in /opt/ios-sweet/root.tar /\nstatvfs /\n' \
+printf 'run\nmount-options force /dev/sda /\ntar-in /opt/vmios/root.tar /\nstatvfs /\n' \
     | guestfish -a ios16-root.img
 fsck.hfsplus -f -y ios16-root.img
 fsck.hfsplus -f -n ios16-root.img

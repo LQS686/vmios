@@ -1,4 +1,4 @@
-package dev.hackios.sweetvm;
+package dev.vmios.sweetvm;
 
 import java.io.ByteArrayOutputStream;
 import java.io.File;

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Install and exercise SweetVM on a connected phone, then report the numbers
+"""Install and exercise vmios on a connected phone, then report the numbers
 that matter for the stutter fix.
 
   python3 tools/sweetvm-device-test.py            # install, boot, measure
@@ -219,7 +219,7 @@ def main(argv=None):
 
     if not a.no_install:
         if a.reinstall:
-            run([adb, 'uninstall', 'dev.hackios.sweetvm'])
+            run([adb, 'uninstall', 'dev.vmios.sweetvm'])
         r = run([adb, 'install', '-r', '-g', a.apk], timeout=600)
         if r.returncode != 0:
             print(r.stdout + r.stderr, file=sys.stderr)
@@ -229,7 +229,7 @@ def main(argv=None):
         print('[*] installed', a.apk)
 
     for name in ('files/payload.bin', 'files/ios16-root.img'):
-        r = run([adb, 'shell', 'run-as', 'dev.hackios.sweetvm', 'ls', '-l', name])
+        r = run([adb, 'shell', 'run-as', 'dev.vmios.sweetvm', 'ls', '-l', name])
         if r.returncode != 0 or 'No such file' in r.stdout:
             print('[!] missing %s in app storage (push it first)' % name, file=sys.stderr)
             return 3
@@ -239,7 +239,7 @@ def main(argv=None):
     logf = open(os.path.join(a.out, 'logcat.txt'), 'w', encoding='utf-8', errors='replace')
     run([adb, 'logcat', '-c'])
     run([adb, 'shell', 'am', 'start', '-n',
-         'dev.hackios.sweetvm/.MainActivity'])
+         'dev.vmios.sweetvm/.MainActivity'])
 
     t0 = time.time()
     config_seen = False
@@ -305,14 +305,14 @@ def main(argv=None):
             print('[!] still capped near 12 fps - check the 高级选项 slider '
                   'and that the APK is the rebuilt one', file=sys.stderr)
     gfxinfo = os.path.join(a.out, 'gfxinfo.txt')
-    r = run([adb, 'shell', 'dumpsys', 'gfxinfo', 'dev.hackios.sweetvm',
+    r = run([adb, 'shell', 'dumpsys', 'gfxinfo', 'dev.vmios.sweetvm',
              'framestats'])
     with open(gfxinfo, 'w', encoding='utf-8', errors='replace') as f:
         f.write(r.stdout)
-    pull_guest_log(adb, 'dev.hackios.sweetvm', a.out)
+    pull_guest_log(adb, 'dev.vmios.sweetvm', a.out)
     print('[*] logs and screenshots in', a.out)
     if a.native_app_check:
-        return native_app_check(adb, 'dev.hackios.sweetvm', a.out)
+        return native_app_check(adb, 'dev.vmios.sweetvm', a.out)
     return 0
 
 
