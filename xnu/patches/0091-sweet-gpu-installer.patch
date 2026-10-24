@@ -1,0 +1,321 @@
+diff --git a/iokit/Kernel/arm/SweetGPU.cpp b/iokit/Kernel/arm/SweetGPU.cpp
+index 57eef20..07a9b31 100644
+--- a/iokit/Kernel/arm/SweetGPU.cpp
++++ b/iokit/Kernel/arm/SweetGPU.cpp
+@@ -12,6 +12,7 @@
+ #include <IOKit/IOLib.h>
+ #include <IOKit/IOKitKeys.h>
+ #include <kern/task.h>
++#include <pexpert/pexpert.h>
+ 
+ class SweetGPUUserClient;
+ class IOAcceleratorES;
+@@ -99,8 +100,15 @@ IOAcceleratorES::start(IOService *provider)
+ 		return false;
+ 	}
+ 	setProperty(kIOUserClientClassKey, "SweetGPUUserClient");
+-	setProperty("MetalPluginName", "AGXMetalA11");
+-	setProperty("MetalPluginClassName", "AGXA11Device");
++	int sweetmetal = 0;
++	if (PE_parse_boot_argn("sweetmetal", &sweetmetal, sizeof(sweetmetal)) &&
++	    sweetmetal != 0) {
++		setProperty("MetalPluginName", "SweetMetal");
++		setProperty("MetalPluginClassName", "SweetMetalDevice");
++	} else {
++		setProperty("MetalPluginName", "AGXMetalA11");
++		setProperty("MetalPluginClassName", "AGXA11Device");
++	}
+ 	setProperty("built-in", kOSBooleanTrue);
+ 	setProperty("IOGPUFamily", 1, 32);
+ 	registerService();
+diff --git a/iokit/Kernel/arm/SweetGPUInstaller.cpp b/iokit/Kernel/arm/SweetGPUInstaller.cpp
+new file mode 100644
+index 0000000..940017c
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetGPUInstaller.cpp
+@@ -0,0 +1,256 @@
++/*
++ * SweetGPUInstaller: installs a Metal plugin bundle into the guest root.
++ *
++ * The virtual GPU is a userland Metal plugin: Metal builds
++ * /System/Library/Extensions/<MetalPluginName>.bundle and instantiates the
++ * class named by MetalPluginClassName (see _getMetalPluginClassForService in
++ * Metal.framework). The guest root is only writable from inside the guest, so
++ * the ADT carries the bundle as an SGB1 blob and this driver writes it with
++ * the kernel's VFS once the root is mounted.
++ */
++#include <IOKit/IOService.h>
++#include <IOKit/IOLib.h>
++#include <kern/thread.h>
++#include <kern/clock.h>
++#include <libkern/libkern.h>
++#include <libkern/c++/OSData.h>
++#include <sys/errno.h>
++#include <sys/vnode.h>
++#include <sys/vnode_internal.h>
++#include <sys/namei.h>
++#include <sys/fcntl.h>
++#include <sys/uio.h>
++
++namespace {
++
++const char *
++data_string(OSData *data)
++{
++	return data ? static_cast<const char *>(data->getBytesNoCopy()) : nullptr;
++}
++
++errno_t
++sweet_mkdir(const char *path)
++{
++	struct nameidata nd;
++	struct vnode_attr va;
++	vnode_t vp;
++	errno_t error;
++
++	NDINIT(&nd, CREATE, OP_MKDIR, LOCKPARENT, UIO_SYSSPACE,
++	    (user_addr_t)(uintptr_t)path, vfs_context_kernel());
++	nd.ni_cnd.cn_flags |= WILLBEDIR;
++	error = namei(&nd);
++	if (error) {
++		return error;
++	}
++	vp = nd.ni_vp;
++	if (vp != NULLVP) {
++		vnode_put(vp);
++		nameidone(&nd);
++		vnode_put(nd.ni_dvp);
++		return EEXIST;
++	}
++	VATTR_INIT(&va);
++	VATTR_SET(&va, va_mode, 0755);
++	VATTR_SET(&va, va_type, VDIR);
++	error = vn_mkdir(nd.ni_dvp, &nd.ni_vp, &nd, &va, vfs_context_kernel());
++	if (nd.ni_vp != NULLVP) {
++		vnode_put(nd.ni_vp);
++	}
++	nameidone(&nd);
++	vnode_put(nd.ni_dvp);
++	return error;
++}
++
++errno_t
++sweet_mkdirs(const char *path)
++{
++	char buffer[512];
++	size_t length = strlcpy(buffer, path, sizeof(buffer));
++	if (length >= sizeof(buffer)) {
++		return ENAMETOOLONG;
++	}
++	for (char *p = buffer + 1; *p != 0; p++) {
++		if (*p != '/') {
++			continue;
++		}
++		*p = 0;
++		errno_t error = sweet_mkdir(buffer);
++		*p = '/';
++		if (error != 0 && error != EEXIST) {
++			return error;
++		}
++	}
++	errno_t error = sweet_mkdir(buffer);
++	return error == EEXIST ? 0 : error;
++}
++
++errno_t
++sweet_write(const char *path, const void *bytes, unsigned int size)
++{
++	vnode_t vp = NULLVP;
++	vfs_context_t ctx = vfs_context_kernel();
++	errno_t error = vnode_open(path, O_CREAT | O_TRUNC | FWRITE, 0644, 0, &vp, ctx);
++	if (error) {
++		return error;
++	}
++	if (size != 0) {
++		int residual = 0;
++		error = vn_rdwr(UIO_WRITE, vp, (caddr_t)(uintptr_t)bytes, (int)size, 0,
++		    UIO_SYSSPACE, IO_SYNC, vfs_context_ucred(ctx), &residual, NULL);
++		if (error == 0 && residual != 0) {
++			error = EIO;
++		}
++	}
++	vnode_close(vp, FWRITE, ctx);
++	return error;
++}
++
++bool
++unsafe_name(const char *name)
++{
++	for (const char *p = name; *p != 0; p++) {
++		if (p[0] == '.' && p[1] == '.' && (p[2] == '/' || p[2] == 0) &&
++		    (p == name || p[-1] == '/')) {
++			return true;
++		}
++	}
++	return name[0] == '/' || name[0] == 0;
++}
++
++errno_t
++sweet_install(const char *base, const unsigned char *blob, unsigned int length)
++{
++	if (length < 8 || memcmp(blob, "SGB1", 4) != 0) {
++		return EINVAL;
++	}
++	uint32_t count;
++	memcpy(&count, blob + 4, sizeof(count));
++	unsigned int offset = 8;
++	errno_t error = sweet_mkdirs(base);
++	if (error) {
++		return error;
++	}
++	for (uint32_t i = 0; i < count; i++) {
++		if (offset + 2 > length) {
++			return EINVAL;
++		}
++		uint16_t nameLength;
++		memcpy(&nameLength, blob + offset, sizeof(nameLength));
++		offset += 2;
++		if (nameLength == 0 || nameLength > 512 ||
++		    nameLength + 4 > length - offset) {
++			return EINVAL;
++		}
++		char name[513];
++		memcpy(name, blob + offset, nameLength);
++		name[nameLength] = 0;
++		offset += nameLength;
++		uint32_t size;
++		memcpy(&size, blob + offset, sizeof(size));
++		offset += 4;
++		if (size > length || offset > length - size || unsafe_name(name)) {
++			return EINVAL;
++		}
++		char path[1024];
++		if (snprintf(path, sizeof(path), "%s/%s", base, name) >= (int)sizeof(path)) {
++			return ENAMETOOLONG;
++		}
++		error = sweet_write(path, blob + offset, size);
++		IOLog("SWEET GPU: install %s (%u bytes) -> %d\n", path, size, error);
++		if (error) {
++			return error;
++		}
++		offset += size;
++	}
++	return 0;
++}
++
++} /* namespace */
++
++class SweetGPUInstaller : public IOService {
++	OSDeclareDefaultStructors(SweetGPUInstaller);
++
++	OSData *base = nullptr;
++	OSData *blob = nullptr;
++
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	void free() APPLE_KEXT_OVERRIDE;
++
++	const char *basePath() const { return data_string(base); }
++	const unsigned char *blobBytes() const {
++		return blob ? static_cast<const unsigned char *>(blob->getBytesNoCopy()) : nullptr;
++	}
++	unsigned int blobLength() const { return blob ? blob->getLength() : 0; }
++};
++
++OSDefineMetaClassAndStructors(SweetGPUInstaller, IOService);
++
++static void
++sweet_install_thread(void *arg, wait_result_t wait_result)
++{
++	SweetGPUInstaller *installer = static_cast<SweetGPUInstaller *>(arg);
++	vfs_context_t ctx = vfs_context_kernel();
++	vnode_t root = NULLVP;
++	bool mounted = false;
++
++	(void)wait_result;
++	/* IOKit matches before vfs_mountroot; wait for a resolvable "/". */
++	for (unsigned i = 0; i < 1200; i++) {
++		if (vnode_lookup("/", 0, &root, ctx) == 0) {
++			vnode_put(root);
++			mounted = true;
++			break;
++		}
++		IOSleep(250);
++	}
++	if (!mounted) {
++		IOLog("SWEET GPU: root never mounted, bundle not installed\n");
++		installer->release();
++		return;
++	}
++	errno_t error = sweet_install(installer->basePath(), installer->blobBytes(),
++	    installer->blobLength());
++	IOLog("SWEET GPU: bundle install %s (%d)\n", error ? "failed" : "done", error);
++	installer->release();
++}
++
++bool
++SweetGPUInstaller::start(IOService *provider)
++{
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	OSData *baseData = OSDynamicCast(OSData, provider->getProperty("base"));
++	OSData *blobData = OSDynamicCast(OSData, provider->getProperty("bundle"));
++	if (baseData == nullptr || blobData == nullptr || data_string(baseData) == nullptr) {
++		return false;
++	}
++	base = baseData;
++	blob = blobData;
++	base->retain();
++	blob->retain();
++	registerService();
++
++	thread_t thread = nullptr;
++	retain();
++	if (kernel_thread_start((thread_continue_t)sweet_install_thread, this,
++	    &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		release();
++		IOLog("SWEET GPU: could not start the bundle installer\n");
++	}
++	IOLog("SWEET GPU: installer armed, %u bytes\n", blob->getLength());
++	return true;
++}
++
++void
++SweetGPUInstaller::free()
++{
++	OSSafeReleaseNULL(base);
++	OSSafeReleaseNULL(blob);
++	IOService::free();
++}
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index 4b87b98..dce582f 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -93,6 +93,12 @@ const char * gIOKernelConfigTables =
+     "     'IONameMatch'     = 'virtio,mmio';"
+     "     'IOProbeScore'    = 10000:32;"
+     "   },"
++    "   {"
++    "     'IOClass'         = SweetGPUInstaller;"
++    "     'IOProviderClass' = IOPlatformDevice;"
++    "     'IONameMatch'     = 'sweet,gpu-install';"
++    "     'IOProbeScore'    = 10000:32;"
++    "   },"
+ #endif
+     "   {"
+     "     'IOClass'         = IOPanicPlatform;"
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index 66fae37..fbf7031 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -17,6 +17,7 @@ iokit/Kernel/arm/SweetSurface.cpp                                optional iokitc
+ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
+ iokit/Kernel/arm/SweetGPU.cpp                                  optional iokitcpp
+ iokit/Kernel/arm/SweetVirtioConsole.cpp                          optional iokitcpp
++iokit/Kernel/arm/SweetGPUInstaller.cpp                           optional iokitcpp
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp

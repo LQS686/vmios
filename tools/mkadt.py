@@ -78,7 +78,7 @@ def node(name, props=(), children=()):
 
 
 def build(seed=None, qemu=False, highmem=False, no_product=False, qemu_cpus=1,
-          fb_w=FB_W, fb_h=FB_H, display_scale=3, gpu_wire=False):
+          fb_w=FB_W, fb_h=FB_H, display_scale=3, gpu_wire=False, gpu_bundle=None):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py).
 
     no_product=True omits the real D22AP /product node (for redistributable
@@ -227,6 +227,19 @@ def build(seed=None, qemu=False, highmem=False, no_product=False, qemu_cpus=1,
         ('dma-coherent', b''),
     ])
 
+    # Metal plugin bundle for the virtual GPU. SweetGPUInstaller.cpp writes the
+    # SGB1 blob into the guest root once it is mounted; Metal then loads
+    # /System/Library/Extensions/SweetMetal.bundle for the IOAcceleratorES
+    # service when booting with sweetmetal=1.
+    gpu_install = None
+    if gpu_bundle:
+        gpu_install = node('sweet-gpu', [
+            ph(),
+            ('compatible', cstr('sweet,gpu-install')),
+            ('base', cstr('/System/Library/Extensions/SweetMetal.bundle')),
+            ('bundle', open(gpu_bundle, 'rb').read()),
+        ])
+
     # pmap_compute_max_asids requires the node even when no overrides are set.
     # An absent pmap-max-asids property selects XNU's own MAX_ASIDS default.
     # No effaceable storage: keybagd then reads /private/var/keybags/systembag.kb
@@ -262,7 +275,8 @@ def build(seed=None, qemu=False, highmem=False, no_product=False, qemu_cpus=1,
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
     ], [chosen, defaults, cpus, arm_io, fbcon, buttons, pram, ufs]
-        + ([virtio] if gpu_wire else []) + product)
+        + ([virtio] if gpu_wire else []) + ([gpu_install] if gpu_install else [])
+        + product)
 
 
 if __name__ == '__main__':
@@ -277,7 +291,9 @@ if __name__ == '__main__':
                  no_product='--no-product' in sys.argv, qemu_cpus=qemu_cpus,
                  fb_w=arg('--fb-width', FB_W), fb_h=arg('--fb-height', FB_H),
                  display_scale=arg('--display-scale', 3),
-                 gpu_wire='--gpu-wire' in sys.argv)
+                 gpu_wire='--gpu-wire' in sys.argv,
+                 gpu_bundle=(sys.argv[sys.argv.index('--gpu-bundle') + 1]
+                             if '--gpu-bundle' in sys.argv else None))
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:
