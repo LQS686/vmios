@@ -211,7 +211,7 @@ public final class VmEngine {
             // first virtio-mmio slot at 0x0a000000; the socket chardev connects
             // to GpuWireServer in this process. QEMU connects at startup, so
             // the server must be listening before the process is spawned.
-            GpuWireServer.start(5141);
+            GpuWireServer.start(5141, guestRam);
             cmd.add("-global"); cmd.add("virtio-mmio.force-legacy=false");
             cmd.add("-chardev"); cmd.add("socket,id=gpu_wire,host=127.0.0.1,port=5141");
             cmd.add("-device"); cmd.add("virtio-serial-device,bus=virtio-mmio-bus.0");

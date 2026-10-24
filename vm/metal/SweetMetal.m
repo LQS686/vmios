@@ -46,6 +46,10 @@ void *dispatch_get_global_queue(long identifier, unsigned long flags);
 unsigned long long dispatch_time(unsigned long long when, long long delta);
 void dispatch_after_f(unsigned long long when, void *queue, void *context,
     void (*work)(void *));
+unsigned int _dyld_image_count(void);
+const char *_dyld_get_image_name(unsigned int index);
+int getpid(void);
+const char *strstr(const char *haystack, const char *needle);
 
 /*
  * Metal's _MTLRegisterDevices accepts the plugin class only if it is a
@@ -213,6 +217,74 @@ sweet_probe_work(void *context)
 	sweet_probe_now("queue");
 }
 
+/*
+ * The panel is IOSurface id 1. Writing it proves the default-surface lookup
+ * and mapping work from a CA process; a nil lookup explains a frozen panel.
+ */
+static void
+sweet_probe_panel(void)
+{
+	void *ios = dlopen("/System/Library/Frameworks/IOSurface.framework/IOSurface", 2);
+	if (ios == 0) {
+		sweet_log("panel", "no IOSurface.framework");
+		return;
+	}
+	id (*lookup)(unsigned int) = (id (*)(unsigned int))dlsym(ios, "IOSurfaceLookup");
+	unsigned long (*get_width)(id) = (unsigned long (*)(id))dlsym(ios, "IOSurfaceGetWidth");
+	unsigned long (*get_height)(id) = (unsigned long (*)(id))dlsym(ios, "IOSurfaceGetHeight");
+	unsigned long (*get_bpr)(id) = (unsigned long (*)(id))dlsym(ios, "IOSurfaceGetBytesPerRow");
+	void *(*get_base)(id) = (void *(*)(id))dlsym(ios, "IOSurfaceGetBaseAddress");
+	int (*lock)(id, unsigned long, unsigned int *) =
+	    (int (*)(id, unsigned long, unsigned int *))dlsym(ios, "IOSurfaceLock");
+	int (*unlock)(id, unsigned long, unsigned int *) =
+	    (int (*)(id, unsigned long, unsigned int *))dlsym(ios, "IOSurfaceUnlock");
+
+	if (lookup == 0 || get_base == 0 || lock == 0 || unlock == 0) {
+		sweet_log("panel", "missing IOSurface symbols");
+		return;
+	}
+	id surface = lookup(1);
+	dprintf(console_fd, "SWEETMETAL: panel pid=%d surface=%p %lux%lu bpr=%lu\n",
+	    getpid(), surface, surface ? get_width(surface) : 0,
+	    surface ? get_height(surface) : 0, surface ? get_bpr(surface) : 0);
+	if (surface == 0) {
+		return;
+	}
+	unsigned int seed = 0;
+	if (lock(surface, 0, &seed) != 0) {
+		sweet_log("panel", "lock failed");
+		return;
+	}
+	unsigned char *base = (unsigned char *)get_base(surface);
+	unsigned long bpr = get_bpr(surface);
+	unsigned long width = get_width(surface);
+	unsigned long height = get_height(surface);
+	dprintf(console_fd, "SWEETMETAL: panel base=%p %lux%lu bpr=%lu\n",
+	    base, width, height, bpr);
+	unlock(surface, 0, &seed);
+}
+
+/* Which graphics stacks does this process actually have loaded? */
+static void
+sweet_probe_images(void *context)
+{
+	(void)context;
+	unsigned int count = _dyld_image_count();
+	dprintf(console_fd, "SWEETMETAL: images pid=%d count=%u\n", getpid(), count);
+	for (unsigned int i = 0; i < count; i++) {
+		const char *name = _dyld_get_image_name(i);
+		if (name == 0) {
+			continue;
+		}
+		if (strstr(name, "GL") || strstr(name, "AGX") ||
+		    strstr(name, "Metal") || strstr(name, "EAGL") ||
+		    strstr(name, "OpenGL") || strstr(name, "QuartzCore")) {
+			dprintf(console_fd, "SWEETMETAL: image[%u] %s\n", i, name);
+		}
+	}
+	sweet_probe_panel();
+}
+
 __attribute__((constructor))
 static void
 sweet_loaded(void)
@@ -226,6 +298,8 @@ sweet_loaded(void)
 	if (queue != 0) {
 		dispatch_after_f(dispatch_time(0, 4000000000LL), queue, 0,
 		    sweet_probe_work);
+		dispatch_after_f(dispatch_time(0, 60000000000LL), queue, 0,
+		    sweet_probe_images);
 	}
 }
 

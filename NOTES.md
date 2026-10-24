@@ -34,18 +34,29 @@
   encoder/opaque/function traps). Unknown selectors get a wide generic
   signature, log `SWEETMETAL: call <sel>`, and return zero. The ring reader is
   `tools/sweet-log.py artifacts/<name>.bin artifacts/<name>.txt`.
-- **Next blocker: no frame reaches the display.** After context init the guest
-  logs one `queue commandBuffer` and never a `buffer commit`; the IOMFB client
-  keeps swapping the software framebuffer (`SWEET FB: 22000 swaps` at 634 s)
-  and the panel still shows the kernel console, not the iOS UI. The Metal
-  context is set up but `CA::OGL::MetalContext::flush()` (the only caller of
-  `commit`/`commitAndWaitUntilSubmitted`/`waitUntilScheduled`) is never
-  reached. QuartzCore's display server created an `EAGLServer`, so the open
-  question is whether CA ever records a display frame at all in this
-  configuration or only uploads textures. Next: instrument the renderer
-  selection (EAGL vs Metal) and the IOMFB surface hand-off
-  (`SweetSurface`/`SWEET SURF` selectors), then turn recorded render/blit
-  commands into host GPU work over the `gpu_wire` protocol.
+- **Host GPU output to the guest panel works (M3a, measured).** The kernel's
+  `gpuwiretest=1` thread sends OP_CLEAR over the virtio wire; GpuWireServer
+  renders with EGL/GLES on the Adreno, reads the colour back, and paints a
+  red band plus a moving white bar straight into the guest panel surface
+  through the shared `guest-ram.bin` (guest PA 0x9c000000, QEMU RAM base
+  0x40000000, stride 4320). The phone shows the band over the console text
+  (`artifacts/m2-screen7.png`; host log `panel blit color=#ffff0000`).
+  Panel memory order is R,G,B,A, not B,G,R,A as the fourcc suggests.
+  The plugin can also `IOSurfaceLookup(1)` the panel from backboardd and
+  sees `1080x2400 bpr=4320`, so the default-surface port/mapping is fine.
+- **Next blocker: CA's Metal commands still don't reach that channel.**
+  After context init WindowServer encodes one batch and never calls
+  `CA::OGL::MetalContext::flush()`; the IOMFB swaps carry an empty layer
+  mask (`swap()`'s per-layer log never fires, though the 0x46c record
+  offsets were verified against IOMobileFramebuffer's `_kern_SwapEnd`).
+  chronod does submit full 423x423 frames through the traps, so the client
+  path works; the display compositor path is the open question. Userspace
+  has no kernel wire handle: the GPU user client (`SweetGPU.cpp`) must
+  forward a plugin command to `SweetVirtioConsole::send()` and expose the
+  target surface's physical address, which needs a kernel CI build.
+  `EAGLServer::renderer()` selects the Metal renderer when
+  `CAMetalContextCreate` succeeds (GL is only the fallback), and backboardd
+  has the full OpenGLES stack loaded, so both APIs are in play.
 
 ### >>> PREVIOUS: VIRTUAL GPU M0 PROVEN ON XIAOMI 14 PRO (2026-10-24) <<<
 
