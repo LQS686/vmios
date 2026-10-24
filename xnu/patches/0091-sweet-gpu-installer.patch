@@ -29,10 +29,10 @@ index 57eef20..f3e2903 100644
  	registerService();
 diff --git a/iokit/Kernel/arm/SweetGPUInstaller.cpp b/iokit/Kernel/arm/SweetGPUInstaller.cpp
 new file mode 100644
-index 0000000..641080c
+index 0000000..e6713cf
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetGPUInstaller.cpp
-@@ -0,0 +1,295 @@
+@@ -0,0 +1,325 @@
 +/*
 + * SweetGPUInstaller: installs a Metal plugin bundle into the guest root.
 + *
@@ -55,6 +55,7 @@ index 0000000..641080c
 +#include <libkern/c++/OSData.h>
 +#include <pexpert/pexpert.h>
 +#include <sys/errno.h>
++#include <sys/proc.h>
 +#include <sys/vnode.h>
 +#include <sys/fcntl.h>
 +#include <sys/uio.h>
@@ -70,10 +71,10 @@ index 0000000..641080c
 +}
 +
 +bool
-+sweet_exists(const char *path)
++sweet_exists(const char *path, vfs_context_t ctx)
 +{
 +	vnode_t vp = NULLVP;
-+	if (vnode_lookup(path, 0, &vp, vfs_context_kernel()) != 0) {
++	if (vnode_lookup(path, 0, &vp, ctx) != 0) {
 +		return false;
 +	}
 +	vnode_put(vp);
@@ -81,10 +82,9 @@ index 0000000..641080c
 +}
 +
 +errno_t
-+sweet_write(const char *path, const void *bytes, unsigned int size)
++sweet_write(const char *path, const void *bytes, unsigned int size, vfs_context_t ctx)
 +{
 +	vnode_t vp = NULLVP;
-+	vfs_context_t ctx = vfs_context_kernel();
 +	errno_t error = vnode_open(path, O_CREAT | O_TRUNC | FWRITE, 0644, 0, &vp, ctx);
 +	if (error) {
 +		return error;
@@ -102,10 +102,9 @@ index 0000000..641080c
 +}
 +
 +errno_t
-+sweet_read(const char *path, void *buffer, unsigned int capacity, unsigned int *size)
++sweet_read(const char *path, void *buffer, unsigned int capacity, unsigned int *size, vfs_context_t ctx)
 +{
 +	vnode_t vp = NULLVP;
-+	vfs_context_t ctx = vfs_context_kernel();
 +	errno_t error = vnode_open(path, O_RDONLY, 0, 0, &vp, ctx);
 +	*size = 0;
 +	if (error) {
@@ -123,13 +122,13 @@ index 0000000..641080c
 +
 +/* Keep the first original next to the file, so one boot can undo the install. */
 +errno_t
-+sweet_backup(const char *path)
++sweet_backup(const char *path, vfs_context_t ctx)
 +{
 +	char original[1024];
 +	if (snprintf(original, sizeof(original), "%s.orig", path) >= (int)sizeof(original)) {
 +		return ENAMETOOLONG;
 +	}
-+	if (sweet_exists(original)) {
++	if (sweet_exists(original, ctx)) {
 +		return 0;
 +	}
 +	void *buffer = IOMalloc(kMaxFileSize);
@@ -137,9 +136,9 @@ index 0000000..641080c
 +		return ENOMEM;
 +	}
 +	unsigned int size = 0;
-+	errno_t error = sweet_read(path, buffer, kMaxFileSize, &size);
++	errno_t error = sweet_read(path, buffer, kMaxFileSize, &size, ctx);
 +	if (error == 0) {
-+		error = sweet_write(original, buffer, size);
++		error = sweet_write(original, buffer, size, ctx);
 +	}
 +	IOLog("SWEET GPU: backup %s (%u bytes) -> %d\n", original, size, error);
 +	IOFree(buffer, kMaxFileSize);
@@ -159,12 +158,12 @@ index 0000000..641080c
 +}
 +
 +errno_t
-+sweet_install(const char *base, const unsigned char *blob, unsigned int length)
++sweet_install(const char *base, const unsigned char *blob, unsigned int length, vfs_context_t ctx)
 +{
 +	if (length < 8 || memcmp(blob, "SGB1", 4) != 0) {
 +		return EINVAL;
 +	}
-+	if (!sweet_exists(base)) {
++	if (!sweet_exists(base, ctx)) {
 +		return ENOENT;
 +	}
 +	uint32_t count;
@@ -197,12 +196,12 @@ index 0000000..641080c
 +		}
 +		errno_t error = 0;
 +		if (strcmp(name, "Info.plist") == 0) {
-+			error = sweet_backup(path);
++			error = sweet_backup(path, ctx);
 +			if (error) {
 +				return error;
 +			}
 +		}
-+		error = sweet_write(path, blob + offset, size);
++		error = sweet_write(path, blob + offset, size, ctx);
 +		IOLog("SWEET GPU: install %s (%u bytes) -> %d\n", path, size, error);
 +		if (error) {
 +			return error;
@@ -213,7 +212,7 @@ index 0000000..641080c
 +}
 +
 +errno_t
-+sweet_restore(const char *base)
++sweet_restore(const char *base, vfs_context_t ctx)
 +{
 +	char info[1024], original[1024];
 +	if (snprintf(info, sizeof(info), "%s/Info.plist", base) >= (int)sizeof(info) ||
@@ -226,9 +225,9 @@ index 0000000..641080c
 +		return ENOMEM;
 +	}
 +	unsigned int size = 0;
-+	errno_t error = sweet_read(original, buffer, kMaxFileSize, &size);
++	errno_t error = sweet_read(original, buffer, kMaxFileSize, &size, ctx);
 +	if (error == 0) {
-+		error = sweet_write(info, buffer, size);
++		error = sweet_write(info, buffer, size, ctx);
 +	}
 +	IOLog("SWEET GPU: restore %s (%u bytes) -> %d\n", info, size, error);
 +	IOFree(buffer, kMaxFileSize);
@@ -262,17 +261,46 @@ index 0000000..641080c
 +	SweetGPUInstaller *installer = static_cast<SweetGPUInstaller *>(arg);
 +	errno_t error = ENOENT;
 +	int restore = 0;
++	proc_t proc = nullptr;
++	vfs_context_t ctx = NULL;
 +
 +	(void)wait_result;
++	/*
++	 * namei() takes the caller proc's directories lock; a bare kernel thread
++	 * runs as kernproc, whose lock is non-sleepable and panics with
++	 * preemption enabled. Use PID 1's context instead, as a syscall would.
++	 */
++	for (unsigned i = 0; i < 600; i++) {
++		proc = proc_find(1);
++		if (proc != nullptr) {
++			break;
++		}
++		IOSleep(500);
++	}
++	if (proc == nullptr) {
++		IOLog("SWEET GPU: PID 1 never appeared\n");
++		installer->release();
++		return;
++	}
++	ctx = vfs_context_create_with_proc(proc);
++	if (ctx == NULL) {
++		IOLog("SWEET GPU: no vfs context\n");
++		proc_rele(proc);
++		installer->release();
++		return;
++	}
++
 +	if (PE_parse_boot_argn("sweetmetal_restore", &restore, sizeof(restore)) && restore) {
 +		for (unsigned i = 0; i < 600; i++) {
-+			error = sweet_restore(installer->basePath());
++			error = sweet_restore(installer->basePath(), ctx);
 +			if (error == 0) {
 +				break;
 +			}
 +			IOSleep(1000);
 +		}
 +		IOLog("SWEET GPU: restore %s (%d)\n", error ? "failed" : "done", error);
++		vfs_context_rele(ctx);
++		proc_rele(proc);
 +		installer->release();
 +		return;
 +	}
@@ -280,13 +308,15 @@ index 0000000..641080c
 +	/* IOKit matches before vfs_mountroot; retry until the root is writable. */
 +	for (unsigned i = 0; i < 600; i++) {
 +		error = sweet_install(installer->basePath(), installer->blobBytes(),
-+		    installer->blobLength());
++		    installer->blobLength(), ctx);
 +		if (error == 0) {
 +			break;
 +		}
 +		IOSleep(1000);
 +	}
 +	IOLog("SWEET GPU: bundle install %s (%d)\n", error ? "failed" : "done", error);
++	vfs_context_rele(ctx);
++	proc_rele(proc);
 +	installer->release();
 +}
 +
