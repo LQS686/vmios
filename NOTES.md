@@ -66,16 +66,19 @@
   clears (`fill surface 7 color=#000000` for chronod). Kernel CI pitfalls
   fixed on the way: 0092 must be based on post-0091 SweetGPU.cpp, and a
   literal newline inside the IOLog string breaks the C++ compile.
-- **Next blocker: CA's Metal commands still don't reach that channel.**
+- **Known limit:** IOSurface buffers from `sweet_surface_create` are
+  physically segmented (chronod's 423x423 surface starts at 0xd0d14000 with
+  a 0x4000 first segment), so the one-PA fill is refused
+  (`result 0xe00002d7`) for everything except the panel, which is a single
+  physical range. A scatter/gather wire message (32+ segments) is the next
+  step if CA surfaces must be filled.
+- **Next blocker: the WindowServer compositor never draws its display.**
   After context init WindowServer encodes one batch and never calls
   `CA::OGL::MetalContext::flush()`; the IOMFB swaps carry an empty layer
   mask (`swap()`'s per-layer log never fires, though the 0x46c record
   offsets were verified against IOMobileFramebuffer's `_kern_SwapEnd`).
   chronod does submit full 423x423 frames through the traps, so the client
-  path works; the display compositor path is the open question. Userspace
-  has no kernel wire handle: the GPU user client (`SweetGPU.cpp`) must
-  forward a plugin command to `SweetVirtioConsole::send()` and expose the
-  target surface's physical address, which needs a kernel CI build.
+  path works; the display compositor path is the open question.
   `EAGLServer::renderer()` selects the Metal renderer when
   `CAMetalContextCreate` succeeds (GL is only the fallback), and backboardd
   has the full OpenGLES stack loaded, so both APIs are in play.
