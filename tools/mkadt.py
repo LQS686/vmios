@@ -78,7 +78,8 @@ def node(name, props=(), children=()):
 
 
 def build(seed=None, qemu=False, highmem=False, no_product=False, qemu_cpus=1,
-          fb_w=FB_W, fb_h=FB_H, display_scale=3, gpu_wire=False, gpu_bundle=None):
+          fb_w=FB_W, fb_h=FB_H, canvas_w=None, canvas_h=None,
+          display_scale=3, gpu_wire=False, gpu_bundle=None):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py).
 
     no_product=True omits the real D22AP /product node (for redistributable
@@ -87,6 +88,10 @@ def build(seed=None, qemu=False, highmem=False, no_product=False, qemu_cpus=1,
     phone's Aff1 numbering.  The SWEET kernel starts every CPU in this tree,
     so N must match QEMU's -smp."""
     phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
+    if canvas_w is None:
+        canvas_w = fb_w
+    if canvas_h is None:
+        canvas_h = fb_h
     # Carve the panic log off the top so the kernel never allocates over it.
     panic_base = phys_base + mem_size - PANIC_LOG_SIZE
     mem_size -= PANIC_LOG_SIZE
@@ -198,8 +203,8 @@ def build(seed=None, qemu=False, highmem=False, no_product=False, qemu_cpus=1,
             ph(),
             ('device_type', cstr('display-subsystem')),
             ('compatible', cstr('sweet,display')),
-            ('canvas-width', u32(fb_w)),
-            ('canvas-height', u32(fb_h)),
+            ('canvas-width', u32(canvas_w)),
+            ('canvas-height', u32(canvas_h)),
         ])])
 
     fbcon = node('sweet-fbcon', [
@@ -290,6 +295,8 @@ if __name__ == '__main__':
     root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv,
                  no_product='--no-product' in sys.argv, qemu_cpus=qemu_cpus,
                  fb_w=arg('--fb-width', FB_W), fb_h=arg('--fb-height', FB_H),
+                 canvas_w=arg('--canvas-width', None),
+                 canvas_h=arg('--canvas-height', None),
                  display_scale=arg('--display-scale', 3),
                  gpu_wire='--gpu-wire' in sys.argv,
                  gpu_bundle=(sys.argv[sys.argv.index('--gpu-bundle') + 1]

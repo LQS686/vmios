@@ -38,13 +38,84 @@ are the local boot inputs. Local checkout directory is still
 `E:\桌面\hackios` (the `E:\hackios` junction and `sdk.dir` depend on it);
 the repository and app identity are vmios.
 
-**Next concrete action:** boot the same payload under the PC QEMU, attach the
-QEMU gdbstub, and break on `CA::WindowServer::IOMFBServer::timer_callback`
-and `CA::OGL::MetalContext::flush` to find what gates rendering, instead of
-inferring from logs. Static targets already decompiled: `thread_body`
-(null timer only), `add_vsync_source` (CADisplayTimer path is chosen),
-`timer_callback`, `Display::render_display`, `DisplayLink::
-update_paused_locked`.
+**CORRECTION (2026-10-25): the local QEMU runs never got past
+`sweet_keys_init`.** `tools/sweet-log.py` decodes the whole 4 MiB ring, but
+only the first `total` bytes belong to the current boot; everything after is
+stale content from earlier phone boots (SpringBoard stacks, 2000 swaps,
+iOS daemons). The m3m payload's boot-args had no `sweetkeys=0`, so
+`sweet_keys_init` mapped the phone PMIC at 0xc440000 and its first read,
+`ldr w8,[x8]` at `sweet_keys_init+0xac`, was an external data abort
+(FAR 0xffffffe34f67ec000). QEMU then sat in the panic debugger trap
+(`handle_debugger_trap`, printing over serial); the panel showed that panic,
+not iOS. Fixes: `tools/bootargs.py` VM profile now has `sweetkeys=0`
+(QEMU has no PM6150L), the image's log area is zeroed before local boots,
+and the payload is built with `cpus=1` to match `-smp 1`.
+New local payload: `.tools/gputest/payload-local-m3n.bin`
+(md5 888d95447cd43dd0e67bf9d0e8553cc5, same m3m.adt with the display probe).
+Treat a ring as current-boot-only up to `meta["total"]`.
+
+**LOCAL QEMU BOOT WORKS (2026-10-25, measured).** With `rd=ufsroot0` in the
+payload cmdline (the Android app adds it itself, the launcher did not), the
+guest boots for real: t=30.4 s `SWEET UFS: "userdata" on LUN 0 ... 16384 MiB`,
+`BSD root: ufsroot0`, launchd at t=30.9 s, dyld shared cache mapped, all iOS
+daemons spawn, and the log ring flushes (`.tools/gputest/payload-local-m3q.bin`,
+md5 9c55b5a523d7564629bad7d06de4c24d, m3m.adt, console deliberately NOT muted
+so the panel shows kernel printf). `cpus=1` matches `-smp 1`. This also proved
+the earlier "local boot" evidence was stale phone data: read only
+`meta["total"]` bytes of the ring.
+
+**Display state now measured in-guest.** backboardd (pid 55) loads SweetMetal
+at t=54.8 s and CA's EAGLServer renderer initializes (queues, pipelines,
+supportsFamily...). IOMFB sequence: `display on` t=67.595 -> SwapBegin/SwapEnd
+(0x46c) t=67.79 -> `display off` t=67.795; `display on` again t=111.53. From
+then on backboardd calls SwapEnd ~30x/s with mask 0 (first record after the
+second on: mask=0x80000007, layer 0 id 0); the plugin records **zero**
+`presentDrawable`, `drawPrimitives`, `setRenderPipelineState` calls - CA's
+compositor never encodes a draw, so `finish_update` has no primary surface
+(`IOMFBDisplay::finish_update` only calls swap_set_layer for layers 0 when the
+update carries one, and always clears layers 1/2 with NULL). QuartzCore slide
+in that boot: 0x38fec000 (base 0x1c1270000), from the plugin's probe.
+
+**XNU version audit (2026-10-25, user asked).** Userland is iOS **16.7.16
+(20H392, iPhone10,3/10,6)** (`research/ipsw-x/BuildManifest.plist`); the kernel
+is **xnu-8796.141.3 / Darwin 22.6.0** (`research/xnu/xnu-xnu-8796.141.3`,
+CI base macOS 13.5, blacktop/darwin-xnu-build pinned SHA). Both are the same
+Darwin 22.6 / xnu-8796 generation; the same kernel+userland reached
+SpringBoard/Setup on the phone and backboardd+all daemons on the PC, with no
+kernel/userland ABI panic. The local kernel matches CI `SHA256SUMS`
+(d3179592...c9a0f) and contains the newest patches' fingerprints
+(`installer armed for %s`, `SWEET GPU: fill surface`, `SWEET FB: rec mask`,
+`SWEET UFS: statistics`). Decision: keep 8796.141.3 + patches 0001-0096.
+
+**Current display root-cause hypothesis (m3r experiment, running).** The ADT
+`disp0` canvas was 1080x2400 while iOS builds its display mode from the
+iPhone X presented size (1125x2436, kernel fLogicalW/H). CA's
+`fetch_current_iomfb_mode` compares IOMobileFramebufferGetCanvasSizes against
+its mode list; with no match it has no current mode, and
+`IOMFBDisplay::current_page_surface` returns NULL (pipe at
+`[display+0xf4...]`/`+0x3b0` empty or allocate_surface fails), so
+`render_display` never encodes a draw and `finish_update` swaps an empty
+record (mask 0). `mkadt.py` now has `--canvas-width/--canvas-height`; the m3r
+ADT uses canvas 1125x2436 with the panel still 1080x2400, and the payload adds
+`sweethidtest=10` (Home press every 10 s) to keep the display awake. Waiting
+for the ring: expect `SWEET FB: swap ... layer 0 surface N 1125x2436` lines
+(0094 logs them only for real ids) or a new `current_page_surface` failure.
+Next static anchors: `Display::allocate_surface` 0x18837622c,
+`IOMFBDisplay::fetch_current_iomfb_mode` 0x1883a7828,
+`update_display_modes` 0x188530570, vtable slot +0x1c8 =
+`IOMFBDisplay::update_surface`.
+
+**Next concrete action:** read the m3r ring after boot; if canvas was the
+gate, implement 1125x2436->1080x2400 scaling in the kernel present path
+(currently it clips top-left). If not, inspect the GetBlock(sel 79) block id
+and contents CA expects (1580-byte block at t=54 s) and implement it in
+SweetFramebuffer.
+
+**Earlier static findings kept:** `thread_body` only runs a null timer;
+`add_vsync_source` chooses the CADisplayTimer path; `IOMFBServer` never
+registers IOMFB notifications (no selector-72 call in the ring). Static targets
+already decompiled: `timer_callback`, `Display::render_display`,
+`DisplayLink::update_paused_locked`.
 
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - historical notes
 

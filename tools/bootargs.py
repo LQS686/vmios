@@ -87,6 +87,10 @@ VM = " ".join([
     # "Ticket spinlock timeout" panic. 2 s is enough to ride out the stall.
     "tlto_us=2000000",
     "slto_us=2000000",
+    # QEMU virt has no PM6150L: sweet_keys_init's first PMIC read at
+    # 0xc440000 is an external abort that panics the kernel (seen on the
+    # m3m payload). Keys only exist on the phone.
+    "sweetkeys=0",
 ])
 
 PROFILES = {

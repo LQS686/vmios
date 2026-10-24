@@ -31,6 +31,9 @@ BOOL sel_isEqual(SEL a, SEL b);
 void _objc_msgForward(void);
 int strcmp(const char *a, const char *b);
 void free(void *ptr);
+void *malloc(unsigned long size);
+void *memcpy(void *dst, const void *src, unsigned long n);
+void bzero(void *dst, unsigned long n);
 SEL sel_registerName(const char *name);
 const char *sel_getName(SEL sel);
 const char *protocol_getName(id protocol);
@@ -48,6 +51,7 @@ unsigned long long dispatch_time(unsigned long long when, long long delta);
 void dispatch_after_f(unsigned long long when, void *queue, void *context,
     void (*work)(void *));
 unsigned int _dyld_image_count(void);
+const void *_dyld_get_image_header(unsigned int index);
 const char *_dyld_get_image_name(unsigned int index);
 int getpid(void);
 char *strstr(const char *haystack, const char *needle);
@@ -361,6 +365,85 @@ sweet_probe_ui(void)
 }
 
 
+/* Does the WindowServer exist here, and which surface does IOMFB hand out? */
+static void
+sweet_probe_display(void)
+{
+	Class ws_class = objc_getClass("CAWindowServer");
+	id server = 0;
+	if (ws_class != 0 &&
+	    ((BOOL (*)(id, SEL, SEL))objc_msgSend)((id)ws_class,
+	    sel_registerName("respondsToSelector:"),
+	    sel_registerName("serverIfExisting"))) {
+		server = ((id (*)(id, SEL))objc_msgSend)((id)ws_class,
+		    sel_registerName("serverIfExisting"));
+	}
+	dprintf(console_fd, "SWEETMETAL: display pid=%d server=%p\n",
+	    getpid(), server);
+	if (server != 0) {
+		id displays = sweet_msg_id(server, "displays");
+		unsigned long count = displays != 0 ?
+		    sweet_msg_ul(displays, "count") : 0;
+		dprintf(console_fd, "SWEETMETAL: display count=%lu\n", count);
+		for (unsigned long i = 0; i < count && i < 4; i++) {
+			id display = sweet_msg_id_idx(displays, "objectAtIndex:", i);
+			id name = display != 0 ?
+			    sweet_msg_id(display, "name") : 0;
+			unsigned long flags = display != 0 ?
+			    sweet_msg_ul(display, "rendererFlags") : 0;
+			dprintf(console_fd,
+			    "SWEETMETAL: display[%lu] %s name=%s flags=0x%lx\n",
+			    i, display != 0 ?
+			    object_getClassName(display) : "(nil)",
+			    sweet_cstr(name), flags);
+		}
+	}
+
+	void *mf = dlopen("/System/Library/Frameworks/IOMobileFramebuffer.framework/IOMobileFramebuffer", 2);
+	void *ios = dlopen("/System/Library/Frameworks/IOSurface.framework/IOSurface", 2);
+	if (mf == 0) {
+		return;
+	}
+	int (*open_fb)(unsigned int, unsigned int, unsigned long,
+	    unsigned int *) = (int (*)(unsigned int, unsigned int,
+	    unsigned long, unsigned int *))dlsym(mf, "IOMobileFramebufferOpen");
+	int (*get_surface)(unsigned int, int, id *) = (int (*)(unsigned int,
+	    int, id *))dlsym(mf, "IOMobileFramebufferGetLayerDefaultSurface");
+	unsigned int service = IOServiceGetMatchingService(0,
+	    IOServiceMatching("IOMobileFramebuffer"));
+	unsigned int conn = 0;
+	int kr = -1;
+	if (service != 0 && open_fb != 0) {
+		kr = open_fb(service, mach_task_self(), 0, &conn);
+	}
+	id surface = 0;
+	int gr = -1;
+	if (kr == 0 && get_surface != 0) {
+		gr = get_surface(conn, 0, &surface);
+	}
+	unsigned int surface_id = 0, width = 0, height = 0, bpr = 0;
+	if (surface != 0 && ios != 0) {
+		unsigned int (*get_id)(id) =
+		    (unsigned int (*)(id))dlsym(ios, "IOSurfaceGetID");
+		unsigned long (*get_w)(id) =
+		    (unsigned long (*)(id))dlsym(ios, "IOSurfaceGetWidth");
+		unsigned long (*get_h)(id) =
+		    (unsigned long (*)(id))dlsym(ios, "IOSurfaceGetHeight");
+		unsigned long (*get_b)(id) =
+		    (unsigned long (*)(id))dlsym(ios, "IOSurfaceGetBytesPerRow");
+		surface_id = get_id != 0 ? get_id(surface) : 0;
+		width = get_w != 0 ? (unsigned int)get_w(surface) : 0;
+		height = get_h != 0 ? (unsigned int)get_h(surface) : 0;
+		bpr = get_b != 0 ? (unsigned int)get_b(surface) : 0;
+	}
+	dprintf(console_fd,
+	    "SWEETMETAL: iomfb svc=%u open=0x%x conn=%u get=0x%x surface=%p id=%u %ux%u bpr=%u\n",
+	    service, kr, conn, gr, surface, surface_id, width, height, bpr);
+	if (service != 0) {
+		IOObjectRelease(service);
+	}
+}
+
 /* Which graphics stacks does this process actually have loaded? */
 static void
 sweet_probe_images(void *context)
@@ -378,9 +461,16 @@ sweet_probe_images(void *context)
 		    strstr(name, "OpenGL") || strstr(name, "QuartzCore")) {
 			dprintf(console_fd, "SWEETMETAL: image[%u] %s\n", i, name);
 		}
+		if (strstr(name, "QuartzCore.framework/QuartzCore")) {
+			unsigned long base = (unsigned long)_dyld_get_image_header(i);
+			dprintf(console_fd,
+			    "SWEETMETAL: quartzcore base=0x%lx slide=0x%lx\n",
+			    base, base - 0x188284000UL);
+		}
 	}
 	sweet_probe_panel();
 	sweet_probe_ui();
+	sweet_probe_display();
 }
 
 __attribute__((constructor))
@@ -529,6 +619,8 @@ __attribute__((objc_root_class))
     reflection:(id *)reflection error:(id *)error;
 @end
 
+static id sweet_pipeline_named(id name);
+
 @implementation SweetOpaque
 
 - (id)newFunctionWithName:(id)name
@@ -560,13 +652,13 @@ __attribute__((objc_root_class))
 {
 	dprintf(console_fd, "SWEETMETAL: library newRenderPipelineStateWithName %s\n",
 	    sweet_cstr(name));
-	return [[SweetOpaque alloc] init];
+	return sweet_pipeline_named(name);
 }
 
 - (id)newRenderPipelineStateWithFunction:(id)function error:(id *)error
 {
 	sweet_log("library", "newRenderPipelineStateWithFunction:error:");
-	return [[SweetOpaque alloc] init];
+	return sweet_pipeline_named(0);
 }
 
 - (id)newComputePipelineStateWithFunction:(id)function error:(id *)error
@@ -656,6 +748,126 @@ __attribute__((objc_root_class))
 
 @end
 
+/* Real storage for CA's vertex/index buffers: the kernel will copyin these
+ * user addresses when a draw reaches the GPU service. */
+@interface SweetBuffer : SweetOpaque {
+	void *buf_ptr;
+	unsigned long buf_len;
+}
+- (id)initWithLength:(unsigned long)length;
+- (id)initWithBytes:(const void *)bytes length:(unsigned long)length;
+@end
+
+@implementation SweetBuffer
+
+- (id)initWithLength:(unsigned long)length
+{
+	buf_len = length ? length : 1;
+	buf_ptr = malloc(buf_len);
+	if (buf_ptr != 0) {
+		bzero(buf_ptr, buf_len);
+	}
+	return self;
+}
+
+- (id)initWithBytes:(const void *)bytes length:(unsigned long)length
+{
+	buf_len = length ? length : 1;
+	buf_ptr = malloc(buf_len);
+	if (buf_ptr != 0) {
+		if (bytes != 0) {
+			memcpy(buf_ptr, bytes, length);
+		} else {
+			bzero(buf_ptr, buf_len);
+		}
+	}
+	return self;
+}
+
+- (void *)contents
+{
+	return buf_ptr;
+}
+
+- (unsigned long)length
+{
+	return buf_len;
+}
+
+@end
+
+/* Pipeline state with the function/library name, so a draw can be decoded. */
+@interface SweetPipeline : SweetOpaque {
+	char pipe_name[96];
+}
+- (void)setNameC:(const char *)name;
+@end
+
+@implementation SweetPipeline
+
+- (void)setNameC:(const char *)name
+{
+	unsigned long i = 0;
+	if (name != 0) {
+		while (name[i] != 0 && i + 1 < sizeof(pipe_name)) {
+			pipe_name[i] = name[i];
+			i++;
+		}
+	}
+	pipe_name[i] = 0;
+}
+
+- (const char *)nameC
+{
+	return pipe_name;
+}
+
+@end
+
+static id
+sweet_pipeline_from_descriptor(id descriptor)
+{
+	SweetPipeline *state = [[SweetPipeline alloc] init];
+	const char *name = "-";
+	if (descriptor != 0) {
+		id vertex = sweet_msg_id(descriptor, "vertexFunction");
+		if (vertex != 0) {
+			id fnname = sweet_msg_id(vertex, "name");
+			if (fnname != 0) {
+				name = sweet_cstr(fnname);
+			}
+		}
+	}
+	((void (*)(id, SEL, const char *))objc_msgSend)(state,
+	    sel_registerName("setNameC:"), name);
+	return state;
+}
+
+static id
+sweet_pipeline_named(id name)
+{
+	SweetPipeline *state = [[SweetPipeline alloc] init];
+	((void (*)(id, SEL, const char *))objc_msgSend)(state,
+	    sel_registerName("setNameC:"), sweet_cstr(name));
+	return state;
+}
+
+static void
+sweet_hex32(const char *tag, unsigned int index, const void *pointer)
+{
+	const unsigned char *p = (const unsigned char *)pointer;
+	if (p == 0) {
+		return;
+	}
+	dprintf(console_fd, "SWEETMETAL:   %s[%u] %02x%02x%02x%02x %02x%02x%02x%02x"
+	    " %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x"
+	    " %02x%02x%02x%02x %02x%02x%02x%02x\n", tag, index,
+	    p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7],
+	    p[8], p[9], p[10], p[11], p[12], p[13], p[14], p[15],
+	    p[16], p[17], p[18], p[19], p[20], p[21], p[22], p[23],
+	    p[24], p[25], p[26], p[27], p[28], p[29], p[30], p[31]);
+}
+
 /* Texture backed by an IOSurface; keeps the id for the clear forwarder. */
 @interface SweetTexture : SweetOpaque {
 	unsigned int tex_surface;
@@ -679,6 +891,159 @@ __attribute__((objc_root_class))
 @end
 
 #define SWEET_OBJECT() [[SweetOpaque alloc] init]
+
+static unsigned int sweet_encoder_logs;
+static unsigned int sweet_draw_logs;
+
+/* Render encoder: records the destination surface and the draw inputs so the
+ * kernel/host can later replay CA's compositor draws with real content. */
+@interface SweetRenderEncoder : SweetObject {
+	unsigned int enc_surface;
+	id enc_pipeline;
+	id enc_vb[8];
+	unsigned long enc_vboff[8];
+	id enc_vtex[8];
+	id enc_tex[8];
+	id enc_ib;
+	unsigned long enc_iboff;
+}
+- (id)initWithSurface:(unsigned int)surface;
+- (void)setRenderPipelineState:(id)pipeline;
+- (void)setVertexBuffer:(id)buffer offset:(unsigned long)offset
+    atIndex:(unsigned long)index;
+- (void)setFragmentTexture:(id)texture atIndex:(unsigned long)index;
+- (void)setVertexTexture:(id)texture atIndex:(unsigned long)index;
+- (void)drawIndexedPrimitives:(unsigned long)type indexCount:(unsigned long)count
+    indexType:(unsigned long)index_type indexBuffer:(id)index_buffer
+    indexBufferOffset:(unsigned long)index_offset
+    instanceCount:(unsigned long)instances;
+- (void)drawPrimitives:(unsigned long)type vertexStart:(unsigned long)start
+    vertexCount:(unsigned long)count;
+- (void)endEncoding;
+@end
+
+@implementation SweetRenderEncoder
+
+- (id)initWithSurface:(unsigned int)surface
+{
+	enc_surface = surface;
+	return self;
+}
+
+- (void)setRenderPipelineState:(id)pipeline
+{
+	enc_pipeline = pipeline;
+}
+
+- (void)setVertexBuffer:(id)buffer offset:(unsigned long)offset
+    atIndex:(unsigned long)index
+{
+	if (index < 8) {
+		enc_vb[index] = buffer;
+		enc_vboff[index] = offset;
+	}
+}
+
+- (void)setFragmentTexture:(id)texture atIndex:(unsigned long)index
+{
+	if (index < 8) {
+		enc_tex[index] = texture;
+	}
+}
+
+- (void)setVertexTexture:(id)texture atIndex:(unsigned long)index
+{
+	if (index < 8) {
+		enc_vtex[index] = texture;
+	}
+}
+
+static unsigned int
+sweet_texture_surface(id texture)
+{
+	if (texture == 0) {
+		return 0;
+	}
+	if (!((BOOL (*)(id, SEL, Class))objc_msgSend)(texture,
+	    sel_registerName("isKindOfClass:"), objc_getClass("SweetTexture"))) {
+		return 0;
+	}
+	return ((unsigned int (*)(id, SEL))objc_msgSend)(texture,
+	    sel_registerName("surfaceID"));
+}
+
+- (void)drawIndexedPrimitives:(unsigned long)type indexCount:(unsigned long)count
+    indexType:(unsigned long)index_type indexBuffer:(id)index_buffer
+    indexBufferOffset:(unsigned long)index_offset
+    instanceCount:(unsigned long)instances
+{
+	enc_ib = index_buffer;
+	enc_iboff = index_offset;
+	if (sweet_draw_logs < 12 || (sweet_draw_logs % 60) == 0) {
+		const char *pipeline = "(none)";
+		if (enc_pipeline != 0 && ((BOOL (*)(id, SEL, Class))objc_msgSend)(
+		    enc_pipeline, sel_registerName("isKindOfClass:"),
+		    objc_getClass("SweetPipeline"))) {
+			pipeline = ((const char *(*)(id, SEL))objc_msgSend)(
+			    enc_pipeline, sel_registerName("nameC"));
+		}
+		dprintf(console_fd,
+		    "SWEETMETAL: draw pid=%d dest=%u pipe=%s prim=%lu count=%lu"
+		    " itype=%lu inst=%lu ib=%p+%lu\n", getpid(), enc_surface,
+		    pipeline, type, count, index_type, instances, index_buffer,
+		    index_offset);
+		for (unsigned int i = 0; i < 8; i++) {
+			if (enc_vb[i] != 0) {
+				void *contents = (void *)((void *(*)(id, SEL))objc_msgSend)(
+				    enc_vb[i], sel_registerName("contents"));
+				unsigned long length = ((unsigned long (*)(id, SEL))objc_msgSend)(
+				    enc_vb[i], sel_registerName("length"));
+				dprintf(console_fd,
+				    "SWEETMETAL:   vb[%u]=%p+%lu len=%lu\n", i,
+				    contents, enc_vboff[i], length);
+				sweet_hex32("vbytes", i,
+				    (const char *)contents + (enc_vboff[i] < length ? enc_vboff[i] : 0));
+			}
+			if (enc_tex[i] != 0) {
+				dprintf(console_fd, "SWEETMETAL:   tex[%u]=surface %u\n",
+				    i, sweet_texture_surface(enc_tex[i]));
+			}
+			if (enc_vtex[i] != 0) {
+				dprintf(console_fd, "SWEETMETAL:   vtex[%u]=surface %u\n",
+				    i, sweet_texture_surface(enc_vtex[i]));
+			}
+		}
+		if (index_buffer != 0) {
+			void *contents = (void *)((void *(*)(id, SEL))objc_msgSend)(
+			    index_buffer, sel_registerName("contents"));
+			unsigned long length = ((unsigned long (*)(id, SEL))objc_msgSend)(
+			    index_buffer, sel_registerName("length"));
+			dprintf(console_fd, "SWEETMETAL:   ib=%p+%lu len=%lu\n",
+			    contents, index_offset, length);
+			sweet_hex32("ibytes", 0,
+			    (const char *)contents + (index_offset < length ? index_offset : 0));
+		}
+		sweet_draw_logs++;
+	}
+}
+
+- (void)drawPrimitives:(unsigned long)type vertexStart:(unsigned long)start
+    vertexCount:(unsigned long)count
+{
+	if (sweet_draw_logs < 12) {
+		dprintf(console_fd,
+		    "SWEETMETAL: draw pid=%d dest=%u prim=%lu vstart=%lu count=%lu\n",
+		    getpid(), enc_surface, type, start, count);
+		sweet_draw_logs++;
+	}
+}
+
+- (void)endEncoding
+{
+	sweet_log("encoder", "endEncoding");
+}
+
+@end
 
 @interface SweetCommandBuffer : SweetObject {
 	unsigned int pending_surface[8];
@@ -747,7 +1112,8 @@ __attribute__((objc_root_class))
 - (id)renderCommandEncoderWithDescriptor:(id)descriptor
 {
 	sweet_log("buffer", "renderCommandEncoderWithDescriptor");
-	if (descriptor != 0 && pending_count < 8) {
+	unsigned int surface = 0;
+	if (descriptor != 0) {
 		id attachments = sweet_msg_id(descriptor, "colorAttachments");
 		id attachment = attachments != 0 ?
 		    sweet_msg_id_idx(attachments, "objectAtIndexedSubscript:", 0) : 0;
@@ -757,23 +1123,37 @@ __attribute__((objc_root_class))
 		id texture = attachment != 0 ? sweet_msg_id(attachment, "texture") : 0;
 		unsigned long action = attachment != 0 ?
 		    sweet_msg_ul(attachment, "loadAction") : 0;
-		if (texture != 0 && action == 2 &&
+		if (texture != 0 &&
 		    ((BOOL (*)(id, SEL, Class))objc_msgSend)(texture,
 		    sel_registerName("isKindOfClass:"), objc_getClass("SweetTexture"))) {
-			typedef struct { double red, green, blue, alpha; } ClearColor;
-			ClearColor color = ((ClearColor (*)(id, SEL))objc_msgSend)(
-			    attachment, sel_registerName("clearColor"));
-			pending_surface[pending_count] =
-			    ((unsigned int (*)(id, SEL))objc_msgSend)(texture,
+			surface = ((unsigned int (*)(id, SEL))objc_msgSend)(texture,
 			    sel_registerName("surfaceID"));
-			pending_color[pending_count] =
-			    (sweet_channel(color.red) << 16) |
-			    (sweet_channel(color.green) << 8) |
-			    sweet_channel(color.blue);
-			pending_count++;
+			double red = 0, green = 0, blue = 0, alpha = 0;
+			if (action == 2) {
+				typedef struct { double red, green, blue, alpha; } ClearColor;
+				ClearColor color = ((ClearColor (*)(id, SEL))objc_msgSend)(
+				    attachment, sel_registerName("clearColor"));
+				red = color.red; green = color.green;
+				blue = color.blue; alpha = color.alpha;
+				if (pending_count < 8) {
+					pending_surface[pending_count] = surface;
+					pending_color[pending_count] =
+					    (sweet_channel(red) << 16) |
+					    (sweet_channel(green) << 8) |
+					    sweet_channel(blue);
+					pending_count++;
+				}
+			}
+			if (sweet_encoder_logs < 24) {
+				sweet_encoder_logs++;
+				dprintf(console_fd,
+				    "SWEETMETAL: pass pid=%d dest=%u action=%lu"
+				    " clear=%.3f,%.3f,%.3f,%.3f\n", getpid(),
+				    surface, action, red, green, blue, alpha);
+			}
 		}
 	}
-	return [[SweetCommandEncoder alloc] init];
+	return [[SweetRenderEncoder alloc] initWithSurface:surface];
 }
 
 - (id)blitCommandEncoder
@@ -1024,7 +1404,7 @@ __attribute__((objc_root_class))
     options:(unsigned long)options error:(id *)error
 {
 	sweet_log("msg", "newRenderPipelineStateWithDescriptor:options:error:");
-	return [[SweetOpaque alloc] init];
+	return sweet_pipeline_from_descriptor(descriptor);
 }
 
 - (id)newComputePipelineStateWithFunction:(id)function error:(id *)error
@@ -1057,7 +1437,7 @@ __attribute__((objc_root_class))
     options:(unsigned long)options reflection:(id *)reflection error:(id *)error
 {
 	sweet_log("msg", "newRenderPipelineStateWithDescriptor:options:reflection:error:");
-	return [[SweetOpaque alloc] init];
+	return sweet_pipeline_from_descriptor(descriptor);
 }
 
 - (id)newTextureWithDescriptor:(id)descriptor iosurface:(id)surface plane:(unsigned long)plane
@@ -1078,7 +1458,7 @@ __attribute__((objc_root_class))
 {
 	sweet_log("msg", "newBufferWithLength:options:");
 	dprintf(console_fd, "SWEETMETAL:   length=%lu options=%lu\n", length, options);
-	return [[SweetOpaque alloc] init];
+	return [[SweetBuffer alloc] initWithLength:length];
 }
 
 - (id)newBufferWithBytes:(const void *)bytes length:(unsigned long)length
@@ -1087,7 +1467,7 @@ __attribute__((objc_root_class))
 	sweet_log("msg", "newBufferWithBytes:length:options:");
 	dprintf(console_fd, "SWEETMETAL:   bytes=%p length=%lu options=%lu\n",
 	    bytes, length, options);
-	return [[SweetOpaque alloc] init];
+	return [[SweetBuffer alloc] initWithBytes:bytes length:length];
 }
 
 - (id)newTextureWithDescriptor:(id)descriptor
@@ -1105,7 +1485,7 @@ __attribute__((objc_root_class))
 - (id)newRenderPipelineStateWithDescriptor:(id)descriptor error:(id *)error
 {
 	sweet_log("msg", "newRenderPipelineStateWithDescriptor:error:");
-	return [[SweetOpaque alloc] init];
+	return sweet_pipeline_from_descriptor(descriptor);
 }
 
 - (id)newDepthStencilStateWithDescriptor:(id)descriptor
