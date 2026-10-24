@@ -1,0 +1,136 @@
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetGPU.cpp
+@@ -0,0 +1,109 @@
++/*
++ * M0 virtual GPU discovery stub.
++ *
++ * Metal.framework matches an IOAcceleratorES service, reads
++ * MetalPluginName/MetalPluginClassName and loads AGXMetalA11. IOGPU then
++ * opens the service and passes the connection as the accelerator port. This
++ * driver publishes those properties and logs every user-client selector so
++ * the real command ABI can be implemented from observed calls.
++ */
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOLib.h>
++#include <IOKit/IOKitKeys.h>
++#include <kern/task.h>
++
++class SweetGPUUserClient;
++class IOAcceleratorES;
++
++class SweetGPUUserClient : public IOUserClient {
++	OSDeclareDefaultStructors(SweetGPUUserClient);
++
++	task_t fTask;
++
++public:
++	bool initWithTask(task_t owningTask, void *securityID, UInt32 type) APPLE_KEXT_OVERRIDE;
++	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++	    IOExternalMethodDispatch *dispatch, OSObject *target,
++	    void *reference) APPLE_KEXT_OVERRIDE;
++	IOReturn registerNotificationPort(mach_port_t port, UInt32 type,
++	    io_user_reference_t refCon) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(SweetGPUUserClient, IOUserClient);
++
++static uint64_t sweet_gpu_logged;
++
++bool
++SweetGPUUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type)
++{
++	if (!IOUserClient::initWithTask(owningTask, securityID, type)) {
++		return false;
++	}
++	fTask = owningTask;
++	return true;
++}
++
++IOReturn
++SweetGPUUserClient::clientClose(void)
++{
++	terminate();
++	return kIOReturnSuccess;
++}
++
++IOReturn
++SweetGPUUserClient::registerNotificationPort(mach_port_t port, UInt32 type,
++    io_user_reference_t refCon)
++{
++	IOLog("SWEET GPU: notification port type=%u port=%u ref=%llu\n", type,
++	    (unsigned)port, (unsigned long long)refCon);
++	return kIOReturnSuccess;
++}
++
++IOReturn
++SweetGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++    IOExternalMethodDispatch *dispatch, OSObject *target, void *reference)
++{
++	if (args == NULL) {
++		return kIOReturnBadArgument;
++	}
++	if (selector < 64 && !(sweet_gpu_logged & (1ULL << selector))) {
++		sweet_gpu_logged |= 1ULL << selector;
++		IOLog("SWEET GPU: sel=%u scalar-in=%u scalar-out=%u struct-in=%u struct-out=%u\n",
++		    selector, args->scalarInputCount, args->scalarOutputCount,
++		    args->structureInputSize, args->structureOutputSize);
++	}
++	for (uint32_t i = 0; i < args->scalarOutputCount; i++) {
++		args->scalarOutput[i] = 0;
++	}
++	if (args->structureOutput != NULL) {
++		bzero(args->structureOutput, args->structureOutputSize);
++	}
++	return kIOReturnSuccess;
++}
++
++class IOAcceleratorES : public IOService {
++	OSDeclareDefaultStructors(IOAcceleratorES);
++
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
++
++bool
++IOAcceleratorES::start(IOService *provider)
++{
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	setProperty(kIOUserClientClassKey, "SweetGPUUserClient");
++	setProperty("MetalPluginName", "AGXMetalA11");
++	setProperty("MetalPluginClassName", "AGXA11Device");
++	setProperty("built-in", kOSBooleanTrue);
++	setProperty("IOGPUFamily", 1, 32);
++	registerService();
++	IOLog("SWEET GPU: IOAcceleratorES registered\n");
++	return true;
++}
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -15,6 +15,7 @@
+ iokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitcpp
+ iokit/Kernel/arm/SweetSurface.cpp                                optional iokitcpp
+ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
++iokit/Kernel/arm/SweetGPU.cpp                                  optional iokitcpp
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -82,6 +82,11 @@
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = SweetBattery;"
+     "   },"
++    "   {"
++    "     'IOClass'         = IOAcceleratorES;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = IOAcceleratorES;"
++    "   },"
+ #endif
+     "   {"
+     "     'IOClass'         = IOPanicPlatform;"
