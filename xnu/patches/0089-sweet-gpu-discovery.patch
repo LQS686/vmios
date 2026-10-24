@@ -59,8 +59,8 @@
 +SweetGPUUserClient::registerNotificationPort(mach_port_t port, UInt32 type,
 +    io_user_reference_t refCon)
 +{
-+	IOLog("SWEET GPU: notification port type=%u port=%u ref=%llu\n", type,
-+	    (unsigned)port, (unsigned long long)refCon);
++	IOLog("SWEET GPU: notification port type=%u ref=%llu\n", type,
++	    (unsigned long long)refCon);
 +	return kIOReturnSuccess;
 +}
 +
