@@ -27,6 +27,17 @@ blocker is CoreAnimation's WindowServer: SpringBoard has a real window tree
 (wallpaper + root scene), but WindowServer submits swaps with layer id 0 and
 never runs its Metal render pass (details below under "Next blocker").
 
+**PC debugging environment (verified present):** WSL has the patched
+QEMU 8.2.0 with the SWEET devices at
+`/opt/qemu/build/qemu-system-aarch64` (`-device sweet-ufs`,
+`sweet-fb`, `sweet-touch`; source tree `/opt/qemu`). The staged Android
+engines come from `/opt/qemu/build-android3` (arm64) and
+`/opt/qemu/build-android-x643` (x86_64); the two older build trees were
+deleted. The 16 GiB `.tools/ios16-root.img` and `tools/qemu-sweet.py`
+are the local boot inputs. Local checkout directory is still
+`E:\桌面\hackios` (the `E:\hackios` junction and `sdk.dir` depend on it);
+the repository and app identity are vmios.
+
 **Next concrete action:** boot the same payload under the PC QEMU, attach the
 QEMU gdbstub, and break on `CA::WindowServer::IOMFBServer::timer_callback`
 and `CA::OGL::MetalContext::flush` to find what gates rendering, instead of
