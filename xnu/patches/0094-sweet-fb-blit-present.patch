@@ -1,0 +1,86 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -494,6 +494,83 @@
+ 		}
+ 		s->release();
+ 	}
++	/* swap_set_blit records: count at 0x38b, 6 entries of 0x24 bytes at 0x38f. */
++	uint32_t blits = get32(rec, 0x38b);
++	if (blits > 6) {
++		blits = 6;
++	}
++	for (uint32_t i = 0; i < blits; i++) {
++		const uint8_t *e = rec + 0x38f + i * 0x24;
++		uint32_t id = get32(e, 0);
++		int32_t bx = (int32_t)get32(e, 4), by = (int32_t)get32(e, 8);
++		int32_t bw = (int32_t)get32(e, 12), bh = (int32_t)get32(e, 16);
++		int32_t dx = (int32_t)get32(e, 20), dy = (int32_t)get32(e, 24);
++		int32_t w = (int32_t)get32(e, 28), h = (int32_t)get32(e, 32);
++		SweetSurface *s = id != 0 ? sweet_surface_copy(id) : NULL;
++		if (sweet_fb_blits_logged < 16) {
++			sweet_fb_blits_logged++;
++			IOLog("SWEET FB: blit %u surface %u %ux%u src %d,%d %dx%d dst %d,%d %dx%d\n",
++			    get32(rec, 0x50), id, s ? s->width : 0, s ? s->height : 0,
++			    bx, by, bw, bh, dx, dy, w, h);
++		}
++		if (s == NULL || s == fSurface) {
++			OSSafeReleaseNULL(s);
++			continue;
++		}
++		uintptr_t src = s->kernelAddress();
++		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
++		if (bw <= 0 || bh <= 0) {
++			bw = (int32_t)s->width - bx;
++			bh = (int32_t)s->height - by;
++		}
++		if (w <= 0 || h <= 0) {
++			w = bw;
++			h = bh;
++		}
++		if (bx < 0 || by < 0) {
++			dx -= bx;
++			dy -= by;
++			w += bx;
++			h += by;
++			bw += bx;
++			bh += by;
++			bx = by = 0;
++		}
++		if (dx < 0 || dy < 0) {
++			bx -= dx;
++			by -= dy;
++			w += dx;
++			h += dy;
++			dx = dy = 0;
++		}
++		if (w > (int32_t)s->width - bx) {
++			w = (int32_t)s->width - bx;
++		}
++		if (h > (int32_t)s->height - by) {
++			h = (int32_t)s->height - by;
++		}
++		if (w > (int32_t)fWidth - dx) {
++			w = (int32_t)fWidth - dx;
++		}
++		if (h > (int32_t)fHeight - dy) {
++			h = (int32_t)fHeight - dy;
++		}
++		uint64_t last = (uint64_t)s->offset + (uint64_t)(by + h - 1) * s->bytesPerRow +
++		    (uint64_t)(bx + w) * 4;
++		if (w <= 0 || h <= 0 || s->elementWidth != 1 || s->elementHeight != 1 ||
++		    s->memory == NULL || last > s->memory->getLength()) {
++			src = 0;
++		}
++		if (src != 0 && bpe == 4) {
++			for (int32_t y = 0; y < h; y++) {
++				memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
++				    (const void *)(src + s->offset + (uint64_t)(by + y) * s->bytesPerRow + (uint64_t)bx * 4),
++				    (size_t)w * 4);
++			}
++		}
++		s->release();
++	}
++
+ 	if (fOffload != NULL) {
+ 		fOffload->submitted = ++fOffloadSeq;
+ 		__sync_synchronize();
