@@ -49,7 +49,16 @@ void dispatch_after_f(unsigned long long when, void *queue, void *context,
 unsigned int _dyld_image_count(void);
 const char *_dyld_get_image_name(unsigned int index);
 int getpid(void);
-const char *strstr(const char *haystack, const char *needle);
+char *strstr(const char *haystack, const char *needle);
+int IOConnectCallStructMethod(unsigned int connection, unsigned int selector,
+    const void *input, unsigned long inputSize, void *output,
+    unsigned long *outputSize);
+void *IOServiceMatching(const char *name);
+unsigned int IOServiceGetMatchingService(unsigned int mainPort, void *matching);
+int IOServiceOpen(unsigned int service, unsigned int owningTask,
+    unsigned int type, unsigned int *connection);
+int IOObjectRelease(unsigned int object);
+unsigned int mach_task_self(void);
 
 /*
  * Metal's _MTLRegisterDevices accepts the plugin class only if it is a
@@ -86,6 +95,51 @@ __attribute__((objc_root_class))
 
 static int console_fd = -1;
 static id sweet_device_self;
+static unsigned int sweet_accel_port;
+static unsigned sweet_fill_logs;
+
+static unsigned int
+sweet_iosurface_id(id surface)
+{
+	static unsigned int (*get_id)(id);
+	if (get_id == 0) {
+		void *ios = dlopen("/System/Library/Frameworks/IOSurface.framework/IOSurface", 2);
+		if (ios != 0) {
+			get_id = (unsigned int (*)(id))dlsym(ios, "IOSurfaceGetID");
+		}
+	}
+	return get_id != 0 && surface != 0 ? get_id(surface) : 0;
+}
+
+/* Open our own IOAcceleratorES user client; the Metal port dies at registration. */
+static unsigned int
+sweet_open_gpu_service(void)
+{
+	void *matching = IOServiceMatching("IOAcceleratorES");
+	if (matching == 0) {
+		return 0;
+	}
+	unsigned int service = IOServiceGetMatchingService(0, matching);
+	if (service == 0) {
+		return 0;
+	}
+	unsigned int connection = 0;
+	int result = IOServiceOpen(service, mach_task_self(), 0, &connection);
+	IOObjectRelease(service);
+	return result == 0 ? connection : 0;
+}
+
+static unsigned int
+sweet_channel(double value)
+{
+	if (value <= 0.0) {
+		return 0;
+	}
+	if (value >= 1.0) {
+		return 255;
+	}
+	return (unsigned int)(value * 255.0 + 0.5);
+}
 
 static void
 sweet_log(const char *what, const char *sel)
@@ -558,23 +612,77 @@ __attribute__((objc_root_class))
 
 @end
 
+/* Texture backed by an IOSurface; keeps the id for the clear forwarder. */
+@interface SweetTexture : SweetOpaque {
+	unsigned int tex_surface;
+}
+- (void)setSurfaceID:(unsigned int)identifier;
+- (unsigned int)surfaceID;
+@end
+
+@implementation SweetTexture
+
+- (void)setSurfaceID:(unsigned int)identifier
+{
+	tex_surface = identifier;
+}
+
+- (unsigned int)surfaceID
+{
+	return tex_surface;
+}
+
+@end
+
 #define SWEET_OBJECT() [[SweetOpaque alloc] init]
 
-@interface SweetCommandBuffer : SweetObject
+@interface SweetCommandBuffer : SweetObject {
+	unsigned int pending_surface[8];
+	unsigned int pending_color[8];
+	int pending_count;
+}
 - (void)commit;
+- (void)commitAndWaitUntilSubmitted;
 - (void)enqueue;
 - (void)presentDrawable:(id)drawable;
 - (void)waitUntilCompleted;
 - (id)renderCommandEncoderWithDescriptor:(id)descriptor;
 - (id)blitCommandEncoder;
 - (id)computeCommandEncoder;
+- (void)flushFills;
 @end
 
 @implementation SweetCommandBuffer
 
+- (void)flushFills
+{
+	for (int i = 0; i < pending_count; i++) {
+		unsigned int request[6] = {
+			pending_surface[i], pending_color[i], 0, 0, 0, 0
+		};
+		unsigned long output_size = 0;
+		int result = IOConnectCallStructMethod(sweet_accel_port, 0x100,
+		    request, sizeof(request), 0, &output_size);
+		if (sweet_fill_logs < 12) {
+			sweet_fill_logs++;
+			dprintf(console_fd,
+			    "SWEETMETAL: fill surface %u color=#%06x -> 0x%x\n",
+			    pending_surface[i], pending_color[i], result);
+		}
+	}
+	pending_count = 0;
+}
+
 - (void)commit
 {
 	sweet_log("buffer", "commit");
+	[self flushFills];
+}
+
+- (void)commitAndWaitUntilSubmitted
+{
+	sweet_log("buffer", "commitAndWaitUntilSubmitted");
+	[self flushFills];
 }
 
 - (void)enqueue
@@ -595,6 +703,32 @@ __attribute__((objc_root_class))
 - (id)renderCommandEncoderWithDescriptor:(id)descriptor
 {
 	sweet_log("buffer", "renderCommandEncoderWithDescriptor");
+	if (descriptor != 0 && pending_count < 8) {
+		id attachments = sweet_msg_id(descriptor, "colorAttachments");
+		id attachment = attachments != 0 ?
+		    sweet_msg_id_idx(attachments, "objectAtIndexedSubscript:", 0) : 0;
+		if (attachment == 0 && attachments != 0) {
+			attachment = sweet_msg_id_idx(attachments, "objectAtIndex:", 0);
+		}
+		id texture = attachment != 0 ? sweet_msg_id(attachment, "texture") : 0;
+		unsigned long action = attachment != 0 ?
+		    sweet_msg_ul(attachment, "loadAction") : 0;
+		if (texture != 0 && action == 2 &&
+		    ((BOOL (*)(id, SEL, Class))objc_msgSend)(texture,
+		    sel_registerName("isKindOfClass:"), objc_getClass("SweetTexture"))) {
+			typedef struct { double red, green, blue, alpha; } ClearColor;
+			ClearColor color = ((ClearColor (*)(id, SEL))objc_msgSend)(
+			    attachment, sel_registerName("clearColor"));
+			pending_surface[pending_count] =
+			    ((unsigned int (*)(id, SEL))objc_msgSend)(texture,
+			    sel_registerName("surfaceID"));
+			pending_color[pending_count] =
+			    (sweet_channel(color.red) << 16) |
+			    (sweet_channel(color.green) << 8) |
+			    sweet_channel(color.blue);
+			pending_count++;
+		}
+	}
 	return [[SweetCommandEncoder alloc] init];
 }
 
@@ -656,6 +790,11 @@ __attribute__((objc_root_class))
 		dprintf(console_fd, "SWEETMETAL: port=%u self=%p\n", port, self);
 	}
 	sweet_device_self = self;
+	sweet_accel_port = sweet_open_gpu_service();
+	if (console_fd >= 0) {
+		dprintf(console_fd, "SWEETMETAL: accel port %u -> own %u\n",
+		    port, sweet_accel_port);
+	}
 	return self;
 }
 
@@ -879,8 +1018,16 @@ __attribute__((objc_root_class))
 
 - (id)newTextureWithDescriptor:(id)descriptor iosurface:(id)surface plane:(unsigned long)plane
 {
-	sweet_log("msg", "newTextureWithDescriptor:iosurface:plane:");
-	return [[SweetOpaque alloc] init];
+	SweetTexture *texture = [[SweetTexture alloc] init];
+	unsigned int identifier = sweet_iosurface_id(surface);
+	((void (*)(id, SEL, unsigned int))objc_msgSend)(texture,
+	    sel_registerName("setSurfaceID:"), identifier);
+	if (sweet_fill_logs < 12) {
+		dprintf(console_fd,
+		    "SWEETMETAL: texture from iosurface id=%u plane=%lu\n",
+		    identifier, plane);
+	}
+	return texture;
 }
 
 - (id)newBufferWithLength:(unsigned long)length options:(unsigned long)options

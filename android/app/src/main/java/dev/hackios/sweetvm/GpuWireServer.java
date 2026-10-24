@@ -26,6 +26,7 @@ public final class GpuWireServer {
     private static final int VERSION = 1;
     private static final int OP_CLEAR = 1;
     private static final int OP_DRAW = 2;
+    private static final int OP_FILL = 3;
     private static final int RESPONSE = 0x8000;
     private static final int WIDTH = 64;
     private static final int HEIGHT = 64;
@@ -106,8 +107,13 @@ public final class GpuWireServer {
             if (magic != MAGIC || version != VERSION || bytes < 0 || bytes > 4096) {
                 return;
             }
+            byte[] payload = new byte[bytes];
             if (bytes > 0) {
-                in.readFully(new byte[bytes]);
+                in.readFully(payload);
+            }
+            if (operation == OP_FILL) {
+                fillSurface(payload, request);
+                continue;
             }
             if (operation != OP_CLEAR && operation != OP_DRAW) {
                 return;
@@ -139,6 +145,58 @@ public final class GpuWireServer {
             }
             out.write(reply.array());
             out.flush();
+        }
+    }
+
+    private static RandomAccessFile panelFile;
+
+    private static synchronized RandomAccessFile panelFile() throws Exception {
+        if (panelFile == null) {
+            panelFile = new RandomAccessFile(guestRam, "rw");
+        }
+        return panelFile;
+    }
+
+    /*
+     * OP_FILL: paint a rectangle of a guest IOSurface (the render pass clear
+     * the plugin asked for) directly in the guest's RAM.
+     */
+    private static void fillSurface(byte[] payload, int request) {
+        if (payload.length < 32 || guestRam == null) {
+            return;
+        }
+        ByteBuffer b = ByteBuffer.wrap(payload).order(ByteOrder.LITTLE_ENDIAN);
+        long pa = (b.getInt(0) & 0xffffffffL) | ((long) b.getInt(4) << 32);
+        int width = b.getInt(8);
+        int height = b.getInt(12);
+        int stride = b.getInt(16);
+        int color = b.getInt(20);
+        int x = b.getInt(24);
+        int y = b.getInt(28);
+        long off = pa - RAM_PA;
+        if (off < 0 || width <= 0 || height <= 0 || stride < width * 4) {
+            Log.w(TAG, "fill rejected pa=0x" + Long.toHexString(pa) + " " + width
+                    + "x" + height + " stride=" + stride);
+            return;
+        }
+        byte[] row = new byte[width * 4];
+        for (int i = 0; i < width; i++) {
+            row[i * 4] = (byte) (color >> 16);
+            row[i * 4 + 1] = (byte) (color >> 8);
+            row[i * 4 + 2] = (byte) color;
+            row[i * 4 + 3] = (byte) 0xff;
+        }
+        try {
+            RandomAccessFile f = panelFile();
+            long base = off + (long) y * stride + (long) x * 4;
+            for (int yy = 0; yy < height; yy++) {
+                f.seek(base + (long) yy * stride);
+                f.write(row);
+            }
+            Log.i(TAG, "fill request=" + request + " pa=0x" + Long.toHexString(pa)
+                    + " " + width + "x" + height + " color=#" + Integer.toHexString(color));
+        } catch (Exception e) {
+            Log.w(TAG, "fill failed", e);
         }
     }
 

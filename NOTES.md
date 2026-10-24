@@ -44,6 +44,22 @@
   Panel memory order is R,G,B,A, not B,G,R,A as the fourcc suggests.
   The plugin can also `IOSurfaceLookup(1)` the panel from backboardd and
   sees `1080x2400 bpr=4320`, so the default-surface port/mapping is fine.
+- **Guest userspace -> kernel GPU channel works.** `initWithAcceleratorPort:`'s
+  port returns `MACH_SEND_INVALID_DEST` (0x10000003) after registration, so
+  the plugin opens its own `IOAcceleratorES` user client with
+  `IOServiceOpen`. On the 0091 kernel it sends selector 0x100 (fill surface
+  {id, colour, x, y, w, h}) from `commitAndWaitUntilSubmitted` for render
+  passes whose colour attachment is `LoadActionClear` on an IOSurface-backed
+  texture: measured `fill surface 7 color=#000000 -> 0x0` for chronod's
+  423x423 frames (ring m3-ring3).
+  `xnu/patches/0092-sweet-gpu-wire-forward.patch` adds the kernel half:
+  SweetGPU resolves the surface's physical address and forwards an OP_FILL
+  (header + {pa, w, h, stride, colour, x, y}) through
+  `sweet_gpu_wire_send()` in SweetVirtioConsole; GpuWireServer paints that
+  rectangle into the guest RAM file. CI run 40094328768 built but
+  **skipped 0092** (context conflict with 0091 in SweetGPU.cpp); the
+  rebased patch is committed (521ef7b) and verified with `git apply
+  --check`, waiting for the next push/CI when github.com is reachable.
 - **Next blocker: CA's Metal commands still don't reach that channel.**
   After context init WindowServer encodes one batch and never calls
   `CA::OGL::MetalContext::flush()`; the IOMFB swaps carry an empty layer
