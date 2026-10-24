@@ -109,16 +109,37 @@ initialization block (or bailed inside it). The plugin now reports
 maxTextureDimension2D 16384 / 3D 2048 / cube 16384 / array 2048 and real
 texture width/height/pixelFormat, but the context field stayed 0.
 
-**Next concrete action:** find which constructor/init path creates the
-display renderer's MetalContext (the fully initialized one from
-`new_metal_context` may be a different object) and why +0xa18/+0xa20 stay 0
-- e.g. break at 0x18848871c and 0x188488728 during boot to see whether they
-are reached at all - then either make the fake device feed the value that
-path reads, or add an in-process shim. Only after get_surface succeeds will
-`Renderer::render` run and the compositor emit Metal draws for surfaces 5/6;
-those draws are then the real work for the virtual GPU (replay/translate
-into the drawable). chronod's own draws into surfaces 7/8 are captured and
-prove the plugin sees client render passes.
+**Compositor shaders recovered (2026-10-25).** The display draws are the
+QuartzCore uber-shaders `fixed_vert_lph_spc` + `fixed_frag_lph_cpf`, loaded
+from `/System/Library/Frameworks/QuartzCore.framework/default.metallib`
+(1,014,944 bytes, MTLB v1.2). The plugin dumped the file as hex to the guest
+console at library load; the host rebuilt it as `research/ca-metallib.bin`
+(Apple artifact, keep out of git). Upstream `llvm-dis` 18 rejects the Apple
+AIR ("Invalid encoding"), so the interface was read from the bitcode metadata
+strings: vertex inputs `position` (float4) plus optional `point_size`,
+`texcoord0/1A/1B` gated by function constants (`vtx_attr_has_texcoords`,
+`vtx_attr_has_point_size`, `fc_vertex_layout`, `fc_texcoord_count0/1`,
+`fc_has_texture_matrix`, `fc_has_chroma_matrix`); vertex buffers include
+`mvp_matrix` (float4x4), `texture_matrix`, `chroma_matrix`, `fc_generic`;
+fragment config is `CA::OGL::Metal::FragmentShaderConfig` (image descriptors,
+`texture_function`, `blend_function`, `destination_function`, attachments
+0..2, color params, sampler). Observed display draws at runtime: dest=5,
+triangle list with 6 indices, positions/texcoords in buffers bound via
+`setVertexBufferOffset:atIndex:`, constant config via
+`setFragmentBufferOffset:atIndex:` (now captured), source textures are the
+CPU uploads (glyph atlases 552x358 fmt=1 and 763x79 fmt=1, gradient strips
+256x1 fmt=115, icon 32x32 fmt=80). Both vertex and fragment SPIs are now
+recorded in SweetMetal.
+
+**Next concrete action:** run one more capture with the fragment-offset SPI
+to read the real config buffer (texture/blend functions, color, matrices),
+decode the `fc_vertex_layout`/`fc_texcoord_count*` specialization used by
+these draws, and implement a quad compositor for that specialization (CPU
+rasterizer in the plugin using IOSurface CPU mappings, or a kernel-side
+rasterizer) so dest=5 receives the real composited scene instead of only the
+clear. Then the existing swap -> panel path will show the actual iOS UI.
+The metallib + bitcode blobs are in `research/` for further metadata work
+(`research/fixed_vert_lph_spc.bc`, `research/fixed_frag_lph_cpf.bc`).
 
 **Earlier static findings kept:** `thread_body` only runs a null timer;
 `add_vsync_source` chooses the CADisplayTimer path; the sampler stack shows

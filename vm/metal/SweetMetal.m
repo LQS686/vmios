@@ -39,7 +39,10 @@ const char *sel_getName(SEL sel);
 const char *protocol_getName(id protocol);
 id objc_msgSend(id self, SEL op, ...);
 int open(const char *path, int flags, ...);
+int read(int fd, void *buf, unsigned long count);
+int close(int fd);
 int dprintf(int fd, const char *format, ...);
+int snprintf(char *str, unsigned long size, const char *format, ...);
 int strncmp(const char *a, const char *b, unsigned long n);
 void *dlopen(const char *path, int mode);
 void *dlsym(void *handle, const char *name);
@@ -100,6 +103,7 @@ __attribute__((objc_root_class))
 
 static int console_fd = -1;
 static id sweet_device_self;
+static char sweet_lib_path[256];
 static unsigned int sweet_accel_port;
 static unsigned sweet_fill_logs;
 
@@ -220,6 +224,22 @@ sweet_zero_return(id invocation)
 		    sel_registerName("setReturnValue:"), zero);
 	}
 }
+
+static int
+sweet_lib_path_is(const char *p)
+{
+	unsigned long i = 0;
+	if (p == 0) {
+		return 0;
+	}
+	while (p[i] != 0 && i + 1 < sizeof(sweet_lib_path)) {
+		sweet_lib_path[i] = p[i];
+		i++;
+	}
+	sweet_lib_path[i] = 0;
+	return 1;
+}
+
 
 static void
 sweet_probe_now(const char *how)
@@ -868,17 +888,51 @@ sweet_hex32(const char *tag, unsigned int index, const void *pointer)
 	    p[24], p[25], p[26], p[27], p[28], p[29], p[30], p[31]);
 }
 
+static void
+sweet_hex64(const char *tag, unsigned int index, const void *pointer)
+{
+	const unsigned char *p = (const unsigned char *)pointer;
+	if (p == 0) {
+		return;
+	}
+	dprintf(console_fd, "SWEETMETAL:   %s%u", tag, index);
+	for (unsigned long i = 0; i < 64; i++) {
+		dprintf(console_fd, "%02x", p[i]);
+		if ((i & 15) == 15) {
+			dprintf(console_fd, "%c", 10);
+			if (i != 63) {
+				dprintf(console_fd, "SWEETMETAL:     ");
+			}
+		}
+	}
+}
 /* Texture backed by an IOSurface; keeps the id for the clear forwarder. */
+typedef struct {
+	unsigned long x, y, z, width, height, depth;
+} SweetRegion;
+
 @interface SweetTexture : SweetOpaque {
 	unsigned int tex_surface;
 	unsigned long tex_width;
 	unsigned long tex_height;
 	unsigned long tex_format;
+	unsigned long tex_bpr;
+	void *tex_pixels;
+	unsigned long tex_dirty;
 }
 - (void)setSurfaceID:(unsigned int)identifier;
 - (unsigned int)surfaceID;
 - (void)setSize:(unsigned long)width height:(unsigned long)height;
 - (void)setFormat:(unsigned long)format;
+- (void)replaceRegion:(SweetRegion)region mipmapLevel:(unsigned long)level
+    slice:(unsigned long)slice withBytes:(const void *)bytes
+    bytesPerRow:(unsigned long)bytes_per_row bytesPerImage:(unsigned long)bytes_per_image;
+- (void)replaceRegion:(SweetRegion)region mipmapLevel:(unsigned long)level
+    withBytes:(const void *)bytes bytesPerRow:(unsigned long)bytes_per_row;
+- (unsigned long)dirty;
+- (void)clearDirty;
+- (void *)pixelBytes;
+- (unsigned long)bytesPerRow;
 @end
 
 @implementation SweetTexture
@@ -919,6 +973,76 @@ sweet_hex32(const char *tag, unsigned int index, const void *pointer)
 	return tex_format;
 }
 
+- (void)storeUpload:(const void *)bytes bytesPerRow:(unsigned long)bytes_per_row
+    height:(unsigned long)height
+{
+	unsigned long need = bytes_per_row * height;
+	if (bytes == 0 || need == 0) {
+		return;
+	}
+	if (tex_pixels != 0) {
+		free(tex_pixels);
+		tex_pixels = 0;
+	}
+	tex_pixels = malloc(need);
+	if (tex_pixels == 0) {
+		return;
+	}
+	memcpy(tex_pixels, bytes, need);
+	tex_bpr = bytes_per_row;
+	tex_dirty = 1;
+}
+
+- (void)replaceRegion:(SweetRegion)region mipmapLevel:(unsigned long)level
+    slice:(unsigned long)slice withBytes:(const void *)bytes
+    bytesPerRow:(unsigned long)bytes_per_row bytesPerImage:(unsigned long)bytes_per_image
+{
+	if (level != 0 || slice != 0) {
+		return;
+	}
+	[self storeUpload:bytes bytesPerRow:bytes_per_row height:region.height];
+	if (tex_pixels != 0) {
+		const unsigned char *p = (const unsigned char *)tex_pixels;
+		unsigned long sum = 0, n = tex_bpr * region.height;
+		unsigned long limit = n < (256UL << 10) ? n : (256UL << 10);
+		for (unsigned long i = 0; i < limit; i += 4) {
+			sum += p[i] + p[i + 1] + p[i + 2] + p[i + 3];
+		}
+		dprintf(console_fd,
+		    "SWEETMETAL: upload %lux%lu fmt=%lu bpr=%lu bytes=%p first=%02x%02x%02x%02x",
+		    tex_width, tex_height, tex_format, tex_bpr,
+		    tex_pixels, p[0], p[1], p[2], p[3]);
+		dprintf(console_fd, " sum256k=%lu%c", sum, 10);
+	}
+}
+
+- (void)replaceRegion:(SweetRegion)region mipmapLevel:(unsigned long)level
+    withBytes:(const void *)bytes bytesPerRow:(unsigned long)bytes_per_row
+{
+	[self replaceRegion:region mipmapLevel:level slice:0 withBytes:bytes
+	    bytesPerRow:bytes_per_row bytesPerImage:0];
+}
+
+- (unsigned long)dirty
+{
+	return tex_dirty;
+}
+
+- (void)clearDirty
+{
+	tex_dirty = 0;
+}
+
+- (void *)pixelBytes
+{
+	return tex_pixels;
+}
+
+- (unsigned long)bytesPerRow
+{
+	return tex_bpr;
+}
+
 @end
 
 #define SWEET_OBJECT() [[SweetOpaque alloc] init]
@@ -933,6 +1057,8 @@ static unsigned int sweet_draw_logs;
 	id enc_pipeline;
 	id enc_vb[8];
 	unsigned long enc_vboff[8];
+	id enc_fb[8];
+	unsigned long enc_fboff[8];
 	id enc_vtex[8];
 	id enc_tex[8];
 	id enc_ib;
@@ -942,12 +1068,24 @@ static unsigned int sweet_draw_logs;
 - (void)setRenderPipelineState:(id)pipeline;
 - (void)setVertexBuffer:(id)buffer offset:(unsigned long)offset
     atIndex:(unsigned long)index;
+- (void)setVertexBufferOffset:(unsigned long)offset atIndex:(unsigned long)index;
 - (void)setFragmentTexture:(id)texture atIndex:(unsigned long)index;
+- (void)setFragmentSamplerState:(id)state atIndex:(unsigned long)index;
+- (void)setFragmentBuffer:(id)buffer offset:(unsigned long)offset
+    atIndex:(unsigned long)index;
+- (void)setFragmentBufferOffset:(unsigned long)offset atIndex:(unsigned long)index;
+- (void)drawIndexedPrimitives:(unsigned long)type indexCount:(unsigned long)count
+    indexType:(unsigned long)index_type indexBuffer:(id)index_buffer
+    indexBufferOffset:(unsigned long)index_offset;
 - (void)setVertexTexture:(id)texture atIndex:(unsigned long)index;
 - (void)drawIndexedPrimitives:(unsigned long)type indexCount:(unsigned long)count
     indexType:(unsigned long)index_type indexBuffer:(id)index_buffer
     indexBufferOffset:(unsigned long)index_offset
     instanceCount:(unsigned long)instances;
+- (void)drawIndexedPrimitives:(unsigned long)type indexCount:(unsigned long)count
+    indexType:(unsigned long)index_type indexBuffer:(id)index_buffer
+    indexBufferOffset:(unsigned long)index_offset;
+
 - (void)drawPrimitives:(unsigned long)type vertexStart:(unsigned long)start
     vertexCount:(unsigned long)count;
 - (void)endEncoding;
@@ -975,10 +1113,38 @@ static unsigned int sweet_draw_logs;
 	}
 }
 
+- (void)setVertexBufferOffset:(unsigned long)offset atIndex:(unsigned long)index
+{
+	if (index < 8) {
+		enc_vboff[index] = offset;
+	}
+}
+
 - (void)setFragmentTexture:(id)texture atIndex:(unsigned long)index
 {
 	if (index < 8) {
 		enc_tex[index] = texture;
+	}
+}
+
+- (void)setFragmentSamplerState:(id)state atIndex:(unsigned long)index
+{
+	sweet_log("encoder", "setFragmentSamplerState:atIndex:");
+}
+
+- (void)setFragmentBuffer:(id)buffer offset:(unsigned long)offset
+    atIndex:(unsigned long)index
+{
+	if (index < 8) {
+		enc_fb[index] = buffer;
+		enc_fboff[index] = offset;
+	}
+}
+
+- (void)setFragmentBufferOffset:(unsigned long)offset atIndex:(unsigned long)index
+{
+	if (index < 8) {
+		enc_fboff[index] = offset;
 	}
 }
 
@@ -1032,7 +1198,7 @@ sweet_texture_surface(id texture)
 				dprintf(console_fd,
 				    "SWEETMETAL:   vb[%u]=%p+%lu len=%lu\n", i,
 				    contents, enc_vboff[i], length);
-				sweet_hex32("vbytes", i,
+				sweet_hex64("vb64_", i,
 				    (const char *)contents + (enc_vboff[i] < length ? enc_vboff[i] : 0));
 			}
 			if (enc_tex[i] != 0) {
@@ -1042,6 +1208,23 @@ sweet_texture_surface(id texture)
 			if (enc_vtex[i] != 0) {
 				dprintf(console_fd, "SWEETMETAL:   vtex[%u]=surface %u\n",
 				    i, sweet_texture_surface(enc_vtex[i]));
+			}
+		}
+		for (unsigned int i = 0; i < 8; i++) {
+			if (enc_fb[i] != 0) {
+				void *contents = (void *)((void *(*)(id, SEL))objc_msgSend)(
+				    enc_fb[i], sel_registerName("contents"));
+				unsigned long length = ((unsigned long (*)(id, SEL))objc_msgSend)(
+				    enc_fb[i], sel_registerName("length"));
+				const char *base = (const char *)contents +
+				    (enc_fboff[i] < length ? enc_fboff[i] : 0);
+				dprintf(console_fd,
+				    "SWEETMETAL:   fb[%u]=%p+%lu len=%lu %08x %08x %08x %08x",
+				    i, contents, enc_fboff[i], length,
+				    *(const unsigned int *)base,
+				    *(const unsigned int *)(base + 4),
+				    *(const unsigned int *)(base + 8),
+				    *(const unsigned int *)(base + 12));
 			}
 		}
 		if (index_buffer != 0) {
@@ -1057,6 +1240,15 @@ sweet_texture_surface(id texture)
 		sweet_draw_logs++;
 	}
 }
+
+- (void)drawIndexedPrimitives:(unsigned long)type indexCount:(unsigned long)count
+    indexType:(unsigned long)index_type indexBuffer:(id)index_buffer
+    indexBufferOffset:(unsigned long)index_offset
+{
+	[self drawIndexedPrimitives:type indexCount:count indexType:index_type
+	    indexBuffer:index_buffer indexBufferOffset:index_offset instanceCount:1];
+}
+
 
 - (void)drawPrimitives:(unsigned long)type vertexStart:(unsigned long)start
     vertexCount:(unsigned long)count
@@ -1201,7 +1393,10 @@ sweet_texture_surface(id texture)
 
 @end
 
-@interface SweetCommandQueue : SweetObject
+@interface SweetCommandQueue : SweetObject {
+	id queue_device;
+}
+- (void)setSweetDevice:(id)device;
 - (id)device;
 - (id)commandBuffer;
 - (id)commandBufferWithUnretainedReferences;
@@ -1210,10 +1405,15 @@ sweet_texture_surface(id texture)
 
 @implementation SweetCommandQueue
 
+- (void)setSweetDevice:(id)device
+{
+	queue_device = device;
+}
+
 - (id)device
 {
 	sweet_log("queue", "device");
-	return sweet_device_self;
+	return queue_device != 0 ? queue_device : sweet_device_self;
 }
 
 - (id)commandBuffer
@@ -1330,8 +1530,50 @@ sweet_texture_surface(id texture)
 	return 1UL << 30;
 }
 
+/* CA's MetalContext uses these legacySPI limits (objc_msgSend$maxTextureWidth2D
+ * etc.), not maxTextureDimension2D; a zero rejects every display surface. */
+- (unsigned long)maxTextureWidth2D
+{
+	return 16384;
+}
+
+- (unsigned long)maxTextureHeight2D
+{
+	return 16384;
+}
+
+- (unsigned long)maxFragmentTextures
+{
+	return 32;
+}
+
+- (unsigned long)maxVertexTextures
+{
+	return 32;
+}
+
+- (unsigned long)maxFragmentSamplers
+{
+	return 16;
+}
+
+- (unsigned long)maxVertexSamplers
+{
+	return 16;
+}
+
+- (unsigned long)maxColorAttachments
+{
+	return 8;
+}
+
 - (unsigned long)maxTextureDimension2D
 {
+	static unsigned int logged;
+	if (logged < 8) {
+		logged++;
+		sweet_log("msg", "maxTextureDimension2D -> 16384");
+	}
 	return 16384;
 }
 
@@ -1409,7 +1651,10 @@ sweet_texture_surface(id texture)
 - (id)newCommandQueue
 {
 	sweet_log("msg", "newCommandQueue");
-	return [[SweetCommandQueue alloc] init];
+	SweetCommandQueue *queue = [[SweetCommandQueue alloc] init];
+	((void (*)(id, SEL, id))objc_msgSend)(queue,
+	    sel_registerName("setSweetDevice:"), self);
+	return queue;
 }
 
 - (id)newCommandQueueWithMaxCommandBufferCount:(unsigned long)count
@@ -1434,6 +1679,12 @@ sweet_texture_surface(id texture)
 - (id)newLibraryWithURL:(id)url error:(id *)error
 {
 	sweet_log("msg", "newLibraryWithURL:error:");
+	sweet_lib_path_is(sweet_cstr(sweet_msg_id(url, "path")));
+	if (url != 0) {
+		id path = sweet_msg_id(url, "path");
+		dprintf(console_fd, "SWEETMETAL: library url %s", sweet_cstr(path));
+		dprintf(console_fd, "%c", 10);
+	}
 	return [[SweetOpaque alloc] init];
 }
 
