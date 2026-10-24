@@ -1,4 +1,41 @@
-# iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
+# vmios working notes
+
+### >>> ACTIVE: PROJECT RENAMED TO vmios; PHONE GONE, DEBUG ON THE PC (2026-10-24) <<<
+
+The project is now **vmios** (see `README.md`, `CREDITS.md`, `docs/NAMING.md`).
+The Android app is `dev.vmios.sweetvm`; user-facing and host-side names use
+`vmios`, while the guest ABI keeps the frozen `sweet` prefix by design.
+
+**Environment change:** the user has taken the phone, so device logging is no
+longer available. The PC path is the way forward: WSL + QEMU (`tools/
+qemu-sweet.py`, sweet-ufs/sweet-fb devices, the 16 GiB `.tools/ios16-root.img`)
+can boot the same payload, and QEMU's gdbstub allows stepping the guest
+kernel and userland. Ghidra 12.1.4 + Temurin 21 are installed for static RE
+(`.tools/run-ghidra-quick.cmd`, `.tools/run-ghidra-process.cmd`).
+
+**Cleanup done (measured):** 21 stale `~/qrun-*` QEMU runs were deleted
+(WSL home 53 -> 15 GiB), the WSL vhdx was converted to sparse (D: free
+13 -> 45 GB), and on E: ~5 GiB of extracted archives, old CI artifacts, old
+kernel trees, APK build output and ring dumps were removed. The legacy
+hackiosx website was dropped with the rename.
+
+**Where the GPU work stands:** the virtual Metal device is the guest's system
+default device, CoreAnimation's Metal context initializes, trace traps cover
+CA's queues/buffers/encoders, and guest userspace -> kernel -> virtio wire ->
+host GPU -> guest panel was proven on the phone (magenta fill). The open
+blocker is CoreAnimation's WindowServer: SpringBoard has a real window tree
+(wallpaper + root scene), but WindowServer submits swaps with layer id 0 and
+never runs its Metal render pass (details below under "Next blocker").
+
+**Next concrete action:** boot the same payload under the PC QEMU, attach the
+QEMU gdbstub, and break on `CA::WindowServer::IOMFBServer::timer_callback`
+and `CA::OGL::MetalContext::flush` to find what gates rendering, instead of
+inferring from logs. Static targets already decompiled: `thread_body`
+(null timer only), `add_vsync_source` (CADisplayTimer path is chosen),
+`timer_callback`, `Display::render_display`, `DisplayLink::
+update_paused_locked`.
+
+# iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - historical notes
 
 ### >>> ACTIVE: VIRTUAL GPU M2 — GUEST METAL DEVICE IS THE SYSTEM DEFAULT (2026-10-24) <<<
 
