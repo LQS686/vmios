@@ -2,6 +2,15 @@
 
 ### >>> ACTIVE: CA 宿主光栅化（性能整改）(2026-10-25) <<<
 
+**15:41 6 vCPU 对照：6 条 TCG 线程都跑，但没有收益；4 vCPU 仍最佳。**
+- 同一 recipe（ADT 6 节点、仅 cpu0 running、QMP SMC、`-smp 6`、MTTCG）：
+  QMP 设 6 个 CPU 成功、6 条 TCG 线程 50–68%，但 guest 面板 copies 仅
+  35、启动/出帧明显落后于 4 vCPU（4 vCPU 同时段 copies 160、交互
+  10–12 fps）。多出的 2 核被小核/热/锁争用吃掉。
+- 最佳配置维持 **4 vCPU + 无 offload**：`payload-4cpu-stopped-smc.bin`
+  （md5 c7a3496f…），交互 10–12 fps，2–2.5× 于 1 vCPU。
+- 6 vCPU 产物 `payload-6cpu-smc.bin`（d7b0ce22…）保留备查。
+
 **15:36 多核打通：4 vCPU 4/4 initialized，交互 10–12 fps。**
 - **ADT state 是 boot_cpu 的关键**：只把 cpu0 标 `running`、其余 `stopped`，
   XNU topology 才能找到 boot CPU；SWEET CPU 驱动随后通过 PSCI 启动
