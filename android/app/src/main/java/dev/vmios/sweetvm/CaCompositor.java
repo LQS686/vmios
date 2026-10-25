@@ -9,6 +9,8 @@ import java.nio.ByteOrder;
 import java.nio.MappedByteBuffer;
 import java.nio.channels.FileChannel;
 import java.util.HashMap;
+import java.util.Iterator;
+import java.util.Map;
 
 /**
  * Host rasterizer for the CoreAnimation draw batches the plugin forwards
@@ -74,7 +76,7 @@ final class CaCompositor {
     private static final String TAG = "sweetgpu-ca";
     private static final boolean NATIVE;
     private static native int nativeInit(String path, long length);
-    private static native int nativeTriangle(long[] pages, int total, int pageShift,
+    private static native long nativeTriangle(long[] pages, int total, int pageShift,
             long alloc, int dstBpr, int clipX0, int clipY0, int clipX1, int clipY1,
             int blend, int[] tex, int texW, int texH, int textured, float[] verts);
 
@@ -113,6 +115,11 @@ final class CaCompositor {
     private long frameDraws;
     private long framePixels;
     private int dropped;
+    private int uploadGen;
+    private int lastDst;
+    private int lastDstW;
+    private int lastDstH;
+    private int lastDstBpr;
 
     CaCompositor(GuestRam ram) {
         this.ram = ram;
@@ -155,6 +162,7 @@ final class CaCompositor {
         int width;
         int height;
         int bpr;
+        int gen;
         boolean ready;
     }
 
@@ -162,6 +170,8 @@ final class CaCompositor {
         int[] pixels;
         int width;
         int height;
+        boolean fromUpload;
+        int gen;
     }
 
     /* ---- wire messages -------------------------------------------------- */
@@ -277,6 +287,7 @@ final class CaCompositor {
             u.height = height;
             u.bpr = bpr;
             u.texFmt = fmt;
+            u.gen = ++uploadGen;
             u.ready = false;
             uploads.put(id, u);
             decoded.remove(id);
@@ -308,12 +319,49 @@ final class CaCompositor {
                     + " ms=" + ((now - frameStart) / 1000000L) + " decodes=" + decodeCount
                     + " maps=" + surfaces.size() + " uploads=" + uploads.size()
                     + " dropped=" + dropped);
+            Surface probe = surfaces.get(lastDst);
+            if (probe != null && probe.ready() && lastDstW > 0 && lastDstH > 0
+                    && lastDstBpr > 0) {
+                int px = lastDstW / 2;
+                int py = lastDstH / 2;
+                long off = (long) py * lastDstBpr + (long) px * 4;
+                int page = (int) (off >>> probe.pageShift);
+                if (page >= 0 && page < probe.total && probe.pages[page] != 0) {
+                    long pa = probe.pages[page];
+                    int v = ram.at(pa).getInt(ram.index(pa)
+                            + (int) (off & probe.pageMask));
+                    Log.i(TAG, "pixel dst=" + lastDst + " " + px + "," + py
+                            + " = 0x" + Integer.toHexString(v));
+                }
+            }
         }
         frame++;
         frameDraws = 0;
         framePixels = 0;
         frameStart = now;
-        decoded.clear();
+        /*
+         * Uploaded textures keep their decoded pixels until the guest sends a
+         * new version: text atlases and icons are sampled by many draws per
+         * frame and re-decoding them every flush was the bulk of Setup's
+         * 400-600 ms frames. Surface-sampled textures change every frame and
+         * are still dropped here.
+         */
+        Iterator<Map.Entry<Integer, Decoded>> entries = decoded.entrySet().iterator();
+        while (entries.hasNext()) {
+            Map.Entry<Integer, Decoded> entry = entries.next();
+            Decoded d = entry.getValue();
+            if (!d.fromUpload) {
+                entries.remove();
+                continue;
+            }
+            Upload u = uploads.get(entry.getKey());
+            if (u == null || u.gen != d.gen) {
+                entries.remove();
+            }
+        }
+        if (decoded.size() > 48) {
+            decoded.clear();
+        }
     }
 
     /* ---- draws ----------------------------------------------------------- */
@@ -379,6 +427,10 @@ final class CaCompositor {
                 return;
             }
         }
+        lastDst = dstId;
+        lastDstW = dstW;
+        lastDstH = dstH;
+        lastDstBpr = dstBpr;
         long start = System.nanoTime();
         int offset = HEADER_BYTES;
         for (int t = 0; t < triCount; t++) {
@@ -426,21 +478,30 @@ final class CaCompositor {
     /* ---- texture decoding ------------------------------------------------ */
 
     private Decoded texture(int flags, int id, int width, int height, int bpr, int fmt) {
+        boolean uploaded = (flags & F_UPLOAD_TEX) != 0;
         Decoded cached = decoded.get(id);
         if (cached != null && cached.width == width && cached.height == height) {
-            return cached;
+            if (!uploaded) {
+                return cached;
+            }
+            Upload cu = uploads.get(id);
+            if (cached.fromUpload && cu != null && cached.gen == cu.gen) {
+                return cached;
+            }
         }
         if (width <= 0 || height <= 0 || bpr <= 0 || width > 8192 || height > 8192
                 || (long) width * height > 4_000_000L) {
             return null;
         }
         int[] out = new int[width * height];
+        int uploadGeneration = 0;
         boolean internal = (flags & F_INTERNAL) != 0;
         if ((flags & F_UPLOAD_TEX) != 0) {
             Upload u = uploads.get(id);
             if (u == null || !u.ready) {
                 return null;
             }
+            uploadGeneration = u.gen;
             ByteBuffer src = ByteBuffer.wrap(u.data).order(ByteOrder.LITTLE_ENDIAN);
             for (int y = 0; y < height; y++) {
                 decodeRow(src, (long) y * bpr, width, internal ? 4 : bpp(fmt), fmt,
@@ -461,6 +522,8 @@ final class CaCompositor {
         d.pixels = out;
         d.width = width;
         d.height = height;
+        d.fromUpload = uploadGeneration != 0;
+        d.gen = uploadGeneration;
         decoded.put(id, d);
         decodeCount++;
         return d;

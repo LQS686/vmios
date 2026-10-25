@@ -2,6 +2,102 @@
 
 ### >>> ACTIVE: CA 宿主光栅化（性能整改）(2026-10-25) <<<
 
+**17:47 崩溃根因找到并修复：插件上传 memcpy 越界（不是热限频/光栅）。**
+- 证据链：崩溃前最后一条 `replaceRegion tex=32x40 fmt=30 region=0,0
+  32x40 bpr=576 bytes=0x107886674`；`bpr*height=23040` 字节，但源指针在
+  一个 32 KiB 只读 LAYERKIT 映射（0x107884000–0x10788C000）尾部，只剩
+  ~1.4 KiB。`storeUpload` 盲拷正好跨过映射末尾 → far 落在其后的空洞
+  （多次崩溃 far 都是该映射结束页）。这是 **guest 侧插件逻辑问题**。
+- 修复：`SweetMetal.m` 新增 `sweet_readable_extent()`，用 `mincore`
+  逐 4 KiB 页探测可读范围，只拷贝可读前缀（calloc 补零），越界时打印
+  `upload short ...`。不引入会崩的 mach_vm_* 调用。
+- 结果：payload `payload-4cpu-perf6.bin`（md5 c7f16557…）启动后到
+  t≈360 **backboardd 0 次崩溃**（此前每次 Setup 首帧 t≈137–226 必崩），
+  CA 持续出帧（host `frame 256 draws=10 px=5.9M`），copies 涨到 262。
+- 注意：帧间隔 `frame ms` 是 **两次 flush 的间隔**，不是光栅耗时；实测
+  flush 本身 2.4–119 ms（`host flush ... ms=`），所以宿主不是串行瓶颈。
+  单 draw 6–125 ms（分带多线程光栅已启用）。
+- 画面仍常见全黑，需区分是 display 休眠/Setup 黑色相位，还是 staging
+  拷贝/呈现问题；下一步用一帧内容校验（stage 首像素 vs 面板）。
+
+**17:05 性能量化：手机热限频是当前硬上限；宿主侧已优化 ~2x。**
+- **热限频硬证据**：thermal `step_wise` 把 `scaling_max_freq` 压到
+  cpu4=1.708GHz（硬件 3.148）、cpu5/6=1.401（2.956）、
+  cpu7=1.363（3.302）；cpu2/3=1.708。soc 温度 ~59–66°C，边充边跑。
+  TCG 只能拿到约 40–54% 主频，这是“响应慢”的最大原因。
+- **已改（APK/插件）**：
+  1) 插件默认静默日志（`sweetmetal_verbose=1` 才打开逐调用 trace）；
+  2) 宿主纹理解码缓存跨帧复用（仅上传纹理，按 uploadGen 失效）：
+     decodes 从 ~26/帧 降到 ~2.8/帧；
+  3) native 光栅器加不透明纯色快路径；
+  4) 修 `covered` 未初始化就 `goto done` 的 UB（这是 px 出现
+     负数/3.2e12 的根因）；JNI 返回值改 jlong；
+  5) QEMU 用 `taskset f0` 固定到 cpu4–7（含 X4 大核）；
+     宿主光栅线程 `taskset -p 0f` 固定 cpu0–3（实测落在 cpu3）。
+- **实测**：单 draw 5–76ms（改前 50–198ms）；帧耗时随内容
+  224–633ms 到 1.3–3.0s（Setup 页面每帧 6–14 draw，5.8–16.9M px，
+  且被限频）。copies 仍受 display 休眠/Setup 动画影响。
+- **结论**：继续堆软件优化前，需要散热（停止边充边跑、暂停 VM 降温），
+  否则同一个 SoC 只有一半频率。软件下一步：光栅按行分带做 2–4 线程，
+  用上目前空闲的 cpu0–1；再减少 Setup 全屏层的重复绘制。
+
+**16:40 Setup 真机推进：Hello→语言→地区；触摸必须“慢按”。**
+- **真实 UI 状态**：不是锁屏，是 Setup Assistant Hello 页；底边上滑
+  （从 guest y≈2340 起）才能进入语言列表。之后已选语言（变西班牙语）
+  并进入“选择国家/地区”（España 行已按下，出现 Cambiando idioma…），
+  语言切换触发 SpringBoard 重启（t=1036），屏幕随后又黑。
+- **触摸根因**：`adb input tap` 的 down/up 太快，sweet-touch 每 10ms
+  （guest 时间）轮询 touch.bin，常只看到 up（状态未变）→ 事件被丢弃。
+  日志证据：t=805.864 之后所有 tap 都没有 `SWEET HID: touch`，只有
+  长滑动/慢按能到 guest。**操作规则：所有点击用
+  `input swipe x y x y 600`（同点位 600ms）**，滑动用 2–3s。
+- **渲染残影**：语言列表→地区页后，旧语言文字叠在新区块上（Deutsch/
+  Русский/Português/Italiano/한국어），白底正常；属脏区/清屏或旧图层
+  未移除，待查。
+- **宿主内存是当前性能瓶颈**：重启后长时间运行，手机 MemFree ~172MB、
+  swap 已用 ~6GB，QEMU 3GB prealloc + guest-ram.bin 页缓存；表现为
+  copies/出帧从 10–14fps 掉到 0–1fps、Android SystemUI 时钟冻结。
+  VmEngine 目前按 **totalMem≥6GB** 决定 prealloc，应改为按
+  **availMem** 判断，并考虑重启 VM 释放压力。
+- backboardd 崩溃：probe3（仅数字日志 + 普通 memcpy）运行 16 分钟
+  未再崩溃（语言/地区切换也存活）；此前 probe1/2 的 `far=0xa` 崩溃是
+  插桩引入（`mach_vm_region`/`%s` label 日志），已移除。原始 LAYERKIT
+  页边界崩溃与 contig 失败/时序相关，尚未复现，继续观察。
+
+**16:12 backboardd 崩溃环是“进不了桌面”的直接原因；已加 upload 探针。**
+- 真实状态（guest 日志 + 截图交叉验证）：设备停在 **Setup Assistant 的
+  Hello 页**（底部提示语言在匈牙利语/瑞典语/罗马尼亚语间循环，说明是
+  Setup 的 hello 动画，不是锁屏）。拖拽能被 guest 收到
+  （`SWEET HID: touch down/up`），但 UI 不前进。
+- 原因：**每次 Setup 启动 ~30 s 后 backboardd 必崩**（t=183、t=412），
+  crash dump `sig 11 ... far` 落在只读 tag 51（VM_MEMORY_LAYERKIT）
+  映射末尾的下一页空洞；两次 pc/lr/bt 完全相同。崩溃后
+  `exec backboardd` → `exec SpringBoard` → `exec Setup` 重启，
+  显示 off/on，回到 Hello 页（fps=0、copies 停住的窗口就是 display off）。
+- 崩溃前最后一条插件日志固定为 `newTextureWithDescriptor` →
+  `setLabel:`，15 ms 后 SIGSEGV。pc 在 dyld 共享缓存（很可能是
+  libsystem memcpy）。推测：CA 随后用 `replaceRegion:...withBytes:`
+  上传，`storeUpload` 的 `memcpy(bpr*height)` 读取调用方缓冲区越界。
+- 已插桩（`sweet-4cpu-probe.adt` / `payload-4cpu-probe.bin`，md5
+  d7b6aa3b…）：replaceRegion 入口记录 tex/region/bpr/bpi/bytes；
+  `sweet_readable_extent()` 用 `mach_vm_region` 探测源缓冲区连续可读
+  范围并截断拷贝，越界时打印 `upload short ... need/readable`；
+  `setLabel:` 转发时打印 label 字符串（限 64 条）。
+- 另发现宿主 `frame ... px=-5203509138`（负的覆盖像素数），说明有
+  几何/裁剪异常的大 draw；宿主侧 dst 尺寸上限仍是 65535×65535，
+  后续需在 `CaCompositor.onDraw` 增加 alloc/面积硬校验。
+
+**15:51 900×1948 低分辨率试验失败：guest 黑屏不出帧。**
+- 同一 4 vCPU SMC recipe，ADT canvas/fb 900×1948 + `sweetfb_w/h=900`
+  （display-scale 仍为 3）：guest 启动、4 条 TCG 线程忙，但 copies 停在
+  27、屏幕全黑。逻辑尺寸从 1125/3=375×812 变成 900/3=300×649，
+  iOS 显示初始化/UI 不匹配；降分辨率必须同时保持逻辑尺寸
+  （调整 display-scale，或只降 canvas 不降 logical size）。
+- 已恢复 1125×2436 的 4 vCPU 最佳配置（`payload-4cpu-stopped-smc.bin`，
+  md5 c7a3496f…），交互 10–12 fps。
+- 低分辨率产物保留：`sweet-4cpu-900.adt`、`payload-4cpu-900.bin`
+  （md5 8121319f…），后续按正确的 display-scale 再做。
+
 **15:41 6 vCPU 对照：6 条 TCG 线程都跑，但没有收益；4 vCPU 仍最佳。**
 - 同一 recipe（ADT 6 节点、仅 cpu0 running、QMP SMC、`-smp 6`、MTTCG）：
   QMP 设 6 个 CPU 成功、6 条 TCG 线程 50–68%，但 guest 面板 copies 仅

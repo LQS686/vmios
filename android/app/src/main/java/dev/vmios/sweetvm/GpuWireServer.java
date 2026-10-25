@@ -77,7 +77,23 @@ public final class GpuWireServer {
         Log.i(TAG, "listening on 127.0.0.1:" + port);
     }
 
+    private static void pinRasterThread(String mask) {
+        try {
+            int tid = android.os.Process.myTid();
+            Process p = new ProcessBuilder("/system/bin/taskset", "-p", mask,
+                    Integer.toString(tid)).redirectErrorStream(true).start();
+            p.waitFor();
+            Log.i(TAG, "raster thread tid=" + tid + " affinity=" + mask);
+        } catch (Exception e) {
+            Log.w(TAG, "raster affinity failed", e);
+        }
+    }
+
     private void serve() {
+        // The guest's four TCG vCPUs own cpu4..cpu7; keep the host raster off
+        // that cluster so CA draws and guest execution stop stealing each
+        // other's cores on a thermally capped phone.
+        pinRasterThread("0f");
         ClearRenderer gpu = null;
         try {
             gpu = new ClearRenderer();

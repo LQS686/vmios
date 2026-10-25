@@ -50,6 +50,7 @@ void *malloc(unsigned long size);
 void *calloc(unsigned long count, unsigned long size);
 void *memcpy(void *dst, const void *src, unsigned long n);
 void bzero(void *dst, unsigned long n);
+int mincore(void *addr, unsigned long length, char *vec);
 SEL sel_registerName(const char *name);
 const char *sel_getName(SEL sel);
 const char *protocol_getName(id protocol);
@@ -68,6 +69,7 @@ int pthread_create(void *thread, const void *attr, void *(*start)(void *), void 
 void *dispatch_get_global_queue(long identifier, unsigned long flags);
 int sysctlbyname(const char *name, void *oldp, unsigned long *oldlenp,
     const void *newp, unsigned long newlen);
+char *strstr(const char *haystack, const char *needle);
 unsigned long long dispatch_time(unsigned long long when, long long delta);
 void dispatch_after_f(unsigned long long when, void *queue, void *context,
     void (*work)(void *));
@@ -83,6 +85,7 @@ int IOConnectCallScalarMethod(unsigned int connection, unsigned int selector,
     const unsigned long long *input, unsigned int inputCount,
     unsigned long long *output, unsigned int *outputCount);
 unsigned long long mach_absolute_time(void);
+static double sweet_ticks_ms(unsigned long long ticks);
 typedef struct { unsigned int numer, denom; } sweet_mach_timebase;
 int mach_timebase_info(sweet_mach_timebase *info);
 void *IOServiceMatching(const char *name);
@@ -126,8 +129,9 @@ __attribute__((objc_root_class))
 @end
 
 static int console_fd = -1;
-/* Forwarded-selector trace; off in the normal build (see sweet_log). */
-static int sweet_verbose;
+/* Forwarded-selector trace costs a console write per Metal call; it is off
+ * by default and boot with sweetmetal_verbose=1 to bring it back. */
+static int sweet_verbose = 0;
 static id sweet_device_self;
 static char sweet_lib_path[256];
 static unsigned int sweet_accel_port;
@@ -929,6 +933,7 @@ sweet_ca_flush(void)
 	unsigned int sequence = sweet_ca_sequence;
 	unsigned long output_size = 0;
 	int result = 0;
+	unsigned long long flush_t0 = mach_absolute_time();
 	/*
 	 * The host may still be rasterizing earlier batches when this flush
 	 * arrives. The kernel waits 4 x 250 ms; a timeout there is not just a
@@ -951,10 +956,12 @@ sweet_ca_flush(void)
 		}
 	}
 	sweet_ca_flushes++;
-	if (sweet_ca_flushes <= 8) {
+	if (sweet_ca_flushes <= 32) {
 		dprintf(console_fd,
-		    "SWEETMETAL: host flush %u pending=%u submitted=%u local=%u%c",
-		    sequence, sweet_ca_pending, sweet_ca_submitted, sweet_ca_local, 10);
+		    "SWEETMETAL: host flush %u pending=%u submitted=%u local=%u"
+		    " ms=%.2f%c", sequence, sweet_ca_pending,
+		    sweet_ca_submitted, sweet_ca_local,
+		    sweet_ticks_ms(mach_absolute_time() - flush_t0), 10);
 	}
 	if (result != 0) {
 		sweet_ca_failures++;
@@ -1260,6 +1267,12 @@ static void
 sweet_loaded(void)
 {
 	static void *thread;
+	char vb[1024];
+	unsigned long vbl = sizeof(vb);
+	if (sysctlbyname("kern.bootargs", vb, &vbl, 0, 0) == 0 &&
+	    strstr(vb, "sweetmetal_verbose=1") != 0) {
+		sweet_verbose = 1;
+	}
 	int ncpu = 0;
 	unsigned long ncpu_len = sizeof(ncpu);
 	if (sysctlbyname("hw.ncpu", &ncpu, &ncpu_len, 0, 0) == 0) {
@@ -1949,6 +1962,38 @@ static unsigned long sweet_texel_bpp(unsigned long fmt);
 - (unsigned long)rendered;
 @end
 
+
+/*
+ * CA sometimes hands replaceRegion a bytesPerRow that runs past the caller's
+ * mapping: a 32x40 texture with bpr=576 asked for 23 KB from a 1.4 KB tail
+ * and our memcpy faulted at the mapping edge, aborting backboardd. Probe
+ * page residency with mincore and copy only the mapped prefix.
+ */
+static unsigned long
+sweet_readable_extent(const void *pointer, unsigned long want)
+{
+	unsigned long long address = (unsigned long long)(unsigned long)pointer;
+	unsigned long got = 0;
+	const unsigned long page = 4096;
+	if (pointer == 0) {
+		return 0;
+	}
+	while (got < want) {
+		unsigned long long offset = address + got;
+		unsigned long long base = offset & ~(unsigned long long)(page - 1);
+		unsigned long avail = page - (unsigned long)(offset & (page - 1));
+		char resident = 0;
+		if (mincore((void *)(unsigned long)base, page, &resident) != 0) {
+			break;
+		}
+		if (avail > want - got) {
+			avail = want - got;
+		}
+		got += avail;
+	}
+	return got;
+}
+
 @implementation SweetTexture
 
 - (void)setSurfaceID:(unsigned int)identifier
@@ -1998,11 +2043,26 @@ static unsigned long sweet_texel_bpp(unsigned long fmt);
 		free(tex_pixels);
 		tex_pixels = 0;
 	}
-	tex_pixels = malloc(need);
+	static unsigned int upload_done_logs;
+	unsigned long readable = sweet_readable_extent(bytes, need);
+	unsigned long copy = readable < need ? readable : need;
+	tex_pixels = calloc(need, 1);
 	if (tex_pixels == 0) {
 		return;
 	}
-	memcpy(tex_pixels, bytes, need);
+	memcpy(tex_pixels, bytes, copy);
+	if (copy != need) {
+		dprintf(console_fd,
+		    "SWEETMETAL: upload short tex=%lux%lu fmt=%lu bpr=%lu "
+		    "need=%lu copied=%lu bytes=%p%c", tex_width, tex_height,
+		    tex_format, bytes_per_row, need, copy, bytes, 10);
+	} else if (upload_done_logs < 32) {
+		upload_done_logs++;
+		dprintf(console_fd,
+		    "SWEETMETAL: upload done tex=%lux%lu fmt=%lu bpr=%lu "
+		    "need=%lu bytes=%p%c", tex_width, tex_height, tex_format,
+		    bytes_per_row, need, bytes, 10);
+	}
 	tex_bpr = bytes_per_row;
 	tex_dirty = 1;
 	tex_version++;
@@ -2012,6 +2072,16 @@ static unsigned long sweet_texel_bpp(unsigned long fmt);
     slice:(unsigned long)slice withBytes:(const void *)bytes
     bytesPerRow:(unsigned long)bytes_per_row bytesPerImage:(unsigned long)bytes_per_image
 {
+	static unsigned int upload_entries;
+	if (upload_entries < 32) {
+		upload_entries++;
+		dprintf(console_fd,
+		    "SWEETMETAL: replaceRegion tex=%lux%lu fmt=%lu region=%lu,%lu "
+		    "%lux%lu level=%lu bpr=%lu bpi=%lu bytes=%p%c",
+		    tex_width, tex_height, tex_format, region.x, region.y,
+		    region.width, region.height, level, bytes_per_row,
+		    bytes_per_image, bytes, 10);
+	}
 	if (level != 0 || slice != 0) {
 		return;
 	}
@@ -3333,19 +3403,74 @@ sweet_texture_surface(id texture)
 	unsigned int pending_surface[8];
 	unsigned int pending_color[8];
 	int pending_count;
+	id completed_handlers[8];
+	int completed_count;
 }
 - (void)commit;
 - (void)commitAndWaitUntilSubmitted;
 - (void)enqueue;
 - (void)presentDrawable:(id)drawable;
 - (void)waitUntilCompleted;
+- (void)waitUntilScheduled;
+- (void)addCompletedHandler:(id)handler;
+- (void)addScheduledHandler:(id)handler;
+- (unsigned long)status;
+- (id)error;
+- (void)sweet_invokeHandlers;
 - (id)renderCommandEncoderWithDescriptor:(id)descriptor;
 - (id)blitCommandEncoder;
 - (id)computeCommandEncoder;
 - (void)flushFills;
 @end
 
+/* arm64 block ABI: the invoke pointer is the fourth word. Calling it
+ * directly keeps this file free of -fblocks and Block_copy. */
+struct SweetBlockHeader {
+	void *isa;
+	int flags;
+	int reserved;
+	void *invoke;
+};
+
 @implementation SweetCommandBuffer
+
+- (void)sweet_invokeHandlers
+{
+	for (int i = 0; i < completed_count; i++) {
+		id block = completed_handlers[i];
+		if (block != 0) {
+			struct SweetBlockHeader *header = (struct SweetBlockHeader *)block;
+			if (header->invoke != 0) {
+				((void (*)(void *, id))header->invoke)(block, self);
+			}
+			((void (*)(id, SEL))objc_msgSend)(block,
+			    sel_registerName("release"));
+		}
+	}
+	completed_count = 0;
+}
+
+- (void)addCompletedHandler:(id)handler
+{
+	sweet_log("buffer", "addCompletedHandler");
+	(void)handler;
+}
+
+- (void)addScheduledHandler:(id)handler
+{
+	sweet_log("buffer", "addScheduledHandler");
+	(void)handler;
+}
+
+- (unsigned long)status
+{
+	return 4; /* MTLCommandBufferStatusCompleted */
+}
+
+- (id)error
+{
+	return 0;
+}
 
 - (void)flushFills
 {
@@ -3395,6 +3520,11 @@ sweet_texture_surface(id texture)
 - (void)waitUntilCompleted
 {
 	sweet_log("buffer", "waitUntilCompleted");
+}
+
+- (void)waitUntilScheduled
+{
+	sweet_log("buffer", "waitUntilScheduled");
 }
 
 - (id)renderCommandEncoderWithDescriptor:(id)descriptor
@@ -3876,6 +4006,16 @@ sweet_texture_surface(id texture)
 		    sweet_msg_ul(descriptor, "width"), sweet_msg_ul(descriptor, "height"));
 		((void (*)(id, SEL, unsigned long))objc_msgSend)(texture,
 		    sel_registerName("setFormat:"), sweet_msg_ul(descriptor, "pixelFormat"));
+	}
+	{
+		static unsigned int tex_desc_logs;
+		if (tex_desc_logs < 16) {
+			tex_desc_logs++;
+			dprintf(console_fd, "SWEETMETAL: texdesc %lux%lu fmt=%lu%c",
+			    sweet_msg_ul(descriptor, "width"),
+			    sweet_msg_ul(descriptor, "height"),
+			    sweet_msg_ul(descriptor, "pixelFormat"), 10);
+		}
 	}
 	return texture;
 }

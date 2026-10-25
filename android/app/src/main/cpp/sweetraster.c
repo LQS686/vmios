@@ -7,6 +7,10 @@
  * of CaCompositor.triangle(): same edge functions, top-left rule, bilinear
  * sampling, source-over/blend-46 math and page-table addressing into the
  * shared guest RAM file.
+ *
+ * Large triangles are split into row bands and rasterized by 2-4 threads.
+ * Bands own disjoint scanlines so they never race; the guest's TCG threads
+ * are pinned to the big cluster and these threads run on the idle cores.
  */
 #include <jni.h>
 #include <math.h>
@@ -17,6 +21,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <pthread.h>
 
 #define RAM_BASE 0x40000000ull
 
@@ -145,7 +150,205 @@ pack(float r, float g, float b, float a)
     return (ai << 24) | (ri << 16) | (gi << 8) | bi;
 }
 
-JNIEXPORT jint JNICALL
+typedef struct {
+    const jlong *pages;
+    const int32_t *tp;
+    uint32_t total;
+    uint32_t page_shift;
+    uint32_t page_mask;
+    long alloc;
+    int dst_bpr;
+    int minx, maxx;
+    int blend;
+    int tex_w, tex_h;
+    int positive;
+    int solid;
+    int textured;
+    int texture_pixels;
+    float inv;
+    float d0x, d1x, d2x;
+    int tl0, tl1, tl2;
+    float ax, ay, bx, by, cx, cy;
+    float au, av, bu, bv, cu, cv;
+    float ar, ag, ab, aa;
+    float br, bg, bb, ba;
+    float cr, cg, cb, ca;
+    float sr, sg, sb, sa;
+    int opaque_solid;
+    uint32_t opaque_px;
+} RasterCtx;
+
+static void
+raster_band(const RasterCtx *c, int y0, int y1, long *out_covered)
+{
+    long covered = 0;
+    const jlong *pages = c->pages;
+    const int32_t *tp = c->tp;
+    const uint32_t page_size = 1u << c->page_shift;
+    const uint32_t page_mask = c->page_mask;
+    float ax = c->ax, ay = c->ay, bx = c->bx, by = c->by;
+    float cx = c->cx, cy = c->cy;
+    for (int y = y0; y < y1; y++) {
+        float py = (float)y + 0.5f;
+        float e0 = edge(bx, by, cx, cy, (float)c->minx + 0.5f, py);
+        float e1 = edge(cx, cy, ax, ay, (float)c->minx + 0.5f, py);
+        float e2 = edge(ax, ay, bx, by, (float)c->minx + 0.5f, py);
+        uint64_t row_offset = (uint64_t)y * (uint32_t)c->dst_bpr;
+        int x = c->minx;
+        while (x < c->maxx) {
+            uint64_t pixel_offset = row_offset + (uint64_t)x * 4;
+            if (c->alloc > 0 && pixel_offset + 4 > (uint64_t)c->alloc) {
+                break;
+            }
+            uint32_t page = (uint32_t)(pixel_offset >> c->page_shift);
+            if (page >= c->total) {
+                break;
+            }
+            uint32_t within = (uint32_t)(pixel_offset & page_mask);
+            int span = (c->maxx - x);
+            int capacity = (int)((page_size - within) / 4);
+            if (span > capacity) {
+                span = capacity;
+            }
+            if (span <= 0) {
+                break;
+            }
+            uint64_t pa = (uint64_t)pages[page];
+            if (pa < RAM_BASE ||
+                pa - RAM_BASE + within + 4 > g_ram_len) {
+                break;
+            }
+            uint8_t *base = g_ram + (pa - RAM_BASE) + within;
+            if (c->opaque_solid) {
+                for (int i = 0; i < span; i++, x++) {
+                    int in;
+                    if (c->positive) {
+                        in = (e0 > 0.0f || (e0 == 0.0f && c->tl0)) &&
+                            (e1 > 0.0f || (e1 == 0.0f && c->tl1)) &&
+                            (e2 > 0.0f || (e2 == 0.0f && c->tl2));
+                    } else {
+                        in = (e0 < 0.0f || (e0 == 0.0f && !c->tl0)) &&
+                            (e1 < 0.0f || (e1 == 0.0f && !c->tl1)) &&
+                            (e2 < 0.0f || (e2 == 0.0f && !c->tl2));
+                    }
+                    if (in) {
+                        memcpy(base + (size_t)i * 4, &c->opaque_px,
+                            sizeof(c->opaque_px));
+                        covered++;
+                    }
+                    e0 += c->d0x;
+                    e1 += c->d1x;
+                    e2 += c->d2x;
+                }
+                continue;
+            }
+            for (int i = 0; i < span; i++, x++) {
+                int in;
+                if (c->positive) {
+                    in = (e0 > 0.0f || (e0 == 0.0f && c->tl0)) &&
+                        (e1 > 0.0f || (e1 == 0.0f && c->tl1)) &&
+                        (e2 > 0.0f || (e2 == 0.0f && c->tl2));
+                } else {
+                    in = (e0 < 0.0f || (e0 == 0.0f && !c->tl0)) &&
+                        (e1 < 0.0f || (e1 == 0.0f && !c->tl1)) &&
+                        (e2 < 0.0f || (e2 == 0.0f && !c->tl2));
+                }
+                if (in) {
+                    float w0 = e0 * c->inv;
+                    float w1 = e1 * c->inv;
+                    float w2 = e2 * c->inv;
+                    float col_r, col_g, col_b, col_a;
+                    if (c->solid) {
+                        col_r = c->sr;
+                        col_g = c->sg;
+                        col_b = c->sb;
+                        col_a = c->sa;
+                    } else {
+                        col_r = c->ar * w0 + c->br * w1 + c->cr * w2;
+                        col_g = c->ag * w0 + c->bg * w1 + c->cg * w2;
+                        col_b = c->ab * w0 + c->bb * w1 + c->cb * w2;
+                        col_a = c->aa * w0 + c->ba * w1 + c->ca * w2;
+                        if (c->textured) {
+                            float u, vv;
+                            if (c->texture_pixels) {
+                                u = c->au * w0 + c->bu * w1 + c->cu * w2;
+                                vv = c->av * w0 + c->bv * w1 + c->cv * w2;
+                            } else {
+                                u = c->au;
+                                vv = c->av;
+                            }
+                            float s[4];
+                            sample(tp, c->tex_w, c->tex_h, u, vv, s);
+                            col_r *= s[0];
+                            col_g *= s[1];
+                            col_b *= s[2];
+                            col_a *= s[3];
+                        }
+                        col_a = col_a > 1.0f ? 1.0f :
+                            (col_a < 0.0f ? 0.0f : col_a);
+                        col_r *= col_a;
+                        col_g *= col_a;
+                        col_b *= col_a;
+                    }
+                    uint32_t dp;
+                    memcpy(&dp, base + (size_t)i * 4, sizeof(dp));
+                    float dr = (dp & 0xff) / 255.0f;
+                    float dg = ((dp >> 8) & 0xff) / 255.0f;
+                    float db = ((dp >> 16) & 0xff) / 255.0f;
+                    float da = ((dp >> 24) & 0xff) / 255.0f;
+                    float inv_a = 1.0f - col_a;
+                    float orr = col_r + dr * inv_a;
+                    float og = col_g + dg * inv_a;
+                    float ob = col_b + db * inv_a;
+                    float oa = col_a + da * inv_a;
+                    if (c->blend == 46) {
+                        float l = 0.299f * dr + 0.587f * dg + 0.114f * db;
+                        l = l < 0.0f ? 0.0f : (l > 1.0f ? 1.0f : l);
+                        float l4 = l * l;
+                        l4 *= l4;
+                        float k = 1.0f - col_a * l4;
+                        orr = col_r * l4 + dr * k;
+                        og = col_g * l4 + dg * k;
+                        ob = col_b * l4 + db * k;
+                        oa = col_a * l4 + da * k;
+                    }
+                    uint32_t out = ((uint32_t)(oa >= 1.0f ? 255 :
+                        oa * 255.0f) << 24) |
+                        ((uint32_t)(orr >= 1.0f ? 255 :
+                        orr * 255.0f) << 16) |
+                        ((uint32_t)(og >= 1.0f ? 255 :
+                        og * 255.0f) << 8) |
+                        (uint32_t)(ob >= 1.0f ? 255 : ob * 255.0f);
+                    memcpy(base + (size_t)i * 4, &out, sizeof(out));
+                    covered++;
+                }
+                e0 += c->d0x;
+                e1 += c->d1x;
+                e2 += c->d2x;
+            }
+            if (x >= c->maxx) {
+                break;
+            }
+        }
+    }
+    *out_covered = covered;
+}
+
+typedef struct {
+    const RasterCtx *ctx;
+    int y0, y1;
+    long covered;
+} RasterBand;
+
+static void *
+raster_thread(void *arg)
+{
+    RasterBand *band = (RasterBand *)arg;
+    raster_band(band->ctx, band->y0, band->y1, &band->covered);
+    return NULL;
+}
+
+JNIEXPORT jlong JNICALL
 Java_dev_vmios_sweetvm_CaCompositor_nativeTriangle(JNIEnv *env, jclass cls,
     jlongArray jpages, jint total, jint page_shift, jlong alloc, jint dst_bpr,
     jint clip_x0, jint clip_y0, jint clip_x1, jint clip_y1, jint blend,
@@ -171,175 +374,121 @@ Java_dev_vmios_sweetvm_CaCompositor_nativeTriangle(JNIEnv *env, jclass cls,
         return 0;
     }
 
-    float ax = v[0], ay = v[1], au = v[2], av = v[3];
-    float ar = v[4], ag = v[5], ab = v[6], aa = v[7];
-    float bx = v[8], by = v[9], bu = v[10], bv = v[11];
-    float br = v[12], bg = v[13], bb = v[14], ba = v[15];
-    float cx = v[16], cy = v[17], cu = v[18], cv = v[19];
-    float cr = v[20], cg = v[21], cb = v[22], ca = v[23];
-
-    float area = edge(ax, ay, bx, by, cx, cy);
-    if (area == 0.0f) {
-        goto done;
-    }
-    float minxf = fminf(ax, fminf(bx, cx));
-    float maxxf = fmaxf(ax, fmaxf(bx, cx));
-    float minyf = fminf(ay, fminf(by, cy));
-    float maxyf = fmaxf(ay, fmaxf(by, cy));
-    int minx = clip_x0 > (int)floorf(minxf) ? clip_x0 : (int)floorf(minxf);
-    int maxx = clip_x1 < (int)ceilf(maxxf) ? clip_x1 : (int)ceilf(maxxf);
-    int miny = clip_y0 > (int)floorf(minyf) ? clip_y0 : (int)floorf(minyf);
-    int maxy = clip_y1 < (int)ceilf(maxyf) ? clip_y1 : (int)ceilf(maxyf);
-    if (minx >= maxx || miny >= maxy) {
-        goto done;
-    }
-    float inv = 1.0f / area;
-    int positive = area > 0.0f;
-    float d0x = cy - by;
-    float d1x = ay - cy;
-    float d2x = by - ay;
-    int tl0 = top_left(cx - bx, cy - by);
-    int tl1 = top_left(ax - cx, ay - cy);
-    int tl2 = top_left(bx - ax, by - ay);
-    int solid = !textured && ar == br && ar == cr && ag == bg && ag == cg &&
-        ab == bb && ab == cb && aa == ba && aa == ca;
-    float sr = 0.0f, sg = 0.0f, sb = 0.0f, sa = 0.0f;
-    if (solid) {
-        sa = aa < 0.0f ? 0.0f : (aa > 1.0f ? 1.0f : aa);
-        sr = ar * sa;
-        sg = ag * sa;
-        sb = ab * sa;
-        if (sa <= 0.0f) {
-            goto done;
-        }
-    }
-    int texture_pixels = textured &&
-        !(au == bu && au == cu && av == bv && av == cv);
-    const uint32_t page_size = 1u << page_shift;
-    const uint32_t page_mask = page_size - 1;
-    const int32_t *tp = tex;
     long covered = 0;
-
-    for (int y = miny; y < maxy; y++) {
-        float py = (float)y + 0.5f;
-        float e0 = edge(bx, by, cx, cy, (float)minx + 0.5f, py);
-        float e1 = edge(cx, cy, ax, ay, (float)minx + 0.5f, py);
-        float e2 = edge(ax, ay, bx, by, (float)minx + 0.5f, py);
-        uint64_t row_offset = (uint64_t)y * (uint32_t)dst_bpr;
-        int x = minx;
-        while (x < maxx) {
-            uint64_t pixel_offset = row_offset + (uint64_t)x * 4;
-            if (alloc > 0 && pixel_offset + 4 > (uint64_t)alloc) {
-                break;
-            }
-            uint32_t page = (uint32_t)(pixel_offset >> page_shift);
-            if (page >= (uint32_t)total) {
-                break;
-            }
-            uint32_t within = (uint32_t)(pixel_offset & page_mask);
-            int span = (maxx - x);
-            int capacity = (int)((page_size - within) / 4);
-            if (span > capacity) {
-                span = capacity;
-            }
-            if (span <= 0) {
-                break;
-            }
-            uint64_t pa = (uint64_t)pages[page];
-            if (pa < RAM_BASE || pa - RAM_BASE + within + 4 > g_ram_len) {
-                break;
-            }
-            uint8_t *base = g_ram + (pa - RAM_BASE) + within;
-            for (int i = 0; i < span; i++, x++) {
-                int in;
-                if (positive) {
-                    in = (e0 > 0.0f || (e0 == 0.0f && tl0)) &&
-                        (e1 > 0.0f || (e1 == 0.0f && tl1)) &&
-                        (e2 > 0.0f || (e2 == 0.0f && tl2));
-                } else {
-                    in = (e0 < 0.0f || (e0 == 0.0f && !tl0)) &&
-                        (e1 < 0.0f || (e1 == 0.0f && !tl1)) &&
-                        (e2 < 0.0f || (e2 == 0.0f && !tl2));
-                }
-                if (in) {
-                    float w0 = e0 * inv;
-                    float w1 = e1 * inv;
-                    float w2 = e2 * inv;
-                    float col_r, col_g, col_b, col_a;
-                    if (solid) {
-                        col_r = sr;
-                        col_g = sg;
-                        col_b = sb;
-                        col_a = sa;
-                    } else {
-                        col_r = ar * w0 + br * w1 + cr * w2;
-                        col_g = ag * w0 + bg * w1 + cg * w2;
-                        col_b = ab * w0 + bb * w1 + cb * w2;
-                        col_a = aa * w0 + ba * w1 + ca * w2;
-                        if (textured) {
-                            float u, vv;
-                            if (texture_pixels) {
-                                u = au * w0 + bu * w1 + cu * w2;
-                                vv = av * w0 + bv * w1 + cv * w2;
-                            } else {
-                                u = au;
-                                vv = av;
-                            }
-                            float s[4];
-                            sample(tp, tex_w, tex_h, u, vv, s);
-                            col_r *= s[0];
-                            col_g *= s[1];
-                            col_b *= s[2];
-                            col_a *= s[3];
-                        }
-                        col_a = col_a > 1.0f ? 1.0f : (col_a < 0.0f ? 0.0f : col_a);
-                        col_r *= col_a;
-                        col_g *= col_a;
-                        col_b *= col_a;
-                    }
-                    uint32_t dp;
-                    memcpy(&dp, base + (size_t)i * 4, sizeof(dp));
-                    float dr = (dp & 0xff) / 255.0f;
-                    float dg = ((dp >> 8) & 0xff) / 255.0f;
-                    float db = ((dp >> 16) & 0xff) / 255.0f;
-                    float da = ((dp >> 24) & 0xff) / 255.0f;
-                    float inv_a = 1.0f - col_a;
-                    float orr = col_r + dr * inv_a;
-                    float og = col_g + dg * inv_a;
-                    float ob = col_b + db * inv_a;
-                    float oa = col_a + da * inv_a;
-                    if (blend == 46) {
-                        float l = 0.299f * dr + 0.587f * dg + 0.114f * db;
-                        l = l < 0.0f ? 0.0f : (l > 1.0f ? 1.0f : l);
-                        float l4 = l * l;
-                        l4 *= l4;
-                        float k = 1.0f - col_a * l4;
-                        orr = col_r * l4 + dr * k;
-                        og = col_g * l4 + dg * k;
-                        ob = col_b * l4 + db * k;
-                        oa = col_a * l4 + da * k;
-                    }
-                    uint32_t out = ((uint32_t)(oa >= 1.0f ? 255 : oa * 255.0f) << 24) |
-                        ((uint32_t)(orr >= 1.0f ? 255 : orr * 255.0f) << 16) |
-                        ((uint32_t)(og >= 1.0f ? 255 : og * 255.0f) << 8) |
-                        (uint32_t)(ob >= 1.0f ? 255 : ob * 255.0f);
-                    memcpy(base + (size_t)i * 4, &out, sizeof(out));
-                    covered++;
-                }
-                e0 += d0x;
-                e1 += d1x;
-                e2 += d2x;
-            }
-            if (x >= maxx) {
+    do {
+        float ax = v[0], ay = v[1], au = v[2], av = v[3];
+        float ar = v[4], ag = v[5], ab = v[6], aa = v[7];
+        float bx = v[8], by = v[9], bu = v[10], bv = v[11];
+        float br = v[12], bg = v[13], bb = v[14], ba = v[15];
+        float cx = v[16], cy = v[17], cu = v[18], cv = v[19];
+        float cr = v[20], cg = v[21], cb = v[22], ca = v[23];
+        float area = edge(ax, ay, bx, by, cx, cy);
+        if (area == 0.0f) {
+            break;
+        }
+        float minxf = fminf(ax, fminf(bx, cx));
+        float maxxf = fmaxf(ax, fmaxf(bx, cx));
+        float minyf = fminf(ay, fminf(by, cy));
+        float maxyf = fmaxf(ay, fmaxf(by, cy));
+        int minx = clip_x0 > (int)floorf(minxf) ? clip_x0 : (int)floorf(minxf);
+        int maxx = clip_x1 < (int)ceilf(maxxf) ? clip_x1 : (int)ceilf(maxxf);
+        int miny = clip_y0 > (int)floorf(minyf) ? clip_y0 : (int)floorf(minyf);
+        int maxy = clip_y1 < (int)ceilf(maxyf) ? clip_y1 : (int)ceilf(maxyf);
+        if (minx >= maxx || miny >= maxy) {
+            break;
+        }
+        int solid = !textured && ar == br && ar == cr && ag == bg &&
+            ag == cg && ab == bb && ab == cb && aa == ba && aa == ca;
+        float sr = 0.0f, sg = 0.0f, sb = 0.0f, sa = 0.0f;
+        if (solid) {
+            sa = aa < 0.0f ? 0.0f : (aa > 1.0f ? 1.0f : aa);
+            sr = ar * sa;
+            sg = ag * sa;
+            sb = ab * sa;
+            if (sa <= 0.0f) {
                 break;
             }
         }
-    }
-done:
+        RasterCtx c;
+        memset(&c, 0, sizeof(c));
+        c.pages = pages;
+        c.tp = tex;
+        c.total = (uint32_t)total;
+        c.page_shift = (uint32_t)page_shift;
+        c.page_mask = (1u << page_shift) - 1;
+        c.alloc = (long)alloc;
+        c.dst_bpr = dst_bpr;
+        c.minx = minx;
+        c.maxx = maxx;
+        c.blend = blend;
+        c.tex_w = tex_w;
+        c.tex_h = tex_h;
+        c.positive = area > 0.0f;
+        c.solid = solid;
+        c.textured = textured;
+        c.texture_pixels = textured &&
+            !(au == bu && au == cu && av == bv && av == cv);
+        c.inv = 1.0f / area;
+        c.d0x = cy - by;
+        c.d1x = ay - cy;
+        c.d2x = by - ay;
+        c.tl0 = top_left(cx - bx, cy - by);
+        c.tl1 = top_left(ax - cx, ay - cy);
+        c.tl2 = top_left(bx - ax, by - ay);
+        c.ax = ax; c.ay = ay; c.bx = bx; c.by = by; c.cx = cx; c.cy = cy;
+        c.au = au; c.av = av; c.bu = bu; c.bv = bv; c.cu = cu; c.cv = cv;
+        c.ar = ar; c.ag = ag; c.ab = ab; c.aa = aa;
+        c.br = br; c.bg = bg; c.bb = bb; c.ba = ba;
+        c.cr = cr; c.cg = cg; c.cb = cb; c.ca = ca;
+        c.sr = sr; c.sg = sg; c.sb = sb; c.sa = sa;
+        c.opaque_solid = solid && sa >= 0.999f;
+        if (c.opaque_solid) {
+            int ri = (int)(sr * 255.0f + 0.5f);
+            int gi = (int)(sg * 255.0f + 0.5f);
+            int bi = (int)(sb * 255.0f + 0.5f);
+            c.opaque_px = 0xff000000u | ((uint32_t)ri << 16) |
+                ((uint32_t)gi << 8) | (uint32_t)bi;
+        }
+        int rows = maxy - miny;
+        long area_px = (long)rows * (long)(maxx - minx);
+        (void)area_px;
+        int threads = 1; /* A/B: threading off */
+        if (threads <= 1) {
+            raster_band(&c, miny, maxy, &covered);
+            break;
+        }
+        RasterBand bands[4];
+        pthread_t th[4];
+        int made = 0;
+        int i;
+        for (i = 0; i < threads; i++) {
+            bands[i].ctx = &c;
+            bands[i].y0 = miny + rows * i / threads;
+            bands[i].y1 = miny + rows * (i + 1) / threads;
+            bands[i].covered = 0;
+        }
+        for (i = 1; i < threads; i++) {
+            if (pthread_create(&th[made], NULL, raster_thread,
+                &bands[i]) == 0) {
+                made++;
+            } else {
+                raster_band(&c, bands[i].y0, bands[i].y1,
+                    &bands[i].covered);
+            }
+        }
+        raster_band(&c, bands[0].y0, bands[0].y1, &bands[0].covered);
+        for (i = 0; i < made; i++) {
+            pthread_join(th[i], NULL);
+        }
+        for (i = 0; i < threads; i++) {
+            covered += bands[i].covered;
+        }
+    } while (0);
+
     (*env)->ReleaseLongArrayElements(env, jpages, pages, JNI_ABORT);
     (*env)->ReleaseFloatArrayElements(env, jverts, v, JNI_ABORT);
     if (tex != NULL) {
         (*env)->ReleaseIntArrayElements(env, jtex, tex, JNI_ABORT);
     }
-    return (jint)covered;
+    return (jlong)covered;
 }

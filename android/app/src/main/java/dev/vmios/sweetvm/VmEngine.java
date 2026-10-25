@@ -172,6 +172,12 @@ public final class VmEngine {
         String qemu = eng.qemu.getAbsolutePath();
 
         List<String> cmd = new ArrayList<>();
+        // Keep TCG on the big cluster. Android otherwise parks a four-thread
+        // load on the mid cores (1.4-1.7 GHz) and leaves the 3.3 GHz prime
+        // core idle; mask 0xf0 is cpu4..cpu7 and is inherited by every QEMU
+        // thread, including the TCG vCPU threads.
+        cmd.add("/system/bin/taskset");
+        cmd.add("f0");
         cmd.add(qemu);
         // Multi-CPU boots stay at EL1 (no EL2): QEMU is started with -S and
         // the PSCI conduit is switched to SMC over QMP before cont. The
