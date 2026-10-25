@@ -2,6 +2,26 @@
 
 ### >>> ACTIVE: CA 宿主光栅化（性能整改）(2026-10-25) <<<
 
+**14:15 多核 PSCI 与 present offload 的下一轮测试已备好（设备掉线，未跑）。**
+- **PSCI 根因（宿主 QEMU 复现）**：4 vCPU + `--qemu-psci` 在 CPU0 反复
+  `Undefined Instruction`（ELR `check_exception_stack`、向量 +0x200）。`hvc #0`
+  在 EL1 且未实现 EL2 时是未定义指令；QEMU virt 需要 `virtualization=on`
+  才会把 HVC 接到 PSCI。`VmEngine` 现在对 `cpus>=2` 使用
+  `virt,gic-version=3,virtualization=on`。mkadt 已把全部 CPU 标 running。
+  待测 payload：`payload-4cpu-psci-quiet.bin`（md5 60d8f3ac…，4 CPU 节点、
+  PSCI HVC、quiet 插件）。
+- **present offload**：内核已确认初始化（`SWEET FB: native present command at
+  0x9d000000`），协议（命令区 0x9d000000、doorbell 0x0f000000、completed@12）
+  与 QEMU `sweet_fb.c` 完全一致；但 app `present=native` 时 `copies` 冻结。
+  APK 已加诊断：completion 序号变化时打印 `offload completed=... status=...`。
+  待测 payload：`payload-0097m-offload.bin`（md5 22af99fd…，quiet 插件）。
+- **插件日志**：`sweet_log`（每个 Metal selector 的 console 写）默认关闭，
+  `payload-0097l.bin`（md5 22c748b1…）是 quiet 1 vCPU 基线，用来量 fps 收益。
+- **设备状态**：14:14 起再次从 adb 掉线。设备上最后一次成功部署的是 m5b 对照
+  payload（a3150f27），APK 仍是旧构建；回连后先装新 APK，再按测试目标换 payload。
+- 已知问题：quiet 运行里 backboardd 在 t=263 崩过一次（heap far，在 stage
+  创建之前）；镜像健康度需用 m5b 对照重新确认。
+
 **13:53 多核的真正卡点：guest SMP bring-up，不是调度。**
 - 之前 2/4 vCPU “只有一条 TCG 线程忙” 的直接原因已找到：`mkadt.py` 把
   cpu1..N 的 DT `state` 写成 `stopped`，XNU 的 topology 只算 1 个 CPU

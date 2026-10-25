@@ -124,6 +124,8 @@ __attribute__((objc_root_class))
 @end
 
 static int console_fd = -1;
+/* Forwarded-selector trace; off in the normal build (see sweet_log). */
+static int sweet_verbose;
 static id sweet_device_self;
 static char sweet_lib_path[256];
 static unsigned int sweet_accel_port;
@@ -175,6 +177,15 @@ sweet_channel(double value)
 static void
 sweet_log(const char *what, const char *sel)
 {
+	/*
+	 * This runs for every forwarded selector. Under TCG the formatted
+	 * console write costs more than the selector itself, and CA issues
+	 * thousands per frame, so the trace is off by default. Errors and the
+	 * stage/raster summaries use dprintf directly and stay visible.
+	 */
+	if (!sweet_verbose) {
+		return;
+	}
 	if (console_fd < 0) {
 		console_fd = open("/dev/console", 1 /* O_WRONLY */);
 	}

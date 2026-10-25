@@ -173,7 +173,12 @@ public final class VmEngine {
 
         List<String> cmd = new ArrayList<>();
         cmd.add(qemu);
-        cmd.add("-M"); cmd.add("virt,gic-version=3");
+        // The SWEET PSCI CPU_ON in the multi-CPU payloads is patched to HVC
+        // (mkpayload --qemu-psci). HVC from EL1 is undefined unless EL2 is
+        // implemented, so multi-CPU boots need virtualization=on.
+        cmd.add("-M");
+        cmd.add(cpus >= 2 ? "virt,gic-version=3,virtualization=on"
+                : "virt,gic-version=3");
         cmd.add("-cpu"); cmd.add("cortex-a76");
         cmd.add("-smp"); cmd.add(Integer.toString(cpus));
         cmd.add("-m"); cmd.add(RAM_GIB + "G");
@@ -343,6 +348,7 @@ public final class VmEngine {
             int[] lastProbe = sequenceMode ? null : new int[probe.length];
             boolean haveLast = false;
             int lastSequence = -1;
+            int seqLogs = 0;
             try {
                 while (running) {
                     ticks++;
@@ -350,6 +356,12 @@ public final class VmEngine {
                     boolean newFrame;
                     if (sequenceMode) {
                         int sequence = completion.getInt(OFFLOAD_COMPLETED);
+                        int status = completion.getInt(16);
+                        if (sequence != lastSequence && seqLogs < 8) {
+                            seqLogs++;
+                            android.util.Log.i("sweetvm", "offload completed="
+                                    + sequence + " status=" + status);
+                        }
                         newFrame = sequence != lastSequence;
                         lastSequence = sequence;
                     } else {

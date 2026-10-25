@@ -245,6 +245,8 @@ def main():
                     help='bridge the first virtio-mmio console to a host TCP GPU wire server')
     ap.add_argument('--incoming', metavar='FILE',
                     help='restore a VM state written by QMP migrate file:...')
+    ap.add_argument('--machine-extra',
+                    help='extra -M virt properties, e.g. virtualization=on')
     ap.add_argument('--qemu-debug', action='store_true',
                     help='log every exception to qemu.log (-d int,guest_errors,unimp); slow, off by default')
     a = ap.parse_args()
@@ -292,7 +294,10 @@ def main():
     # virt RAM starts at 0x40000000: cover the payload's RAM (mkadt.py --highmem needs 8G).
     mem_size = struct.unpack_from('<Q', payload, 0x40)[0]
     ram_gib = max(4, -(-(phys_base + mem_size - 0x40000000) // (1 << 30)))
-    cmd = [a.qemu, '-M', 'virt,gic-version=3', '-cpu', a.cpu,
+    machine = 'virt,gic-version=3'
+    if a.machine_extra:
+        machine += ',' + a.machine_extra
+    cmd = [a.qemu, '-M', machine, '-cpu', a.cpu,
            '-smp', str(a.smp), '-m', f'{ram_gib}G',
            '-accel', ('tcg,thread=single' if a.tcg_single or a.smp == 1 else 'tcg,thread=multi') + ',tb-size=512',
            '-nographic', '-serial', f'file:{out}/serial.txt', '-qmp', f'unix:{mon},server,nowait',
