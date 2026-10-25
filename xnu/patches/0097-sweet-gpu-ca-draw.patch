@@ -1,24 +1,32 @@
 diff --git a/iokit/Kernel/arm/SweetGPU.cpp b/iokit/Kernel/arm/SweetGPU.cpp
-index 2835d6a..200a7b0 100644
+index 2835d6a..aeef74d 100644
 --- a/iokit/Kernel/arm/SweetGPU.cpp
 +++ b/iokit/Kernel/arm/SweetGPU.cpp
-@@ -15,13 +15,29 @@
+@@ -15,13 +15,58 @@
  #include <pexpert/pexpert.h>
  #include "SweetSurface.h"
  
 -/* Custom user-client selector: fill an IOSurface on the host GPU. */
 +/* Custom user-client selectors: host-side rasterization of the guest's
-+ * IOSurfaces. 0x100 fills, 0x101 forwards a CoreAnimation draw batch (the
-+ * kernel waits for the host to finish it), 0x102 reports where a surface
-+ * lives so the plugin can decide whether the host can address it. */
++ * IOSurfaces. 0x100 fills, 0x101 queues a CoreAnimation draw batch, 0x102
++ * reports a surface's physical layout, 0x103 flushes the queue and waits for
++ * the host, 0x104 hands the host the page map of a surface so it can address
++ * buffers the allocator did not make contiguous. */
  #define kSweetGPUClearSurface 0x100
 +#define kSweetGPUCADraw 0x101
 +#define kSweetGPUSurfaceInfo 0x102
++#define kSweetGPUCADrawFlush 0x103
++#define kSweetGPUSurfaceMap 0x104
  #define SWEET_GPU_WIRE_MAGIC 0x5550474e
  #define SWEET_GPU_WIRE_VERSION 1
  #define SWEET_GPU_WIRE_FILL 3
 +#define SWEET_GPU_WIRE_CA_DRAW 4
++#define SWEET_GPU_WIRE_TEXMAP 5
++#define SWEET_GPU_WIRE_CA_FLUSH 6
 +#define SWEET_GPU_CA_MAX_PAYLOAD 4000
++#define SWEET_GPU_PAGE_SHIFT 14
++#define SWEET_GPU_PAGE_SIZE (1u << SWEET_GPU_PAGE_SHIFT)
++#define SWEET_GPU_MAP_PAGES 480
  
  extern "C" IOReturn sweet_gpu_wire_send(const void *data, size_t bytes);
 +extern "C" IOReturn sweet_gpu_wire_send_wait(const void *data, size_t bytes,
@@ -30,18 +38,41 @@ index 2835d6a..200a7b0 100644
 +	uint32_t flags;		/* bit0: one physical run covers the surface */
 +	uint32_t segments;
 +};
++
++/* WIRE_TEXMAP payload: the guest page list of one surface. The host keys its
++ * cache on the surface id and replaces the map when the first page moves. */
++struct sweet_gpu_wire_map {
++	uint32_t surface;
++	uint32_t page_index;	/* index of pages[0] within the surface */
++	uint32_t page_count;	/* entries used in this message */
++	uint32_t total_pages;
++	uint32_t alloc_lo, alloc_hi;
++	uint32_t first_pa_lo, first_pa_hi;
++	uint32_t page_shift;
++	uint32_t reserved;
++	uint64_t pages[SWEET_GPU_MAP_PAGES];
++};
++
++struct sweet_gpu_map_result {
++	uint32_t ok;
++	uint32_t total_pages;
++	uint32_t alloc_lo, alloc_hi;
++	uint32_t first_pa_lo, first_pa_hi;
++};
  
  struct sweet_gpu_wire_header {
  	uint32_t magic;
-@@ -58,6 +74,7 @@ OSDefineMetaClassAndStructors(SweetGPUUserClient, IOUserClient);
+@@ -58,6 +103,9 @@ OSDefineMetaClassAndStructors(SweetGPUUserClient, IOUserClient);
  
  static uint64_t sweet_gpu_logged;
  static unsigned sweet_gpu_fills;
 +static unsigned sweet_gpu_draws;
++static unsigned sweet_gpu_flushes;
++static unsigned sweet_gpu_maps;
  
  bool
  SweetGPUUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type)
-@@ -85,6 +102,41 @@ SweetGPUUserClient::registerNotificationPort(mach_port_t port, UInt32 type,
+@@ -85,6 +133,117 @@ SweetGPUUserClient::registerNotificationPort(mach_port_t port, UInt32 type,
  	return kIOReturnSuccess;
  }
  
@@ -80,10 +111,86 @@ index 2835d6a..200a7b0 100644
 +	info->flags = (runs == 1 && offset >= s->allocSize) ? 1 : 0;
 +}
 +
++/*
++ * Stream the surface's page tables to the host. The host samples and blends
++ * into guest RAM through the shared RAM file, which needs a physical address
++ * per 16 KiB page; nothing else in the guest can supply that mapping.
++ */
++static IOReturn
++sweet_surface_send_map(SweetSurface *s, uint32_t surface, uint32_t *out_pages,
++    addr64_t *out_first)
++{
++	uint32_t total = (uint32_t)((s->allocSize + SWEET_GPU_PAGE_SIZE - 1) >>
++	    SWEET_GPU_PAGE_SHIFT);
++	size_t message_size = 16 + sizeof(struct sweet_gpu_wire_map);
++	unsigned char *message = (unsigned char *)IOMalloc(message_size);
++	if (message == NULL) {
++		return kIOReturnNoMemory;
++	}
++	struct sweet_gpu_wire_header *header =
++	    (struct sweet_gpu_wire_header *)message;
++	struct sweet_gpu_wire_map *map =
++	    (struct sweet_gpu_wire_map *)(message + 16);
++	bzero(map, sizeof(*map));
++	header->magic = SWEET_GPU_WIRE_MAGIC;
++	header->version = SWEET_GPU_WIRE_VERSION;
++	header->operation = SWEET_GPU_WIRE_TEXMAP;
++	header->request = surface;
++	IOByteCount offset = 0;
++	uint32_t index = 0;
++	addr64_t first = 0;
++	IOReturn result = kIOReturnSuccess;
++	while (offset < s->allocSize && index < total) {
++		IOByteCount length = 0;
++		addr64_t pa = s->memory->getPhysicalSegment(offset, &length, 0);
++		if (pa == 0 || length == 0) {
++			result = kIOReturnIOError;
++			break;
++		}
++		IOByteCount end = offset + length;
++		while (offset < end && index < total) {
++			if (map->page_count == 0) {
++				map->surface = surface;
++				map->page_index = index;
++				map->total_pages = total;
++				map->alloc_lo = (uint32_t)s->allocSize;
++				map->alloc_hi = (uint32_t)((uint64_t)s->allocSize >> 32);
++				map->first_pa_lo = (uint32_t)first;
++				map->first_pa_hi = (uint32_t)(first >> 32);
++				map->page_shift = SWEET_GPU_PAGE_SHIFT;
++			}
++			if (index == 0) {
++				first = pa;
++				map->first_pa_lo = (uint32_t)first;
++				map->first_pa_hi = (uint32_t)(first >> 32);
++			}
++			map->pages[map->page_count++] = pa;
++			index++;
++			offset += SWEET_GPU_PAGE_SIZE;
++			pa += SWEET_GPU_PAGE_SIZE;
++			if (map->page_count == SWEET_GPU_MAP_PAGES || index == total) {
++				header->bytes = (uint32_t)(40 + 8 * map->page_count);
++				result = sweet_gpu_wire_send(message, 16 + header->bytes);
++				map->page_count = 0;
++				if (result != kIOReturnSuccess) {
++					break;
++				}
++			}
++		}
++		if (result != kIOReturnSuccess) {
++			break;
++		}
++	}
++	IOFree(message, message_size);
++	*out_pages = index;
++	*out_first = first;
++	return result;
++}
++
  IOReturn
  SweetGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
      IOExternalMethodDispatch *dispatch, OSObject *target, void *reference)
-@@ -92,6 +144,55 @@ SweetGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
+@@ -92,6 +251,112 @@ SweetGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
  	if (args == NULL) {
  		return kIOReturnBadArgument;
  	}
@@ -126,8 +233,9 @@ index 2835d6a..200a7b0 100644
 +		header->request = sequence;
 +		memcpy(message + 16, (const unsigned char *)args->structureInput + 8,
 +		    payload);
-+		IOReturn result = sweet_gpu_wire_send_wait(message, 16 + payload,
-+		    sequence);
++		/* Queued, not executed: the plugin flushes once per commit so the
++		 * guest is not serialized on every draw. */
++		IOReturn result = sweet_gpu_wire_send(message, 16 + payload);
 +		IOFree(message, 16 + payload);
 +		if (sweet_gpu_draws < 8) {
 +			sweet_gpu_draws++;
@@ -135,6 +243,62 @@ index 2835d6a..200a7b0 100644
 +			    sequence, payload, result);
 +		}
 +		return result;
++	}
++	if (selector == kSweetGPUCADrawFlush) {
++		uint32_t sequence = 0;
++		if (args->structureInput == NULL || args->structureInputSize < 4) {
++			return kIOReturnBadArgument;
++		}
++		memcpy(&sequence, args->structureInput, 4);
++		struct sweet_gpu_wire_header header;
++		bzero(&header, sizeof(header));
++		header.magic = SWEET_GPU_WIRE_MAGIC;
++		header.version = SWEET_GPU_WIRE_VERSION;
++		header.operation = SWEET_GPU_WIRE_CA_FLUSH;
++		header.request = sequence;
++		IOReturn result = sweet_gpu_wire_send_wait(&header, sizeof(header),
++		    sequence);
++		if (sweet_gpu_flushes < 16) {
++			sweet_gpu_flushes++;
++			IOLog("SWEET GPU: flush seq %u result 0x%x\n", sequence,
++			    result);
++		}
++		return result;
++	}
++	if (selector == kSweetGPUSurfaceMap) {
++		uint32_t surface = 0;
++		struct sweet_gpu_map_result out;
++		if (args->structureInput == NULL || args->structureInputSize < 4 ||
++		    args->structureOutput == NULL ||
++		    args->structureOutputSize < sizeof(out)) {
++			return kIOReturnBadArgument;
++		}
++		memcpy(&surface, args->structureInput, 4);
++		SweetSurface *s = sweet_surface_copy(surface);
++		if (s == NULL) {
++			return kIOReturnNotFound;
++		}
++		bzero(&out, sizeof(out));
++		uint32_t pages = 0;
++		addr64_t first = 0;
++		IOReturn result = kIOReturnNotReady;
++		if (s->memory != NULL && s->allocSize != 0) {
++			result = sweet_surface_send_map(s, surface, &pages, &first);
++		}
++		out.ok = result == kIOReturnSuccess ? 1 : 0;
++		out.total_pages = pages;
++		out.alloc_lo = (uint32_t)s->allocSize;
++		out.alloc_hi = (uint32_t)((uint64_t)s->allocSize >> 32);
++		out.first_pa_lo = (uint32_t)first;
++		out.first_pa_hi = (uint32_t)(first >> 32);
++		memcpy(args->structureOutput, &out, sizeof(out));
++		if (sweet_gpu_maps < 16) {
++			sweet_gpu_maps++;
++			IOLog("SWEET GPU: map surface %u pages %u alloc %u result 0x%x\n",
++			    surface, pages, (uint32_t)s->allocSize, result);
++		}
++		s->release();
++		return kIOReturnSuccess;
 +	}
  	if (selector == kSweetGPUClearSurface) {
  		struct {
