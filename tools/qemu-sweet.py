@@ -101,8 +101,13 @@ def build_image(payload):
 
 
 def stub(ba_pa, entry_pa):
-    # ldr x0, =ba ; ldr x1, =entry ; br x1 ; nop ; .quad ba ; .quad entry
-    return struct.pack('<4I2Q', 0x58000080, 0x580000a1, 0xd61f0020, 0xd503201f, ba_pa, entry_pa)
+    # EL2 -> EL1 drop, then load boot_args/entry and branch. QEMU enters at
+    # EL2 when virtualization=on (needed for the PSCI HVC conduit); XNU runs
+    # at EL1. The first compare falls through on EL1 boots.
+    code = [0xd5384242, 0xf100205f, 0x540000e1, 0xd28078a2, 0xd51c4002,
+            0x10000082, 0xd51c4022, 0xd51c111f, 0xd69f03e0, 0x10000083,
+            0xf9400060, 0xf9400461, 0xd61f0020]
+    return struct.pack('<13I2Q', *code, ba_pa, entry_pa)
 
 
 def write_png(path, raw):

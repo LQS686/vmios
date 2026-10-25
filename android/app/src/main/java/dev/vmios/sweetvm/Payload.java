@@ -208,11 +208,31 @@ public final class Payload {
             out.write(img);
         }
 
-        ByteBuffer stub = ByteBuffer.allocate(32).order(ByteOrder.LITTLE_ENDIAN);
-        stub.putInt(0x58000080);            // ldr x0, =boot_args
-        stub.putInt(0x580000a1);            // ldr x1, =entry
-        stub.putInt(0xd61f0020);            // br x1
-        stub.putInt(0xd503201f);            // nop
+        /*
+         * Multi-CPU QEMU boots need virtualization=on for the PSCI HVC
+         * conduit, which makes QEMU enter this stub at EL2. XNU must run at
+         * EL1, so drop EL2 -> EL1 first, then load boot_args/entry and branch.
+         * At EL1 (single-CPU QEMU, the phone) the first compare falls through.
+         */
+        int[] code = {
+                0xd5384242, // mrs x2, CurrentEL
+                0xf100205f, // cmp x2, #8 (EL2)
+                0x540000e1, // b.ne 2f
+                0xd28078a2, // mov x2, #0x3c5 (EL1h, DAIF masked)
+                0xd51c4002, // msr spsr_el2, x2
+                0x10000082, // adr x2, 2f
+                0xd51c4022, // msr elr_el2, x2
+                0xd51c111f, // msr hcr_el2, xzr
+                0xd69f03e0, // eret
+                0x10000083, // adr x3, 3f
+                0xf9400060, // ldr x0, [x3]
+                0xf9400461, // ldr x1, [x3, #8]
+                0xd61f0020, // br x1
+        };
+        ByteBuffer stub = ByteBuffer.allocate(68).order(ByteOrder.LITTLE_ENDIAN);
+        for (int word : code) {
+            stub.putInt(word);
+        }
         stub.putLong(baPa);
         stub.putLong(entryPa());
         try (FileOutputStream out = new FileOutputStream(stubFile)) {

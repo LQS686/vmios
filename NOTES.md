@@ -2,6 +2,22 @@
 
 ### >>> ACTIVE: CA 宿主光栅化（性能整改）(2026-10-25) <<<
 
+**14:47 present offload 真机验证成功；渲染异常定位到渐变块。**
+- `payload-0097m-offload.bin`（quiet 插件 + `sweetfb_offload=1`）+ 新 APK：
+  `-device sweet-fb` 生效，app 日志 `offload completed=1,2,3… status=0`
+  持续增长，`copies` 从 2 涨到 464，fps 3–5。guest 不再执行每帧
+  10.9 MB 的 present memcpy（由 QEMU sweet-fb 在宿主做）。
+- 画面：状态栏时间/电量/home indicator 正确；中间出现一块 **灰白渐变矩形，
+  带 3 条竖直缝**（见 `.tools/shot-offload2.png`）。这是下一个渲染缺陷，
+  怀疑 host 内部纹理上传分块/采样或行跨页时的边界。
+- **多核仍阻塞在 EL2 入口**：`virtualization=on` 时 QEMU 从 EL2 进入；新
+  EL-drop stub（`Payload.java` 68 字节）能把异常从 EL1 的 0x200 改变为
+  `eret` 的 Illegal Execution State（ELR 0x40200024），从核仍未启动。
+  SMC + virtualization=on 的 4 vCPU 也停在早期。下一步查 stub 的
+  SPSR/ELR 编码，或试 `-cpu max`/其它 EL 配置；host QEMU 可复现。
+- 1 vCPU 走新 stub 的 EL1 路径正常（本次 offload 启动就是），stub 对
+  `virtualization=off` 安全。
+
 **14:15 多核 PSCI 与 present offload 的下一轮测试已备好（设备掉线，未跑）。**
 - **PSCI 根因（宿主 QEMU 复现）**：4 vCPU + `--qemu-psci` 在 CPU0 反复
   `Undefined Instruction`（ELR `check_exception_stack`、向量 +0x200）。`hvc #0`
