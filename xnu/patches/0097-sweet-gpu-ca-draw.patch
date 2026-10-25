@@ -1,0 +1,312 @@
+diff --git a/iokit/Kernel/arm/SweetGPU.cpp b/iokit/Kernel/arm/SweetGPU.cpp
+index 2835d6a..200a7b0 100644
+--- a/iokit/Kernel/arm/SweetGPU.cpp
++++ b/iokit/Kernel/arm/SweetGPU.cpp
+@@ -15,13 +15,29 @@
+ #include <pexpert/pexpert.h>
+ #include "SweetSurface.h"
+ 
+-/* Custom user-client selector: fill an IOSurface on the host GPU. */
++/* Custom user-client selectors: host-side rasterization of the guest's
++ * IOSurfaces. 0x100 fills, 0x101 forwards a CoreAnimation draw batch (the
++ * kernel waits for the host to finish it), 0x102 reports where a surface
++ * lives so the plugin can decide whether the host can address it. */
+ #define kSweetGPUClearSurface 0x100
++#define kSweetGPUCADraw 0x101
++#define kSweetGPUSurfaceInfo 0x102
+ #define SWEET_GPU_WIRE_MAGIC 0x5550474e
+ #define SWEET_GPU_WIRE_VERSION 1
+ #define SWEET_GPU_WIRE_FILL 3
++#define SWEET_GPU_WIRE_CA_DRAW 4
++#define SWEET_GPU_CA_MAX_PAYLOAD 4000
+ 
+ extern "C" IOReturn sweet_gpu_wire_send(const void *data, size_t bytes);
++extern "C" IOReturn sweet_gpu_wire_send_wait(const void *data, size_t bytes,
++    uint32_t sequence);
++
++struct sweet_gpu_surface_info {
++	uint32_t pa_lo, pa_hi;
++	uint32_t width, height, bytes_per_row, alloc;
++	uint32_t flags;		/* bit0: one physical run covers the surface */
++	uint32_t segments;
++};
+ 
+ struct sweet_gpu_wire_header {
+ 	uint32_t magic;
+@@ -58,6 +74,7 @@ OSDefineMetaClassAndStructors(SweetGPUUserClient, IOUserClient);
+ 
+ static uint64_t sweet_gpu_logged;
+ static unsigned sweet_gpu_fills;
++static unsigned sweet_gpu_draws;
+ 
+ bool
+ SweetGPUUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type)
+@@ -85,6 +102,41 @@ SweetGPUUserClient::registerNotificationPort(mach_port_t port, UInt32 type,
+ 	return kIOReturnSuccess;
+ }
+ 
++/*
++ * A draw batch is addressed by guest physical address, so the surface has to
++ * be one linear run. IOSurfaces made of 16 KiB pages are not, and the plugin
++ * keeps rasterizing those itself.
++ */
++static void
++sweet_surface_locate(SweetSurface *s, struct sweet_gpu_surface_info *info)
++{
++	bzero(info, sizeof(*info));
++	info->width = s->width;
++	info->height = s->height;
++	info->bytes_per_row = s->bytesPerRow;
++	info->alloc = s->allocSize;
++	if (s->memory == NULL || s->allocSize == 0) {
++		return;
++	}
++	IOByteCount first = 0;
++	addr64_t pa = s->memory->getPhysicalSegment(0, &first, 0);
++	info->pa_lo = (uint32_t)pa;
++	info->pa_hi = (uint32_t)(pa >> 32);
++	IOByteCount offset = 0;
++	uint32_t runs = 0;
++	while (offset < s->allocSize && runs < 65536) {
++		IOByteCount length = 0;
++		if (s->memory->getPhysicalSegment(offset, &length, 0) == 0 ||
++		    length == 0) {
++			break;
++		}
++		runs++;
++		offset += length;
++	}
++	info->segments = runs;
++	info->flags = (runs == 1 && offset >= s->allocSize) ? 1 : 0;
++}
++
+ IOReturn
+ SweetGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
+     IOExternalMethodDispatch *dispatch, OSObject *target, void *reference)
+@@ -92,6 +144,55 @@ SweetGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
+ 	if (args == NULL) {
+ 		return kIOReturnBadArgument;
+ 	}
++	if (selector == kSweetGPUSurfaceInfo) {
++		uint32_t surface = 0;
++		struct sweet_gpu_surface_info info;
++		if (args->structureInput == NULL || args->structureInputSize < 4 ||
++		    args->structureOutput == NULL ||
++		    args->structureOutputSize < sizeof(info)) {
++			return kIOReturnBadArgument;
++		}
++		memcpy(&surface, args->structureInput, 4);
++		SweetSurface *s = sweet_surface_copy(surface);
++		if (s == NULL) {
++			return kIOReturnNotFound;
++		}
++		sweet_surface_locate(s, &info);
++		memcpy(args->structureOutput, &info, sizeof(info));
++		s->release();
++		return kIOReturnSuccess;
++	}
++	if (selector == kSweetGPUCADraw) {
++		if (args->structureInput == NULL || args->structureInputSize < 8 ||
++		    args->structureInputSize > 8 + SWEET_GPU_CA_MAX_PAYLOAD) {
++			return kIOReturnBadArgument;
++		}
++		uint32_t sequence = 0;
++		uint32_t payload = (uint32_t)args->structureInputSize - 8;
++		memcpy(&sequence, args->structureInput, 4);
++		unsigned char *message = (unsigned char *)IOMalloc(16 + payload);
++		if (message == NULL) {
++			return kIOReturnNoMemory;
++		}
++		struct sweet_gpu_wire_header *header =
++		    (struct sweet_gpu_wire_header *)message;
++		header->magic = SWEET_GPU_WIRE_MAGIC;
++		header->version = SWEET_GPU_WIRE_VERSION;
++		header->operation = SWEET_GPU_WIRE_CA_DRAW;
++		header->bytes = payload;
++		header->request = sequence;
++		memcpy(message + 16, (const unsigned char *)args->structureInput + 8,
++		    payload);
++		IOReturn result = sweet_gpu_wire_send_wait(message, 16 + payload,
++		    sequence);
++		IOFree(message, 16 + payload);
++		if (sweet_gpu_draws < 8) {
++			sweet_gpu_draws++;
++			IOLog("SWEET GPU: draw seq %u bytes %u result 0x%x\n",
++			    sequence, payload, result);
++		}
++		return result;
++	}
+ 	if (selector == kSweetGPUClearSurface) {
+ 		struct {
+ 			uint32_t surface, color, x, y, width, height;
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 7f90c56..6c448ff 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -73,6 +73,7 @@ static uint32_t      sweet_surface_users[SWEET_SURFACE_MAX_ID];
+ static uint32_t      sweet_surface_next_id = 1;
+ static uint32_t      sweet_surface_creates_logged;
+ static uint64_t      sweet_surface_wired;       /* bytes of buffer surfaces */
++static uint32_t      sweet_surface_wired_logs;
+ #define SWEET_SURFACE_WIRED_MAX         (1536ull << 20)
+ 
+ OSDefineMetaClassAndStructors(SweetSurface, OSObject);
+@@ -686,10 +687,29 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 	ret = sweet_surface_layout(s, props);
+ 	if (ret == kIOReturnSuccess) {
+ 		IOBufferMemoryDescriptor *mem = NULL;
++		int contiguous = 0;
+ 		if ((uint64_t)OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired) +
+ 		    s->allocSize <= SWEET_SURFACE_WIRED_MAX) {
++			/* The host compositor addresses surfaces by physical address, so
++			 * prefer one linear run; fall back to ordinary wired pages when
++			 * the allocator cannot supply one. */
+ 			mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+-			    kIODirectionInOut | kIOMemoryKernelUserShared, s->allocSize, page_size);
++			    kIODirectionInOut | kIOMemoryKernelUserShared |
++			    kIOMemoryPhysicallyContiguous, s->allocSize, page_size);
++			contiguous = mem != NULL;
++			if (mem == NULL) {
++				mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
++				    kIODirectionInOut | kIOMemoryKernelUserShared,
++				    s->allocSize, page_size);
++			}
++		}
++		if (mem != NULL && sweet_surface_wired_logs < 64) {
++			IOByteCount span = 0;
++			addr64_t pa = mem->getPhysicalSegment(0, &span, 0);
++			sweet_surface_wired_logs++;
++			IOLog("SWEET SURF: memory %u bytes contiguous=%d pa 0x%llx span 0x%llx\n",
++			    s->allocSize, contiguous, (unsigned long long)pa,
++			    (unsigned long long)span);
+ 		}
+ 		if (mem == NULL) {
+ 			OSAddAtomic64(-(SInt64)s->allocSize, (volatile SInt64 *)&sweet_surface_wired);
+diff --git a/iokit/Kernel/arm/SweetVirtioConsole.cpp b/iokit/Kernel/arm/SweetVirtioConsole.cpp
+index 5488156..9f5d84d 100644
+--- a/iokit/Kernel/arm/SweetVirtioConsole.cpp
++++ b/iokit/Kernel/arm/SweetVirtioConsole.cpp
+@@ -108,6 +108,7 @@ class SweetVirtioConsole : public IOService {
+ 	bool configure();
+ 	void post(unsigned id, unsigned bytes);
+ 	IOReturn complete(unsigned id, unsigned *length);
++	IOReturn completeWithin(unsigned id, unsigned *length, unsigned ms);
+ 	void cleanup();
+ 
+ public:
+@@ -117,6 +118,7 @@ public:
+ 	void free() APPLE_KEXT_OVERRIDE;
+ 
+ 	IOReturn send(const void *data, size_t bytes);
++	IOReturn sendWait(const void *data, size_t bytes, uint32_t sequence);
+ 	IOReturn receive(void *data, size_t *bytes);
+ };
+ 
+@@ -137,6 +139,18 @@ sweet_gpu_wire_send(const void *data, size_t bytes)
+ 	return console->send(data, bytes);
+ }
+ 
++/* Draw batches must be finished on the host before the guest touches the
++ * surfaces again, so wait for the matching acknowledgement. */
++extern "C" IOReturn
++sweet_gpu_wire_send_wait(const void *data, size_t bytes, uint32_t sequence)
++{
++	SweetVirtioConsole *console = sweet_wire_console;
++	if (console == nullptr) {
++		return kIOReturnOffline;
++	}
++	return console->sendWait(data, bytes, sequence);
++}
++
+ IOService *
+ SweetVirtioConsole::probe(IOService *provider, SInt32 *score)
+ {
+@@ -258,6 +272,12 @@ SweetVirtioConsole::post(unsigned id, unsigned bytes)
+ 
+ IOReturn
+ SweetVirtioConsole::complete(unsigned id, unsigned *length)
++{
++	return completeWithin(id, length, 2000);
++}
++
++IOReturn
++SweetVirtioConsole::completeWithin(unsigned id, unsigned *length, unsigned ms)
+ {
+ 	Queue &q = queues[id];
+ 	if (!q.pending) {
+@@ -265,7 +285,7 @@ SweetVirtioConsole::complete(unsigned id, unsigned *length)
+ 	}
+ 	volatile uint16_t *used = reinterpret_cast<volatile uint16_t *>(q.memory() + 256);
+ 	uint64_t deadline;
+-	clock_interval_to_deadline(2000, kMillisecondScale, &deadline);
++	clock_interval_to_deadline(ms, kMillisecondScale, &deadline);
+ 	while (used[1] == q.used) {
+ 		if (read32(0x70) & (64 | 128)) {
+ 			online = false;
+@@ -325,6 +345,66 @@ SweetVirtioConsole::send(const void *data, size_t bytes)
+ 	return status;
+ }
+ 
++/* The host answers every draw batch with {wire magic, sequence}. */
++IOReturn
++SweetVirtioConsole::sendWait(const void *data, size_t bytes, uint32_t sequence)
++{
++	struct { uint32_t magic; uint32_t sequence; } ack;
++	if (data == nullptr || bytes == 0 || bytes > kBufferSize) {
++		return kIOReturnBadArgument;
++	}
++	IOLockLock(gate);
++	IOReturn status = kIOReturnNotReady;
++	Queue &q = queues[1];
++	Queue &in = queues[0];
++	if (online) {
++		unsigned consumed = 0;
++		if (q.pending) {
++			status = complete(1, &consumed);
++		} else {
++			status = kIOReturnSuccess;
++		}
++		/* Drop a late acknowledgement from an earlier batch. */
++		if (status == kIOReturnSuccess && in.pending) {
++			unsigned dropped = 0;
++			completeWithin(0, &dropped, 0);
++		}
++		/* Give the host a receive buffer before it can answer. */
++		if (status == kIOReturnSuccess && !in.pending) {
++			post(0, kBufferSize);
++		}
++		if (status == kIOReturnSuccess) {
++			memcpy(q.data(), data, bytes);
++			post(1, (unsigned)bytes);
++			status = complete(1, &consumed);
++		}
++		if (status == kIOReturnSuccess) {
++			status = kIOReturnNotResponding;
++			for (unsigned tries = 0; tries < 4; tries++) {
++				unsigned got = 0;
++				IOReturn reply = completeWithin(0, &got, 250);
++				if (reply != kIOReturnSuccess) {
++					break;
++				}
++				if (got >= sizeof(ack)) {
++					memcpy(&ack, in.data(), sizeof(ack));
++					if (ack.magic == kGpuWireMagic &&
++					    ack.sequence == sequence) {
++						status = kIOReturnSuccess;
++						break;
++					}
++				}
++				post(0, kBufferSize);
++			}
++			if (!in.pending) {
++				post(0, kBufferSize);
++			}
++		}
++	}
++	IOLockUnlock(gate);
++	return status;
++}
++
+ IOReturn
+ SweetVirtioConsole::receive(void *data, size_t *bytes)
+ {
