@@ -2,6 +2,27 @@
 
 ### >>> ACTIVE: CA 宿主光栅化（性能整改）(2026-10-25) <<<
 
+**15:36 多核打通：4 vCPU 4/4 initialized，交互 10–12 fps。**
+- **ADT state 是 boot_cpu 的关键**：只把 cpu0 标 `running`、其余 `stopped`，
+  XNU topology 才能找到 boot CPU；SWEET CPU 驱动随后通过 PSCI 启动
+  stopped 的从核：日志 `requested=4 selected=4`、`cpu=1/2/3 CPU_ON
+  rc=0 ... came alive`、`4/4 CPUs initialized`。之前“全部 running”的
+  修改是错的（`topology_info.boot_cpu == NULL` panic），已回退。
+- **QEMU/PSCI**：`-S` 启动 + QMP `query-cpus-fast` 对每个 CPU
+  `qom-set psci-conduit=1`（SMC）+ `cont`；guest 留在 EL1（不开
+  virtualization，避开 EL2 下 CPU0 早期异常）。主控 SMC 由 QEMU
+  ersatz-EL3 处理。
+- **实测性能**：4 条 TCG 线程 60–74%；Setup/锁屏交互 **10–12 fps**
+  （1 vCPU 为 3–5 fps），copies 211→399，copy ~1.1 ms，约 2–2.5×。
+- **present offload 在 4 vCPU 下反而更慢**（1–3 fps，doorbell/拷贝串行），
+  最佳配置是 **4 vCPU + 无 offload**；1 vCPU offload 已被超过。
+- 产物：`sweet-4cpu-stopped.adt`、`payload-4cpu-stopped-smc.bin`
+  （md5 c7a3496f…）、带 QMP SMC 的 APK。设备当前跑这个最佳配置。
+- 渲染：Setup 加载页的渐变是平滑全屏的（之前三条竖缝是另一个动画
+  相位）；锁屏状态栏偏暗红/壁纸仍不完整，继续查。
+- 下一步：按同一 recipe 试 6 vCPU（ADT 6 节点、仅 cpu0 running、
+  `-smp 6`、QMP SMC），看是否继续提升/热限制；再优化渲染。
+
 **15:17 QMP 硬证据：EL2 路径下 CPU0 先进异常，从核停在 reset。**
 - app 新增 QMP 诊断（`Snapshot.probeCpus`，启动 40 s 后 `info registers -a`）：
   4 vCPU SMC+EL2+RW=1 启动时

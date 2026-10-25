@@ -165,12 +165,7 @@ def build(seed=None, qemu=False, highmem=False, no_product=False, qemu_cpus=1,
             ('cluster-core-id', u32(core)),
             ('l2-cache-id', u32(core)),  # distinct per-core L2 nodes in live FDT
             ('l3-cache-id', u32(0)),     # shared L3
-            # XNU's topology parser ignores CPUs whose DT state is not
-            # "running". Marking the secondaries stopped made cpus=4 payloads
-            # boot 1/1 CPUs (and idle every extra TCG thread). The real iBoot
-            # tree marks every core running; the kernel chooses how many to
-            # start from cpus=N.
-            ('state', cstr('running')),
+            ('state', cstr('running' if core == 0 else 'stopped')),
             ('timebase-frequency', u32(timebase)),
             ('clock-frequency', u32(2304000000 if core >= 6 else 1804800000)),
             ('bus-frequency', u32(100000000)),

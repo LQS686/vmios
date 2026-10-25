@@ -156,6 +156,44 @@ public final class Snapshot {
         }
     }
 
+    /**
+     * Start a -S VM with PSCI through the SMC conduit: QEMU normally picks
+     * HVC for a loader boot, but the SWEET kernel's CPU_ON is SMC and the
+     * guest must stay at EL1. Returns after cont.
+     */
+    public static void configurePsciSmc(File qmpSock) throws Exception {
+        LocalSocket s = new LocalSocket();
+        try {
+            s.connect(new LocalSocketAddress(qmpSock.getAbsolutePath(),
+                    LocalSocketAddress.Namespace.FILESYSTEM));
+            BufferedReader in = new BufferedReader(new InputStreamReader(
+                    s.getInputStream(), StandardCharsets.UTF_8));
+            OutputStream out = s.getOutputStream();
+            in.readLine();
+            qmp(out, in, "{\"execute\":\"qmp_capabilities\"}");
+            String r = qmp(out, in, "{\"execute\":\"query-cpus-fast\"}");
+            JSONObject o = new JSONObject(r);
+            org.json.JSONArray cpus = o.optJSONArray("return");
+            int n = cpus == null ? 0 : cpus.length();
+            for (int i = 0; i < n; i++) {
+                String path = cpus.getJSONObject(i).optString("qom-path");
+                if (path.isEmpty()) {
+                    continue;
+                }
+                qmp(out, in, "{\"execute\":\"qom-set\",\"arguments\":{\"path\":"
+                        + JSONObject.quote(path)
+                        + ",\"property\":\"psci-conduit\",\"value\":1}}");
+            }
+            qmp(out, in, "{\"execute\":\"cont\"}");
+            android.util.Log.i("sweetvm", "psci smc set on " + n + " cpus");
+        } finally {
+            try {
+                s.close();
+            } catch (IOException ignored) {
+            }
+        }
+    }
+
     private static String qmp(OutputStream out, BufferedReader in, String cmd)
             throws IOException {
         out.write((cmd + "\n").getBytes(StandardCharsets.UTF_8));

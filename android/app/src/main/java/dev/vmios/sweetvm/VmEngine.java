@@ -173,14 +173,12 @@ public final class VmEngine {
 
         List<String> cmd = new ArrayList<>();
         cmd.add(qemu);
-        // The SWEET PSCI CPU_ON in the multi-CPU payloads is patched to HVC
-        // (mkpayload --qemu-psci). Booting the stub through -kernel reaches
-        // arm_load_kernel, which sets the CPU psci-conduit to HVC and holds
-        // the secondaries powered off; HVC then traps to QEMU's PSCI without
-        // needing EL2.
+        // Multi-CPU boots stay at EL1 (no EL2): QEMU is started with -S and
+        // the PSCI conduit is switched to SMC over QMP before cont. The
+        // SWEET kernel's CPU_ON is SMC and QEMU's ersatz-EL3 conduit handles
+        // it; EL2 would make XNU fault before it can start the secondaries.
         cmd.add("-M");
-        cmd.add(cpus >= 2 ? "virt,gic-version=3,virtualization=on"
-                : "virt,gic-version=3");
+        cmd.add("virt,gic-version=3");
         cmd.add("-cpu"); cmd.add("cortex-a76");
         cmd.add("-smp"); cmd.add(Integer.toString(cpus));
         cmd.add("-m"); cmd.add(RAM_GIB + "G");
@@ -207,6 +205,10 @@ public final class VmEngine {
         cmd.add("-qmp");
         cmd.add("unix:" + qmpSocket.getAbsolutePath() + ",server=on,wait=off");
         cmd.add("-no-reboot");
+        if (cpus >= 2) {
+            // The QMP client below sets psci-conduit=SMC and resumes.
+            cmd.add("-S");
+        }
         cmd.add("-nic"); cmd.add("none");
         cmd.add("-L"); cmd.add(qemuShare.getAbsolutePath());
         if (offload) {
@@ -267,6 +269,23 @@ public final class VmEngine {
         pb.redirectOutput(ProcessBuilder.Redirect.to(logFile));
         final Process p = pb.start();
         process = p;
+        if (cpus >= 2) {
+            boolean configured = false;
+            for (int i = 0; i < 50 && !configured; i++) {
+                try {
+                    Snapshot.configurePsciSmc(qmpSocket);
+                    configured = true;
+                } catch (Exception e) {
+                    try {
+                        Thread.sleep(200);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        break;
+                    }
+                }
+            }
+            android.util.Log.i("sweetvm", "psci smc configured=" + configured);
+        }
         running = true;
         stopping = false;
         frames = 0;
