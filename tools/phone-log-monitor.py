@@ -65,12 +65,13 @@ def main(argv):
             print("# ring %d bytes, guest wrote %d, flush #%d%s" % (
                 meta["size"], total, meta["seq"],
                 " (wrapped)" if meta["wrapped"] else ""), file=sys.stderr)
-            body = text[-args.tail:] if args.tail else ""
-            if len(text) > args.tail:
-                body = body[body.find("\n") + 1:] if "\n" in body else body
-            sys.stdout.write(body)
+            lines = text.splitlines(True)
+            sys.stdout.write("".join(lines[-args.tail:]) if args.tail else "")
         elif total > last_total:
-            sys.stdout.write(text[last_total:])
+            fresh = total - last_total
+            if fresh > len(text):
+                fresh = len(text)
+            sys.stdout.write(text[-fresh:])
         elif total < last_total:
             print("monitor: guest log reset (%d -> %d)" % (last_total, total),
                   file=sys.stderr)

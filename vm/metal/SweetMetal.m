@@ -460,6 +460,108 @@ sweet_probe_panel(void)
 	}
 }
 
+/*
+ * The compositor's render target is an IOSurface owned by this process. Map it
+ * once per render pass so draw input can be turned into pixels; the kernel's
+ * present path copies the surface onto the panel unchanged.
+ */
+typedef struct {
+	id surface;
+	unsigned char *base;
+	unsigned long width, height, bytes_per_row;
+} SweetSurfaceMapping;
+
+static void *sweet_iosurface_library;
+
+static void *
+sweet_iosurface_symbol(const char *name)
+{
+	if (sweet_iosurface_library == 0) {
+		sweet_iosurface_library = dlopen(
+		    "/System/Library/Frameworks/IOSurface.framework/IOSurface", 2);
+	}
+	return sweet_iosurface_library != 0 ?
+	    dlsym(sweet_iosurface_library, name) : 0;
+}
+
+static int
+sweet_surface_map(unsigned int identifier, SweetSurfaceMapping *mapping)
+{
+	bzero(mapping, sizeof(*mapping));
+	if (identifier == 0) {
+		return -1;
+	}
+	id (*lookup)(unsigned int) = (id (*)(unsigned int))
+	    sweet_iosurface_symbol("IOSurfaceLookup");
+	int (*lock)(id, unsigned int, unsigned int *) = (int (*)(id, unsigned int,
+	    unsigned int *))sweet_iosurface_symbol("IOSurfaceLock");
+	void *(*base)(id) = (void *(*)(id))
+	    sweet_iosurface_symbol("IOSurfaceGetBaseAddress");
+	unsigned long (*width)(id) = (unsigned long (*)(id))
+	    sweet_iosurface_symbol("IOSurfaceGetWidth");
+	unsigned long (*height)(id) = (unsigned long (*)(id))
+	    sweet_iosurface_symbol("IOSurfaceGetHeight");
+	unsigned long (*bpr)(id) = (unsigned long (*)(id))
+	    sweet_iosurface_symbol("IOSurfaceGetBytesPerRow");
+	if (lookup == 0 || lock == 0 || base == 0 || width == 0 || height == 0 ||
+	    bpr == 0) {
+		return -1;
+	}
+	id surface = lookup(identifier);
+	if (surface == 0) {
+		return -1;
+	}
+	unsigned int seed = 0;
+	if (lock(surface, 0, &seed) != 0) {
+		return -1;
+	}
+	mapping->surface = surface;
+	mapping->base = (unsigned char *)base(surface);
+	mapping->width = width(surface);
+	mapping->height = height(surface);
+	mapping->bytes_per_row = bpr(surface);
+	if (mapping->base == 0) {
+		mapping->surface = 0;
+		return -1;
+	}
+	return 0;
+}
+
+static void
+sweet_surface_unmap(SweetSurfaceMapping *mapping)
+{
+	if (mapping->surface != 0) {
+		int (*unlock)(id, unsigned int, unsigned int *) = (int (*)(id,
+		    unsigned int, unsigned int *))
+		    sweet_iosurface_symbol("IOSurfaceUnlock");
+		if (unlock != 0) {
+			unsigned int seed = 0;
+			unlock(mapping->surface, 0, &seed);
+		}
+		void (*release_surface)(id) = (void (*)(id))
+		    sweet_iosurface_symbol("IOSurfaceRelease");
+		if (release_surface != 0) {
+			release_surface(mapping->surface);
+		}
+		bzero(mapping, sizeof(*mapping));
+	}
+}
+
+static void
+sweet_surface_fill(SweetSurfaceMapping *mapping, unsigned int rgba)
+{
+	if (mapping->surface == 0 || mapping->base == 0) {
+		return;
+	}
+	for (unsigned long y = 0; y < mapping->height; y++) {
+		unsigned int *row = (unsigned int *)(mapping->base +
+		    y * mapping->bytes_per_row);
+		for (unsigned long x = 0; x < mapping->width; x++) {
+			row[x] = rgba;
+		}
+	}
+}
+
 /* Does this process actually have UI windows/layers? (SpringBoard only) */
 static void
 sweet_probe_ui(void)
@@ -989,8 +1091,19 @@ static id sweet_pipeline_named(id name);
 /* Pipeline state with the function/library name, so a draw can be decoded. */
 @interface SweetPipeline : SweetOpaque {
 	char pipe_name[96];
+	unsigned long pipe_attr_format[8];
+	unsigned long pipe_attr_offset[8];
+	unsigned long pipe_attr_buffer[8];
+	unsigned long pipe_stride[8];
 }
 - (void)setNameC:(const char *)name;
+- (void)setAttribute:(unsigned long)index format:(unsigned long)format
+    offset:(unsigned long)offset buffer:(unsigned long)buffer;
+- (void)setStride:(unsigned long)stride forBuffer:(unsigned long)buffer;
+- (unsigned long)attributeFormat:(unsigned long)index;
+- (unsigned long)attributeOffset:(unsigned long)index;
+- (unsigned long)attributeBuffer:(unsigned long)index;
+- (unsigned long)strideForBuffer:(unsigned long)buffer;
 @end
 
 @implementation SweetPipeline
@@ -1010,6 +1123,43 @@ static id sweet_pipeline_named(id name);
 - (const char *)nameC
 {
 	return pipe_name;
+}
+
+- (void)setAttribute:(unsigned long)index format:(unsigned long)format
+    offset:(unsigned long)offset buffer:(unsigned long)buffer
+{
+	if (index < 8) {
+		pipe_attr_format[index] = format;
+		pipe_attr_offset[index] = offset;
+		pipe_attr_buffer[index] = buffer;
+	}
+}
+
+- (void)setStride:(unsigned long)stride forBuffer:(unsigned long)buffer
+{
+	if (buffer < 8) {
+		pipe_stride[buffer] = stride;
+	}
+}
+
+- (unsigned long)attributeFormat:(unsigned long)index
+{
+	return index < 8 ? pipe_attr_format[index] : 0;
+}
+
+- (unsigned long)attributeOffset:(unsigned long)index
+{
+	return index < 8 ? pipe_attr_offset[index] : 0;
+}
+
+- (unsigned long)attributeBuffer:(unsigned long)index
+{
+	return index < 8 ? pipe_attr_buffer[index] : 0;
+}
+
+- (unsigned long)strideForBuffer:(unsigned long)buffer
+{
+	return buffer < 8 ? pipe_stride[buffer] : 0;
 }
 
 @end
@@ -1033,18 +1183,54 @@ sweet_pipeline_from_descriptor(id descriptor)
 			dprintf(console_fd, "%c", 10);
 		}
 		if (strstr(name, "fixed_") != 0) {
-			id d = sweet_msg_id(descriptor, "description");
-			if (d != 0) {
-				dprintf(console_fd, "SWEETMETAL: pso desc %.1600s", sweet_cstr(d));
-				dprintf(console_fd, "%c", 10);
-			}
-			id vd = sweet_msg_id(descriptor, "vertexDescriptor");
-			if (vd != 0) {
-				id dd = sweet_msg_id(vd, "description");
-				if (dd != 0) {
-					dprintf(console_fd, "SWEETMETAL: pso vdesc %.1200s", sweet_cstr(dd));
+			@try {
+				id vd = sweet_msg_id(descriptor, "vertexDescriptor");
+				id attrs = vd != 0 ? sweet_msg_id(vd, "attributes") : 0;
+				id lays = vd != 0 ? sweet_msg_id(vd, "layouts") : 0;
+				for (unsigned long i = 0; i < 8; i++) {
+					id a = attrs != 0 ? sweet_msg_id_idx(attrs,
+					    "objectAtIndexedSubscript:", i) : 0;
+					if (a != 0) {
+						unsigned long afmt = sweet_msg_ul(a, "format");
+						unsigned long aoff = sweet_msg_ul(a, "offset");
+						unsigned long abuf = sweet_msg_ul(a, "bufferIndex");
+						dprintf(console_fd,
+						    "SWEETMETAL: pso attr%lu fmt=%lu off=%lu buf=%lu", i,
+						    afmt, aoff, abuf);
+						dprintf(console_fd, "%c", 10);
+						((void (*)(id, SEL, unsigned long, unsigned long,
+						    unsigned long, unsigned long))objc_msgSend)(state,
+						    sel_registerName("setAttribute:format:offset:buffer:"),
+						    i, afmt, aoff, abuf);
+					}
+					id l = lays != 0 ? sweet_msg_id_idx(lays,
+					    "objectAtIndexedSubscript:", i) : 0;
+					if (l != 0) {
+						unsigned long lstride = sweet_msg_ul(l, "stride");
+						dprintf(console_fd,
+						    "SWEETMETAL: pso lay%lu stride=%lu step=%lu", i,
+						    lstride, sweet_msg_ul(l, "stepFunction"));
+						dprintf(console_fd, "%c", 10);
+						((void (*)(id, SEL, unsigned long, unsigned long))
+						    objc_msgSend)(state,
+						    sel_registerName("setStride:forBuffer:"), lstride, i);
+					}
+				}
+				id cas = sweet_msg_id(descriptor, "colorAttachments");
+				id a0 = cas != 0 ? sweet_msg_id_idx(cas,
+				    "objectAtIndexedSubscript:", 0) : 0;
+				if (a0 != 0) {
+					dprintf(console_fd,
+					    "SWEETMETAL: pso color0 fmt=%lu blend=%lu src=%lu dst=%lu op=%lu",
+					    sweet_msg_ul(a0, "pixelFormat"),
+					    sweet_msg_ul(a0, "blendingEnabled"),
+					    sweet_msg_ul(a0, "sourceRGBBlendFactor"),
+					    sweet_msg_ul(a0, "destinationRGBBlendFactor"),
+					    sweet_msg_ul(a0, "rgbBlendOperation"));
 					dprintf(console_fd, "%c", 10);
 				}
+			} @catch (id exception) {
+				sweet_log("pso query failed", 0);
 			}
 		}
 	}
@@ -1243,6 +1429,243 @@ static unsigned int sweet_draw_logs5;
 
 /* Render encoder: records the destination surface and the draw inputs so the
  * kernel/host can later replay CA's compositor draws with real content. */
+float floorf(float);
+float ceilf(float);
+float fminf(float, float);
+float fmaxf(float, float);
+
+/*
+ * CPU compositor for CoreAnimation's 2D draws.
+ *
+ * The runtime layout (read from the render-pipeline vertex descriptor) is
+ * 48 bytes per vertex: float4 position @0, float2 texcoord0 @16,
+ * float2 texcoord1 @24, half4 color @32. Positions are pixels in the
+ * destination surface; texcoords are normalized. The fragment shaders blend
+ * source-over into the destination (framebuffer fetch), which is exactly what
+ * the kernel's present path then copies to the panel.
+ */
+static float
+sweet_half_to_float(unsigned short h)
+{
+	int sign = (h >> 15) & 1;
+	int expo = (h >> 10) & 0x1f;
+	int mant = h & 0x3ff;
+	float v;
+	if (expo == 0) {
+		v = (float)mant * 5.9604644775390625e-8f;
+	} else if (expo == 31) {
+		v = 65504.0f;
+	} else {
+		unsigned int bits = (unsigned int)(expo - 15 + 127) << 23;
+		float scale = *(float *)&bits;
+		v = (1.0f + (float)mant / 1024.0f) * scale;
+	}
+	return sign ? -v : v;
+}
+
+typedef struct {
+	const unsigned char *vb;
+	unsigned long vb_len;
+	unsigned long stride;
+	unsigned long pos_fmt, pos_off;
+	unsigned long tex_fmt, tex_off;
+	unsigned long col_fmt, col_off;
+	const unsigned char *tex;
+	unsigned long tex_w, tex_h, tex_fmt_px, tex_bpr;
+	unsigned int tex_surface;
+	unsigned char *dst;
+	unsigned long dst_w, dst_h, dst_bpr;
+	int clip_x0, clip_y0, clip_x1, clip_y1;
+} SweetRaster;
+
+static void
+sweet_texel(const SweetRaster *r, float u, float v, float out[4])
+{
+	out[0] = out[1] = out[2] = out[3] = 1.0f;
+	if (r->tex == 0 || r->tex_w == 0 || r->tex_h == 0) {
+		return;
+	}
+	if (u < 0.0f) u = 0.0f;
+	if (v < 0.0f) v = 0.0f;
+	if (u > 0.999999f) u = 0.999999f;
+	if (v > 0.999999f) v = 0.999999f;
+	float fx = u * (float)r->tex_w - 0.5f;
+	float fy = v * (float)r->tex_h - 0.5f;
+	int x0 = (int)floorf(fx), y0 = (int)floorf(fy);
+	float ax = fx - (float)x0, ay = fy - (float)y0;
+	int xs[2] = { x0, x0 + 1 };
+	int ys[2] = { y0, y0 + 1 };
+	float acc[4] = { 0, 0, 0, 0 };
+	for (int j = 0; j < 2; j++) {
+		int y = ys[j];
+		if (y < 0) y = 0;
+		if (y >= (int)r->tex_h) y = (int)r->tex_h - 1;
+		for (int i = 0; i < 2; i++) {
+			int x = xs[i];
+			if (x < 0) x = 0;
+			if (x >= (int)r->tex_w) x = (int)r->tex_w - 1;
+			const unsigned char *p = r->tex + (unsigned long)y * r->tex_bpr +
+			    (unsigned long)x * (r->tex_fmt_px == 1 || r->tex_fmt_px == 10 ? 1 :
+			    (r->tex_fmt_px == 115 ? 8 : 4));
+			float t[4] = { 1, 1, 1, 1 };
+			if (r->tex_fmt_px == 1 || r->tex_fmt_px == 10) {
+				t[0] = t[1] = t[2] = 1.0f;
+				t[3] = (float)p[0] / 255.0f;
+			} else if (r->tex_fmt_px == 80) {
+				t[0] = (float)p[2] / 255.0f;
+				t[1] = (float)p[1] / 255.0f;
+				t[2] = (float)p[0] / 255.0f;
+				t[3] = (float)p[3] / 255.0f;
+			} else if (r->tex_fmt_px == 115) {
+				const unsigned short *h = (const unsigned short *)p;
+				t[0] = sweet_half_to_float(h[0]);
+				t[1] = sweet_half_to_float(h[1]);
+				t[2] = sweet_half_to_float(h[2]);
+				t[3] = sweet_half_to_float(h[3]);
+			} else if (r->tex_fmt_px == 55) {
+				t[0] = t[1] = t[2] = *(const float *)p;
+				t[3] = 1.0f;
+			}
+			float w = (i ? ax : 1.0f - ax) * (j ? ay : 1.0f - ay);
+			for (int k = 0; k < 4; k++) {
+				acc[k] += t[k] * w;
+			}
+		}
+	}
+	for (int k = 0; k < 4; k++) {
+		out[k] = acc[k];
+	}
+}
+
+static int
+sweet_vertex(const SweetRaster *r, unsigned long index, float *x, float *y,
+    float *u, float *v, float col[4])
+{
+	unsigned long off = index * r->stride;
+	if (off + r->stride > r->vb_len) {
+		return 0;
+	}
+	const unsigned char *p = r->vb + off;
+	if (r->pos_fmt == 29) {
+		*x = *(const float *)(p + r->pos_off);
+		*y = *(const float *)(p + r->pos_off + 4);
+	} else {
+		*x = *(const float *)(p + r->pos_off);
+		*y = *(const float *)(p + r->pos_off + 4);
+	}
+	if (r->tex_fmt == 29) {
+		*u = *(const float *)(p + r->tex_off);
+		*v = *(const float *)(p + r->tex_off + 4);
+	} else {
+		*u = 0.0f;
+		*v = 0.0f;
+	}
+	col[0] = col[1] = col[2] = col[3] = 1.0f;
+	if (r->col_fmt == 27) {
+		const unsigned short *h = (const unsigned short *)(p + r->col_off);
+		col[0] = sweet_half_to_float(h[0]);
+		col[1] = sweet_half_to_float(h[1]);
+		col[2] = sweet_half_to_float(h[2]);
+		col[3] = sweet_half_to_float(h[3]);
+	}
+	return 1;
+}
+
+static float
+sweet_edge(float ax, float ay, float bx, float by, float px, float py)
+{
+	return (px - ax) * (by - ay) - (py - ay) * (bx - ax);
+}
+
+static void
+sweet_blend_pixel(SweetRaster *r, int x, int y, const float col[4])
+{
+	if (x < 0 || y < 0 || x >= (int)r->dst_w || y >= (int)r->dst_h) {
+		return;
+	}
+	if (x < r->clip_x0 || y < r->clip_y0 || x >= r->clip_x1 || y >= r->clip_y1) {
+		return;
+	}
+	unsigned char *p = r->dst + (unsigned long)y * r->dst_bpr + (unsigned long)x * 4;
+	float a = col[3];
+	if (a <= 0.0f) {
+		return;
+	}
+	if (a > 1.0f) a = 1.0f;
+	float sr = col[0] * a, sg = col[1] * a, sb = col[2] * a;
+	float dr = (float)p[0] / 255.0f;
+	float dg = (float)p[1] / 255.0f;
+	float db = (float)p[2] / 255.0f;
+	float da = (float)p[3] / 255.0f;
+	float inv = 1.0f - a;
+	float orr = sr + dr * inv;
+	float og = sg + dg * inv;
+	float ob = sb + db * inv;
+	float oa = a + da * inv;
+	p[0] = (unsigned char)(orr > 1.0f ? 255.0f : orr * 255.0f);
+	p[1] = (unsigned char)(og > 1.0f ? 255.0f : og * 255.0f);
+	p[2] = (unsigned char)(ob > 1.0f ? 255.0f : ob * 255.0f);
+	p[3] = (unsigned char)(oa > 1.0f ? 255.0f : oa * 255.0f);
+}
+
+static void
+sweet_raster_triangle(SweetRaster *r, unsigned long i0, unsigned long i1,
+    unsigned long i2)
+{
+	float x0, y0, u0, v0, c0[4];
+	float x1, y1, u1, v1, c1[4];
+	float x2, y2, u2, v2, c2[4];
+	if (!sweet_vertex(r, i0, &x0, &y0, &u0, &v0, c0) ||
+	    !sweet_vertex(r, i1, &x1, &y1, &u1, &v1, c1) ||
+	    !sweet_vertex(r, i2, &x2, &y2, &u2, &v2, c2)) {
+		return;
+	}
+	float area = sweet_edge(x0, y0, x1, y1, x2, y2);
+	if (area == 0.0f) {
+		return;
+	}
+	int minx = (int)floorf(fminf(fminf(x0, x1), x2));
+	int maxx = (int)ceilf(fmaxf(fmaxf(x0, x1), x2));
+	int miny = (int)floorf(fminf(fminf(y0, y1), y2));
+	int maxy = (int)ceilf(fmaxf(fmaxf(y0, y1), y2));
+	if (minx < r->clip_x0) minx = r->clip_x0;
+	if (miny < r->clip_y0) miny = r->clip_y0;
+	if (maxx > r->clip_x1) maxx = r->clip_x1;
+	if (maxy > r->clip_y1) maxy = r->clip_y1;
+	float inv_area = 1.0f / area;
+	for (int y = miny; y < maxy; y++) {
+		for (int x = minx; x < maxx; x++) {
+			float px = (float)x + 0.5f, py = (float)y + 0.5f;
+			float w0 = sweet_edge(x1, y1, x2, y2, px, py) * inv_area;
+			float w1 = sweet_edge(x2, y2, x0, y0, px, py) * inv_area;
+			float w2 = sweet_edge(x0, y0, x1, y1, px, py) * inv_area;
+			if (w0 < 0.0f || w1 < 0.0f || w2 < 0.0f) {
+				continue;
+			}
+			float u = u0 * w0 + u1 * w1 + u2 * w2;
+			float v = v0 * w0 + v1 * w1 + v2 * w2;
+			float col[4];
+			for (int k = 0; k < 4; k++) {
+				col[k] = c0[k] * w0 + c1[k] * w1 + c2[k] * w2;
+			}
+			if (r->tex != 0 && r->tex_surface != 0) {
+				float t[4];
+				sweet_texel(r, u, v, t);
+				for (int k = 0; k < 4; k++) {
+					col[k] *= t[k];
+				}
+			} else if (r->tex != 0) {
+				float t[4];
+				sweet_texel(r, u, v, t);
+				for (int k = 0; k < 4; k++) {
+					col[k] *= t[k];
+				}
+			}
+			sweet_blend_pixel(r, x, y, col);
+		}
+	}
+}
+
 typedef struct {
 	double origin_x, origin_y, width, height, znear, zfar;
 } SweetViewport;
@@ -1268,6 +1691,7 @@ typedef struct {
 	unsigned long enc_fblen[8];
 	SweetViewport enc_viewport;
 	SweetScissor enc_scissor;
+	SweetSurfaceMapping enc_map;
 }
 - (id)initWithSurface:(unsigned int)surface;
 - (void)setRenderPipelineState:(id)pipeline;
@@ -1278,6 +1702,8 @@ typedef struct {
     atIndex:(unsigned long)index;
 - (void)setViewport:(SweetViewport)viewport;
 - (void)setScissorRect:(SweetScissor)rect;
+- (void)clearRed:(double)red green:(double)green blue:(double)blue
+    alpha:(double)alpha;
 - (void)setFragmentBytes:(const void *)bytes length:(unsigned long)length
     atIndex:(unsigned long)index;
 - (void)setFragmentTexture:(id)texture atIndex:(unsigned long)index;
@@ -1307,7 +1733,26 @@ typedef struct {
 - (id)initWithSurface:(unsigned int)surface
 {
 	enc_surface = surface;
+	if (surface != 0 && sweet_surface_map(surface, &enc_map) == 0) {
+		dprintf(console_fd,
+		    "SWEETMETAL: mapped dest=%u %lux%lu bpr=%lu base=%p", surface,
+		    enc_map.width, enc_map.height, enc_map.bytes_per_row,
+		    enc_map.base);
+		dprintf(console_fd, "%c", 10);
+	}
 	return self;
+}
+
+- (void)clearRed:(double)red green:(double)green blue:(double)blue
+    alpha:(double)alpha
+{
+	unsigned int rgba = (unsigned int)sweet_channel(red) |
+	    ((unsigned int)sweet_channel(green) << 8) |
+	    ((unsigned int)sweet_channel(blue) << 16) |
+	    ((unsigned int)sweet_channel(alpha) << 24);
+	sweet_surface_fill(&enc_map, rgba);
+	dprintf(console_fd, "SWEETMETAL: clear dest=%u to %#x", enc_surface, rgba);
+	dprintf(console_fd, "%c", 10);
 }
 
 - (void)setRenderPipelineState:(id)pipeline
@@ -1523,6 +1968,118 @@ sweet_texture_surface(id texture)
 			sweet_draw_logs++;
 		}
 	}
+
+	if (enc_map.surface != 0 && enc_map.base != 0 && enc_pipeline != 0) {
+		SweetRaster r;
+		bzero(&r, sizeof(r));
+		unsigned long vbuf = ((unsigned long (*)(id, SEL, unsigned long))
+		    objc_msgSend)(enc_pipeline,
+		    sel_registerName("attributeBuffer:"), 0);
+		if (vbuf >= 8 || enc_vb[vbuf] == 0) {
+			vbuf = 1;
+		}
+		unsigned long stride = ((unsigned long (*)(id, SEL, unsigned long))
+		    objc_msgSend)(enc_pipeline,
+		    sel_registerName("strideForBuffer:"), vbuf);
+		r.pos_fmt = ((unsigned long (*)(id, SEL, unsigned long))objc_msgSend)(
+		    enc_pipeline, sel_registerName("attributeFormat:"), 0);
+		r.pos_off = ((unsigned long (*)(id, SEL, unsigned long))objc_msgSend)(
+		    enc_pipeline, sel_registerName("attributeOffset:"), 0);
+		r.tex_fmt = ((unsigned long (*)(id, SEL, unsigned long))objc_msgSend)(
+		    enc_pipeline, sel_registerName("attributeFormat:"), 1);
+		r.tex_off = ((unsigned long (*)(id, SEL, unsigned long))objc_msgSend)(
+		    enc_pipeline, sel_registerName("attributeOffset:"), 1);
+		r.col_fmt = ((unsigned long (*)(id, SEL, unsigned long))objc_msgSend)(
+		    enc_pipeline, sel_registerName("attributeFormat:"), 3);
+		r.col_off = ((unsigned long (*)(id, SEL, unsigned long))objc_msgSend)(
+		    enc_pipeline, sel_registerName("attributeOffset:"), 3);
+		if (r.pos_fmt == 0 || r.pos_fmt == 29) {
+			r.pos_fmt = 31;
+		}
+		if (r.tex_fmt == 0) {
+			r.tex_fmt = 29;
+			r.tex_off = 16;
+		}
+		if (r.col_fmt == 0) {
+			r.col_fmt = 27;
+			r.col_off = 32;
+		}
+		r.stride = stride != 0 ? stride : 48;
+		if (enc_vb[vbuf] != 0) {
+			void *vc = (void *)((void *(*)(id, SEL))objc_msgSend)(enc_vb[vbuf],
+			    sel_registerName("contents"));
+			unsigned long vl = ((unsigned long (*)(id, SEL))objc_msgSend)(
+			    enc_vb[vbuf], sel_registerName("length"));
+			unsigned long vo = enc_vboff[vbuf];
+			if (vc != 0 && vo < vl) {
+				r.vb = (const unsigned char *)vc + vo;
+				r.vb_len = vl - vo;
+			}
+		}
+		for (unsigned int i = 0; i < 8 && r.tex == 0; i++) {
+			if (enc_tex[i] == 0) {
+				continue;
+			}
+			void *px = (void *)((void *(*)(id, SEL))objc_msgSend)(enc_tex[i],
+			    sel_registerName("pixelBytes"));
+			if (px == 0) {
+				continue;
+			}
+			r.tex = (const unsigned char *)px;
+			r.tex_w = ((unsigned long (*)(id, SEL))objc_msgSend)(enc_tex[i],
+			    sel_registerName("width"));
+			r.tex_h = ((unsigned long (*)(id, SEL))objc_msgSend)(enc_tex[i],
+			    sel_registerName("height"));
+			r.tex_fmt_px = ((unsigned long (*)(id, SEL))objc_msgSend)(enc_tex[i],
+			    sel_registerName("pixelFormat"));
+			r.tex_bpr = ((unsigned long (*)(id, SEL))objc_msgSend)(enc_tex[i],
+			    sel_registerName("bytesPerRow"));
+			r.tex_surface = ((unsigned int (*)(id, SEL))objc_msgSend)(enc_tex[i],
+			    sel_registerName("surfaceID"));
+		}
+		r.dst = enc_map.base;
+		r.dst_w = enc_map.width;
+		r.dst_h = enc_map.height;
+		r.dst_bpr = enc_map.bytes_per_row;
+		r.clip_x0 = enc_scissor.width != 0 ? (int)enc_scissor.x : 0;
+		r.clip_y0 = enc_scissor.height != 0 ? (int)enc_scissor.y : 0;
+		r.clip_x1 = enc_scissor.width != 0 ? (int)(enc_scissor.x + enc_scissor.width) :
+		    (int)r.dst_w;
+		r.clip_y1 = enc_scissor.height != 0 ? (int)(enc_scissor.y + enc_scissor.height) :
+		    (int)r.dst_h;
+		if (r.vb != 0 && index_buffer != 0 && r.stride >= 16 && count >= 3 &&
+		    count <= 4096) {
+			void *ic = (void *)((void *(*)(id, SEL))objc_msgSend)(index_buffer,
+			    sel_registerName("contents"));
+			unsigned long il = ((unsigned long (*)(id, SEL))objc_msgSend)(
+			    index_buffer, sel_registerName("length"));
+			unsigned long isz = index_type == 0 ? 2 : 4;
+			if (ic != 0 && index_offset < il) {
+				unsigned long n = (il - index_offset) / isz;
+				if (n > count) {
+					n = count;
+				}
+				const unsigned char *ip = (const unsigned char *)ic + index_offset;
+				for (unsigned long k = 0; k + 2 < n; k += 3) {
+					unsigned long a, b, c;
+					if (index_type == 0) {
+						a = ((const unsigned short *)ip)[k];
+						b = ((const unsigned short *)ip)[k + 1];
+						c = ((const unsigned short *)ip)[k + 2];
+					} else {
+						a = ((const unsigned int *)ip)[k];
+						b = ((const unsigned int *)ip)[k + 1];
+						c = ((const unsigned int *)ip)[k + 2];
+					}
+					sweet_raster_triangle(&r, a, b, c);
+				}
+				dprintf(console_fd,
+				    "SWEETMETAL: raster dest=%u tris=%lu stride=%lu tex=%p fmt=%lu",
+				    enc_surface, count / 3, r.stride, r.tex, r.tex_fmt_px);
+				dprintf(console_fd, "%c", 10);
+			}
+		}
+	}
 }
 
 - (void)drawIndexedPrimitives:(unsigned long)type indexCount:(unsigned long)count
@@ -1548,6 +2105,7 @@ sweet_texture_surface(id texture)
 - (void)endEncoding
 {
 	sweet_log("encoder", "endEncoding");
+	sweet_surface_unmap(&enc_map);
 }
 
 @end
@@ -1620,6 +2178,8 @@ sweet_texture_surface(id texture)
 {
 	sweet_log("buffer", "renderCommandEncoderWithDescriptor");
 	unsigned int surface = 0;
+	unsigned long action = 0;
+	double red = 0, green = 0, blue = 0, alpha = 0;
 	if (descriptor != 0) {
 		id attachments = sweet_msg_id(descriptor, "colorAttachments");
 		id attachment = attachments != 0 ?
@@ -1628,14 +2188,13 @@ sweet_texture_surface(id texture)
 			attachment = sweet_msg_id_idx(attachments, "objectAtIndex:", 0);
 		}
 		id texture = attachment != 0 ? sweet_msg_id(attachment, "texture") : 0;
-		unsigned long action = attachment != 0 ?
+		action = attachment != 0 ?
 		    sweet_msg_ul(attachment, "loadAction") : 0;
 		if (texture != 0 &&
 		    ((BOOL (*)(id, SEL, Class))objc_msgSend)(texture,
 		    sel_registerName("isKindOfClass:"), objc_getClass("SweetTexture"))) {
 			surface = ((unsigned int (*)(id, SEL))objc_msgSend)(texture,
 			    sel_registerName("surfaceID"));
-			double red = 0, green = 0, blue = 0, alpha = 0;
 			if (action == 2) {
 				typedef struct { double red, green, blue, alpha; } ClearColor;
 				ClearColor color = ((ClearColor (*)(id, SEL))objc_msgSend)(
@@ -1660,7 +2219,12 @@ sweet_texture_surface(id texture)
 			}
 		}
 	}
-	return [[SweetRenderEncoder alloc] initWithSurface:surface];
+	SweetRenderEncoder *encoder = [[SweetRenderEncoder alloc]
+	    initWithSurface:surface];
+	if (action == 2 && surface != 0) {
+		[encoder clearRed:red green:green blue:blue alpha:alpha];
+	}
+	return encoder;
 }
 
 - (id)blitCommandEncoder

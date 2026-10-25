@@ -1,6 +1,54 @@
 # vmios working notes
 
-### >>> ACTIVE: PROJECT RENAMED TO vmios; PHONE GONE, DEBUG ON THE PC (2026-10-24) <<<
+### >>> ACTIVE: 真机回归 + 实时日志 + CA 绘制链路 (2026-10-25) <<<
+
+**真机恢复可用。** Xiaomi 14 Pro (eb72c928) 已连接；安装包
+dev.hackios.sweetvm 0.2.0 为 DEBUGGABLE，app 内部持有 16 GiB
+ios16-root.img 与 payload.bin，`adb run-as` 可读写，`adb exec-out run-as
+... dd` 可拉取镜像尾部 4 MiB 日志环。新增 `tools/phone-log-monitor.py`：
+轮询环头 total，只解码并输出新增字节，实时流式，不再固定 sleep 盲等。
+
+**payload 替换流程（md5 已验证一致）：** `mkadt.py --qemu --gpu-wire
+--canvas-width 1125 --canvas-height 2436 --gpu-bundle
+vm/metal/build/SweetMetalAccel.sgb`；`mkpayload.py
+.tools/dl/xnu-0096/kernel.development.sweet ADT OUT --cmdline "<原 payload
+的 cmdline>"`（手机不用 --qemu-psci）。安装：adb push 到
+/data/local/tmp -> chmod 644 -> run-as cp 到 files/payload.bin；不要用
+`adb shell run-as ... sh -c 'cat >'`（只传入 1016 字节）。旧 payload 备份
+在 files/payload-before-m4o.bin。
+
+**已修根因（backboardd SIGABRT）：** 读取
+MTLRenderPipelineDescriptor.description 会格式化我们伪造的 MTLFunction
+并在 backboardd 内 abort（t≈196，sig 6，随后 formattedDescription:）。
+现只读 vertexDescriptor 的 attributes/layouts 与 colorAttachments[0] 的
+pixelFormat/混合参数，整段 @try 保护。
+
+**插件新增：** fixed_* 管线打印 pso attr/lay/color0；渲染通道目标为
+IOSurface 时用 IOSurfaceLookup+Lock 映射，LoadActionClear 直接写该
+surface（真实像素，非伪造 UI），endEncoding 解锁释放。真机当前 payload
+m4q (md5 0cef9e36…) 用于验证映射/清屏，日志走 phone-log-monitor。
+
+**下一步：** 等真机 CA 首次 dest=5 绘制（约 t≈200），用 pso attr/lay 与
+256 字节 vb 转储定死顶点布局（m4l 数据推测 stride 48：position float4@0,
+texcoord0 float2@16, texcoord1 float2@24, color half4@32），据此实现
+solid/textured 三角形光栅化；Ghidra 正在分析 QuartzCore
+(ghidra-scripts/FindCAVertexLayout.java)。
+
+**M4q 实测（2026-10-25, 真机）确认：** pso 顶点描述符为 buffer 1、
+stride 48：attr0 Float4@0（位置，像素坐标）、attr1 Float2@16（uv0，
+归一化）、attr2 Float2@24（uv1）、attr3 Half4@32（顶点色）。另有 stride 16
+的简化管线（Float2 位置 + Half4 颜色）。IOSurface 映射成功：
+`mapped dest=5 1125x2436 bpr=4544 base=…`，LoadActionClear 写 0 后整块面板
+变黑（真机截图），证明“插件写 IOSurface → 内核 present → 面板”链路成立。
+CA 依次绘制：全屏黑色底、顶部渐变带、全屏渐变、0.07 黑色压暗层、
+framebuffer 采样，然后才是文字/图标；纹理都绑在 fragment texture 3，
+上传格式 A8(fmt1)/BGRA8(fmt80)/RGBA16F(fmt115)/R32Float(fmt55)。
+
+**M4r/M4s（CPU 光栅化，已实现）：** 按 pso 元数据逐三角形填充，双线性
+采样上述纹理，src-over 预乘混合写入 IOSurface；同时修复了 half→float
+比例错误（原实现大 1024 倍）。真机验证截图见 `.tools/gputest/shots/`。
+
+### >>> ACTIVE (superseded, 2026-10-24): PROJECT RENAMED TO vmios; DEBUG ON THE PC <<<
 
 The project is now **vmios** (see `README.md`, `CREDITS.md`, `docs/NAMING.md`).
 The Android app is `dev.vmios.sweetvm`; user-facing and host-side names use
