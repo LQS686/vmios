@@ -47,6 +47,7 @@ void _objc_msgForward(void);
 int strcmp(const char *a, const char *b);
 void free(void *ptr);
 void *malloc(unsigned long size);
+void *calloc(unsigned long count, unsigned long size);
 void *memcpy(void *dst, const void *src, unsigned long n);
 void bzero(void *dst, unsigned long n);
 SEL sel_registerName(const char *name);
@@ -76,6 +77,12 @@ char *strstr(const char *haystack, const char *needle);
 int IOConnectCallStructMethod(unsigned int connection, unsigned int selector,
     const void *input, unsigned long inputSize, void *output,
     unsigned long *outputSize);
+int IOConnectCallScalarMethod(unsigned int connection, unsigned int selector,
+    const unsigned long long *input, unsigned int inputCount,
+    unsigned long long *output, unsigned int *outputCount);
+unsigned long long mach_absolute_time(void);
+typedef struct { unsigned int numer, denom; } sweet_mach_timebase;
+int mach_timebase_info(sweet_mach_timebase *info);
 void *IOServiceMatching(const char *name);
 unsigned int IOServiceGetMatchingService(unsigned int mainPort, void *matching);
 int IOServiceOpen(unsigned int service, unsigned int owningTask,
@@ -249,11 +256,79 @@ sweet_cv_set_index(id self, SEL _cmd, const void *value, unsigned long type,
 	}
 }
 
+/* Last value written for each constant name; a function is created right
+ * after CA fills a fresh set, so this table is that function's constants. */
+#define SWEET_FC_MAX 64
+typedef struct {
+	char name[32];
+	double value;
+} SweetFcEntry;
+typedef struct {
+	int count;
+	SweetFcEntry e[SWEET_FC_MAX];
+} SweetFcSet;
+
+static SweetFcSet sweet_fc;
+
+static float sweet_half_to_float(unsigned short h);
+
+static void
+sweet_fc_store(const char *name, unsigned long type, const void *value)
+{
+	double d = 0.0;
+	if (name == 0 || strcmp(name, "-") == 0) {
+		return;
+	}
+	if (value != 0) {
+		switch (type) {
+		case 3: {	/* MTLDataTypeFloat */
+			float f;
+			memcpy(&f, value, sizeof(f));
+			d = (double)f;
+			break;
+		}
+		case 16: {	/* MTLDataTypeHalf */
+			unsigned short h;
+			memcpy(&h, value, sizeof(h));
+			d = (double)sweet_half_to_float(h);
+			break;
+		}
+		case 53: {	/* MTLDataTypeBool */
+			d = (*(const unsigned char *)value) ? 1.0 : 0.0;
+			break;
+		}
+		default: {
+			unsigned int u;
+			memcpy(&u, value, sizeof(u));
+			d = (double)u;
+			break;
+		}
+		}
+	}
+	for (int i = 0; i < sweet_fc.count; i++) {
+		if (strcmp(sweet_fc.e[i].name, name) == 0) {
+			sweet_fc.e[i].value = d;
+			return;
+		}
+	}
+	if (sweet_fc.count < SWEET_FC_MAX) {
+		SweetFcEntry *e = &sweet_fc.e[sweet_fc.count++];
+		unsigned long i = 0;
+		while (name[i] != 0 && i + 1 < sizeof(e->name)) {
+			e->name[i] = name[i];
+			i++;
+		}
+		e->name[i] = 0;
+		e->value = d;
+	}
+}
+
 static void
 sweet_cv_set_name(id self, SEL _cmd, const void *value, unsigned long type,
     id name)
 {
 	sweet_cv_report("byname", sweet_cstr(name), 0, type, value);
+	sweet_fc_store(sweet_cstr(name), type, value);
 	if (sweet_cv_name_imp != 0) {
 		((void (*)(id, SEL, const void *, unsigned long, id))
 		    sweet_cv_name_imp)(self, _cmd, value, type, name);
@@ -550,7 +625,7 @@ sweet_surface_unmap(SweetSurfaceMapping *mapping)
 static void
 sweet_surface_fill(SweetSurfaceMapping *mapping, unsigned int rgba)
 {
-	if (mapping->surface == 0 || mapping->base == 0) {
+	if (mapping->base == 0) {
 		return;
 	}
 	for (unsigned long y = 0; y < mapping->height; y++) {
@@ -560,6 +635,113 @@ sweet_surface_fill(SweetSurfaceMapping *mapping, unsigned int rgba)
 			row[x] = rgba;
 		}
 	}
+}
+
+/*
+ * CoreAnimation renders into a drawable IOSurface, but the guest window
+ * server never flips it, so the panel keeps the last boot-time frame. Hand
+ * the finished drawable to IOMobileFramebuffer's swap selectors (4 = begin,
+ * 5 = end with the 0x46c record AppleCLCD::present consumes); the kernel's
+ * vsync timer copies it natively (sweet-fb descriptors in QEMU).
+ */
+static unsigned int sweet_fb_conn;
+static int sweet_fb_open_tried;
+static unsigned int sweet_swap_id;
+static unsigned int sweet_presents;
+static unsigned int sweet_present_logs;
+static unsigned int sweet_last_surface;
+static unsigned long sweet_last_width, sweet_last_height;
+
+static int
+sweet_fb_open(void)
+{
+	if (sweet_fb_conn != 0) {
+		return 0;
+	}
+	if (sweet_fb_open_tried) {
+		return -1;
+	}
+	sweet_fb_open_tried = 1;
+	void *mf = dlopen(
+	    "/System/Library/Frameworks/IOMobileFramebuffer.framework/IOMobileFramebuffer", 2);
+	int (*open_fb)(unsigned int, unsigned int, unsigned long, unsigned int *) =
+	    (int (*)(unsigned int, unsigned int, unsigned long, unsigned int *))
+	    (mf != 0 ? dlsym(mf, "IOMobileFramebufferOpen") : 0);
+	unsigned int service = IOServiceGetMatchingService(0,
+	    IOServiceMatching("IOMobileFramebuffer"));
+	unsigned int conn = 0;
+	int kr = -1;
+	if (service != 0 && open_fb != 0) {
+		kr = open_fb(service, mach_task_self(), 0, &conn);
+	}
+	if (service != 0) {
+		IOObjectRelease(service);
+	}
+	dprintf(console_fd, "SWEETMETAL: present open=0x%x conn=%u%c", kr, conn, 10);
+	if (kr == 0 && conn != 0) {
+		sweet_fb_conn = conn;
+		return 0;
+	}
+	return -1;
+}
+
+static void
+sweet_present_surface(unsigned int surface, unsigned long width,
+    unsigned long height)
+{
+	if (surface == 0 || width == 0 || height == 0 || sweet_fb_open() != 0) {
+		return;
+	}
+	unsigned char rec[0x46c];
+	bzero(rec, sizeof(rec));
+	unsigned long long swap = 0;
+	unsigned int swap_count = 1;
+	unsigned int id = ++sweet_swap_id;
+	if (IOConnectCallScalarMethod(sweet_fb_conn, 4, 0, 0, &swap,
+	    &swap_count) == 0 && swap != 0) {
+		id = (unsigned int)swap;
+	}
+	unsigned int rect[4] = { 0, 0, (unsigned int)width, (unsigned int)height };
+	unsigned int mask = 1;
+	memcpy(rec + 0x50, &id, 4);
+	memcpy(rec + 0x54, &surface, 4);
+	memcpy(rec + 0x64, rect, sizeof(rect));
+	memcpy(rec + 0xc4, rect, sizeof(rect));
+	memcpy(rec + 0x104, &mask, 4);
+	int kr = IOConnectCallStructMethod(sweet_fb_conn, 5, rec, sizeof(rec), 0, 0);
+	sweet_presents++;
+	if (sweet_present_logs < 8) {
+		sweet_present_logs++;
+		dprintf(console_fd,
+		    "SWEETMETAL: present surface=%u %lux%lu swap=%u -> 0x%x%c",
+		    surface, width, height, id, kr, 10);
+	}
+}
+
+static void
+sweet_present_pending(void)
+{
+	if (sweet_last_surface != 0) {
+		sweet_present_surface(sweet_last_surface, sweet_last_width,
+		    sweet_last_height);
+		sweet_last_surface = 0;
+	}
+}
+
+static double
+sweet_ticks_ms(unsigned long long ticks)
+{
+	static sweet_mach_timebase timebase;
+	static int ready;
+	if (!ready) {
+		if (mach_timebase_info(&timebase) != 0) {
+			timebase.numer = 1;
+			timebase.denom = 1;
+		}
+		ready = 1;
+	}
+	return (double)ticks * (double)timebase.numer /
+	    (double)timebase.denom / 1000000.0;
 }
 
 /* Does this process actually have UI windows/layers? (SpringBoard only) */
@@ -797,9 +979,13 @@ __attribute__((objc_root_class))
  */
 @interface SweetFunction : SweetObject {
 	id fn_name;
+	SweetFcSet fn_fc;
+	int fn_has_fc;
 }
 - (void)setSweetName:(id)name;
 - (id)name;
+- (void)snapshotConstants;
+- (int)copyFcTo:(SweetFcSet *)out;
 @end
 
 @implementation SweetFunction
@@ -808,6 +994,21 @@ __attribute__((objc_root_class))
 {
 	fn_name = ((id (*)(id, SEL))objc_msgSend)(name,
 	    sel_registerName("retain"));
+}
+
+- (void)snapshotConstants
+{
+	fn_fc = sweet_fc;
+	fn_has_fc = 1;
+}
+
+- (int)copyFcTo:(SweetFcSet *)out
+{
+	if (!fn_has_fc) {
+		return 0;
+	}
+	*out = fn_fc;
+	return 1;
 }
 
 - (id)name
@@ -936,6 +1137,8 @@ static id sweet_pipeline_named(id name);
 	SweetFunction *function = [[SweetFunction alloc] init];
 	((void (*)(id, SEL, id))objc_msgSend)(function,
 	    sel_registerName("setSweetName:"), name);
+	((void (*)(id, SEL))objc_msgSend)(function,
+	    sel_registerName("snapshotConstants"));
 	return function;
 }
 
@@ -1095,6 +1298,8 @@ static id sweet_pipeline_named(id name);
 	unsigned long pipe_attr_offset[8];
 	unsigned long pipe_attr_buffer[8];
 	unsigned long pipe_stride[8];
+	SweetFcSet pipe_fc;
+	int pipe_has_fc;
 }
 - (void)setNameC:(const char *)name;
 - (void)setAttribute:(unsigned long)index format:(unsigned long)format
@@ -1104,6 +1309,8 @@ static id sweet_pipeline_named(id name);
 - (unsigned long)attributeOffset:(unsigned long)index;
 - (unsigned long)attributeBuffer:(unsigned long)index;
 - (unsigned long)strideForBuffer:(unsigned long)buffer;
+- (int)copyConstantsFromFunction:(id)function;
+- (double)fcValue:(const char *)name;
 @end
 
 @implementation SweetPipeline
@@ -1162,6 +1369,30 @@ static id sweet_pipeline_named(id name);
 	return buffer < 8 ? pipe_stride[buffer] : 0;
 }
 
+- (int)copyConstantsFromFunction:(id)function
+{
+	if (function == 0 || !((BOOL (*)(id, SEL, Class))objc_msgSend)(function,
+	    sel_registerName("isKindOfClass:"), objc_getClass("SweetFunction"))) {
+		return 0;
+	}
+	pipe_has_fc = ((int (*)(id, SEL, SweetFcSet *))objc_msgSend)(function,
+	    sel_registerName("copyFcTo:"), &pipe_fc);
+	return pipe_has_fc;
+}
+
+- (double)fcValue:(const char *)name
+{
+	if (!pipe_has_fc || name == 0) {
+		return -1.0;
+	}
+	for (int i = 0; i < pipe_fc.count; i++) {
+		if (strcmp(pipe_fc.e[i].name, name) == 0) {
+			return pipe_fc.e[i].value;
+		}
+	}
+	return -1.0;
+}
+
 @end
 
 static id
@@ -1181,6 +1412,26 @@ sweet_pipeline_from_descriptor(id descriptor)
 		if (frag != 0) {
 			dprintf(console_fd, "SWEETMETAL: pso frag %s", sweet_cstr(sweet_msg_id(frag, "name")));
 			dprintf(console_fd, "%c", 10);
+			((void (*)(id, SEL, id))objc_msgSend)(state,
+			    sel_registerName("copyConstantsFromFunction:"), frag);
+			if (strstr(name, "fixed_") != 0) {
+				double fblend = ((double (*)(id, SEL, const char *))
+				    objc_msgSend)(state, sel_registerName("fcValue:"),
+				    "fc_blend_function");
+				double ftex = ((double (*)(id, SEL, const char *))
+				    objc_msgSend)(state, sel_registerName("fcValue:"),
+				    "fc_texture_function");
+				double fdst = ((double (*)(id, SEL, const char *))
+				    objc_msgSend)(state, sel_registerName("fcValue:"),
+				    "fc_destination_function");
+				double fimg = ((double (*)(id, SEL, const char *))
+				    objc_msgSend)(state, sel_registerName("fcValue:"),
+				    "fc_image_count");
+				dprintf(console_fd,
+				    "SWEETMETAL: pso fc blend=%g tex=%g dst=%g img=%g",
+				    fblend, ftex, fdst, fimg);
+				dprintf(console_fd, "%c", 10);
+			}
 		}
 		if (strstr(name, "fixed_") != 0) {
 			@try {
@@ -1287,6 +1538,8 @@ typedef struct {
 	unsigned long x, y, z, width, height, depth;
 } SweetRegion;
 
+static unsigned long sweet_texel_bpp(unsigned long fmt);
+
 @interface SweetTexture : SweetOpaque {
 	unsigned int tex_surface;
 	unsigned long tex_width;
@@ -1295,6 +1548,7 @@ typedef struct {
 	unsigned long tex_bpr;
 	void *tex_pixels;
 	unsigned long tex_dirty;
+	unsigned long tex_rendered;
 }
 - (void)setSurfaceID:(unsigned int)identifier;
 - (unsigned int)surfaceID;
@@ -1309,6 +1563,9 @@ typedef struct {
 - (void)clearDirty;
 - (void *)pixelBytes;
 - (unsigned long)bytesPerRow;
+- (int)ensureRenderPixels;
+- (void)markRendered;
+- (unsigned long)rendered;
 @end
 
 @implementation SweetTexture
@@ -1419,6 +1676,52 @@ typedef struct {
 	return tex_bpr;
 }
 
+- (unsigned long)bytesPerPixel
+{
+	return sweet_texel_bpp(tex_format);
+}
+
+- (void)markRendered
+{
+	tex_rendered = 1;
+}
+
+- (unsigned long)rendered
+{
+	return tex_rendered;
+}
+
+- (int)ensureRenderPixels
+{
+	if (tex_width == 0 || tex_height == 0 || tex_width > 8192 ||
+	    tex_height > 8192) {
+		return -1;
+	}
+	unsigned long bpr = tex_width * [self bytesPerPixel];
+	if (tex_pixels != 0 && tex_bpr == bpr) {
+		return 0;
+	}
+	free(tex_pixels);
+	tex_pixels = calloc(bpr * tex_height, 1);
+	if (tex_pixels == 0) {
+		tex_bpr = 0;
+		return -1;
+	}
+	tex_bpr = bpr;
+	tex_dirty = 1;
+	dprintf(console_fd,
+	    "SWEETMETAL: offscreen storage %lux%lu fmt=%lu bpr=%lu %p%c",
+	    tex_width, tex_height, tex_format, tex_bpr, tex_pixels, 10);
+	return 0;
+}
+
+- (void)dealloc
+{
+	free(tex_pixels);
+	tex_pixels = 0;
+	[super dealloc];
+}
+
 @end
 
 #define SWEET_OBJECT() [[SweetOpaque alloc] init]
@@ -1473,10 +1776,165 @@ typedef struct {
 	const unsigned char *tex;
 	unsigned long tex_w, tex_h, tex_fmt_px, tex_bpr;
 	unsigned int tex_surface;
+	unsigned long tex_internal;
+	unsigned long blend_fn, tex_fn, dst_fn, img_count;
 	unsigned char *dst;
 	unsigned long dst_w, dst_h, dst_bpr;
 	int clip_x0, clip_y0, clip_x1, clip_y1;
+	int dbg_n;
+	float dbg_x0, dbg_y0, dbg_x1, dbg_y1;
+	float dbg_u0, dbg_v0, dbg_u1, dbg_v1;
+	float dbg_col[4];
 } SweetRaster;
+
+/*
+ * MTLPixelFormat storage sizes. CoreAnimation binds RG8Unorm (30) for its
+ * two-channel gradients, R16Float (25) for LUTs and the private wide-gamut
+ * BGR10_XR (550/551, 32bpp) / BGRA10_XR (552/553, 64bpp) formats; assuming
+ * four bytes per texel shifts every row and skews sampled gradients.
+ */
+static unsigned long
+sweet_texel_bpp(unsigned long fmt)
+{
+	switch (fmt) {
+	case 1:
+	case 10: case 11: case 12: case 13: case 14:
+		return 1;
+	case 20: case 21: case 22: case 23: case 24: case 25:
+	case 30: case 31: case 32: case 33: case 34:
+		return 2;
+	case 53: case 54: case 55:
+	case 60: case 61: case 62: case 63: case 64: case 65:
+	case 70: case 71: case 72: case 73: case 74:
+	case 80: case 81:
+	case 90: case 91: case 92: case 93:
+	case 550: case 551: case 554: case 555:
+		return 4;
+	case 103: case 104: case 105:
+	case 110: case 111: case 112: case 113: case 114: case 115:
+	case 552: case 553:
+		return 8;
+	case 123: case 124: case 125:
+		return 16;
+	default:
+		return 4;
+	}
+}
+
+/* Extended-range formats store raw/1023 in [-0.752941, 1.25098]. */
+static float
+sweet_xr10(unsigned long raw)
+{
+	return (float)raw * (2.003921568627451f / 1023.0f) - 0.7529411764705882f;
+}
+
+static float
+sweet_xr16(unsigned long raw)
+{
+	return (float)raw * (2.003921568627451f / 65535.0f) - 0.7529411764705882f;
+}
+
+static void
+sweet_decode_texel(unsigned long fmt, const unsigned char *p, float t[4])
+{
+	t[0] = t[1] = t[2] = t[3] = 1.0f;
+	switch (fmt) {
+	case 1: case 10:
+		t[3] = (float)p[0] / 255.0f;
+		break;
+	case 20: {
+		unsigned int v = *(const unsigned short *)p;
+		t[0] = t[1] = t[2] = (float)v / 65535.0f;
+		break;
+	}
+	case 25: {
+		float v = sweet_half_to_float(*(const unsigned short *)p);
+		t[0] = t[1] = t[2] = v;
+		break;
+	}
+	case 30: case 31: {
+		t[0] = (float)p[0] / 255.0f;
+		t[1] = (float)p[1] / 255.0f;
+		t[2] = 0.0f;
+		break;
+	}
+	case 55: {
+		float v = *(const float *)p;
+		t[0] = t[1] = t[2] = v;
+		break;
+	}
+	case 70: case 71:
+		t[0] = (float)p[0] / 255.0f;
+		t[1] = (float)p[1] / 255.0f;
+		t[2] = (float)p[2] / 255.0f;
+		t[3] = (float)p[3] / 255.0f;
+		break;
+	case 80: case 81:
+		t[0] = (float)p[2] / 255.0f;
+		t[1] = (float)p[1] / 255.0f;
+		t[2] = (float)p[0] / 255.0f;
+		t[3] = (float)p[3] / 255.0f;
+		break;
+	case 110: case 111: {
+		const unsigned short *h = (const unsigned short *)p;
+		t[0] = (float)h[0] / 65535.0f;
+		t[1] = (float)h[1] / 65535.0f;
+		t[2] = (float)h[2] / 65535.0f;
+		t[3] = (float)h[3] / 65535.0f;
+		break;
+	}
+	case 115: {
+		const unsigned short *h = (const unsigned short *)p;
+		t[0] = sweet_half_to_float(h[0]);
+		t[1] = sweet_half_to_float(h[1]);
+		t[2] = sweet_half_to_float(h[2]);
+		t[3] = sweet_half_to_float(h[3]);
+		break;
+	}
+	case 550: case 551: {
+		unsigned int raw = *(const unsigned int *)p;
+		unsigned int b = raw & 0x3ff;
+		unsigned int g = (raw >> 10) & 0x3ff;
+		unsigned int r = (raw >> 20) & 0x3ff;
+		t[0] = sweet_xr10(r);
+		t[1] = sweet_xr10(g);
+		t[2] = sweet_xr10(b);
+		break;
+	}
+	case 552: case 553: {
+		const unsigned short *h = (const unsigned short *)p;
+		t[0] = sweet_xr16(h[0]);
+		t[1] = sweet_xr16(h[1]);
+		t[2] = sweet_xr16(h[2]);
+		t[3] = (float)h[3] / 65535.0f;
+		break;
+	}
+	case 105: {
+		const float *f = (const float *)p;
+		t[0] = f[0];
+		t[1] = f[1];
+		t[2] = 0.0f;
+		break;
+	}
+	default:
+		t[0] = (float)p[2] / 255.0f;
+		t[1] = (float)p[1] / 255.0f;
+		t[2] = (float)p[0] / 255.0f;
+		t[3] = (float)p[3] / 255.0f;
+		break;
+	}
+}
+
+/* Anything this process rendered is stored as RGBA8 whatever the declared
+ * format says; only the IOSurface consumer sees the native layout. */
+static void
+sweet_decode_internal(const unsigned char *p, float t[4])
+{
+	t[0] = (float)p[0] / 255.0f;
+	t[1] = (float)p[1] / 255.0f;
+	t[2] = (float)p[2] / 255.0f;
+	t[3] = (float)p[3] / 255.0f;
+}
 
 static void
 sweet_texel(const SweetRaster *r, float u, float v, float out[4])
@@ -1484,6 +1942,11 @@ sweet_texel(const SweetRaster *r, float u, float v, float out[4])
 	out[0] = out[1] = out[2] = out[3] = 1.0f;
 	if (r->tex == 0 || r->tex_w == 0 || r->tex_h == 0) {
 		return;
+	}
+	if ((u > 1.5f || v > 1.5f) && u >= 0.0f && v >= 0.0f &&
+	    u <= (float)r->tex_w + 0.5f && v <= (float)r->tex_h + 0.5f) {
+		u /= (float)r->tex_w;
+		v /= (float)r->tex_h;
 	}
 	if (u < 0.0f) u = 0.0f;
 	if (v < 0.0f) v = 0.0f;
@@ -1505,26 +1968,13 @@ sweet_texel(const SweetRaster *r, float u, float v, float out[4])
 			if (x < 0) x = 0;
 			if (x >= (int)r->tex_w) x = (int)r->tex_w - 1;
 			const unsigned char *p = r->tex + (unsigned long)y * r->tex_bpr +
-			    (unsigned long)x * (r->tex_fmt_px == 1 || r->tex_fmt_px == 10 ? 1 :
-			    (r->tex_fmt_px == 115 ? 8 : 4));
-			float t[4] = { 1, 1, 1, 1 };
-			if (r->tex_fmt_px == 1 || r->tex_fmt_px == 10) {
-				t[0] = t[1] = t[2] = 1.0f;
-				t[3] = (float)p[0] / 255.0f;
-			} else if (r->tex_fmt_px == 80) {
-				t[0] = (float)p[2] / 255.0f;
-				t[1] = (float)p[1] / 255.0f;
-				t[2] = (float)p[0] / 255.0f;
-				t[3] = (float)p[3] / 255.0f;
-			} else if (r->tex_fmt_px == 115) {
-				const unsigned short *h = (const unsigned short *)p;
-				t[0] = sweet_half_to_float(h[0]);
-				t[1] = sweet_half_to_float(h[1]);
-				t[2] = sweet_half_to_float(h[2]);
-				t[3] = sweet_half_to_float(h[3]);
-			} else if (r->tex_fmt_px == 55) {
-				t[0] = t[1] = t[2] = *(const float *)p;
-				t[3] = 1.0f;
+			    (unsigned long)x * (r->tex_internal ? 4 :
+			    sweet_texel_bpp(r->tex_fmt_px));
+			float t[4];
+			if (r->tex_internal) {
+				sweet_decode_internal(p, t);
+			} else {
+				sweet_decode_texel(r->tex_fmt_px, p, t);
 			}
 			float w = (i ? ax : 1.0f - ax) * (j ? ay : 1.0f - ay);
 			for (int k = 0; k < 4; k++) {
@@ -1602,6 +2052,18 @@ sweet_blend_pixel(SweetRaster *r, int x, int y, const float col[4])
 	float og = sg + dg * inv;
 	float ob = sb + db * inv;
 	float oa = a + da * inv;
+	if (r->blend_fn == 46) {
+		/* fixed_frag_lph_cpf blend 46: src scaled by dst luminance^4. */
+		float l = 0.299f * dr + 0.587f * dg + 0.114f * db;
+		if (l < 0.0f) l = 0.0f;
+		if (l > 1.0f) l = 1.0f;
+		float l4 = l * l;
+		l4 *= l4;
+		orr = sr * l4 + dr * (1.0f - a * l4);
+		og = sg * l4 + dg * (1.0f - a * l4);
+		ob = sb * l4 + db * (1.0f - a * l4);
+		oa = a * l4 + da * (1.0f - a * l4);
+	}
 	p[0] = (unsigned char)(orr > 1.0f ? 255.0f : orr * 255.0f);
 	p[1] = (unsigned char)(og > 1.0f ? 255.0f : og * 255.0f);
 	p[2] = (unsigned char)(ob > 1.0f ? 255.0f : ob * 255.0f);
@@ -1619,6 +2081,20 @@ sweet_raster_triangle(SweetRaster *r, unsigned long i0, unsigned long i1,
 	    !sweet_vertex(r, i1, &x1, &y1, &u1, &v1, c1) ||
 	    !sweet_vertex(r, i2, &x2, &y2, &u2, &v2, c2)) {
 		return;
+	}
+	/* Vertex functions without a color attribute leave +color zero; such a
+	 * triangle is fully transparent, so the attribute is absent, not black. */
+	int zero_color = 1;
+	for (int k = 0; k < 4; k++) {
+		if (c0[k] != 0.0f || c1[k] != 0.0f || c2[k] != 0.0f) {
+			zero_color = 0;
+			break;
+		}
+	}
+	if (zero_color) {
+		for (int k = 0; k < 4; k++) {
+			c0[k] = c1[k] = c2[k] = 1.0f;
+		}
 	}
 	float area = sweet_edge(x0, y0, x1, y1, x2, y2);
 	if (area == 0.0f) {
@@ -1692,8 +2168,10 @@ typedef struct {
 	SweetViewport enc_viewport;
 	SweetScissor enc_scissor;
 	SweetSurfaceMapping enc_map;
+	id enc_target_tex;
 }
 - (id)initWithSurface:(unsigned int)surface;
+- (void)setTargetTexture:(id)texture;
 - (void)setRenderPipelineState:(id)pipeline;
 - (void)setVertexBuffer:(id)buffer offset:(unsigned long)offset
     atIndex:(unsigned long)index;
@@ -1741,6 +2219,47 @@ typedef struct {
 		dprintf(console_fd, "%c", 10);
 	}
 	return self;
+}
+
+/* Render targets created with newTextureWithDescriptor have no IOSurface;
+ * keep their pixels here so later draws can sample what was rendered. */
+- (void)setTargetTexture:(id)texture
+{
+	enc_target_tex = texture;
+	if (texture == 0 || enc_map.base != 0) {
+		return;
+	}
+	if (((unsigned int (*)(id, SEL))objc_msgSend)(texture,
+	    sel_registerName("surfaceID")) != 0) {
+		return;
+	}
+	if (((int (*)(id, SEL))objc_msgSend)(texture,
+	    sel_registerName("ensureRenderPixels")) != 0) {
+		return;
+	}
+	enc_map.base = (unsigned char *)((void *(*)(id, SEL))objc_msgSend)(
+	    texture, sel_registerName("pixelBytes"));
+	enc_map.width = ((unsigned long (*)(id, SEL))objc_msgSend)(texture,
+	    sel_registerName("width"));
+	enc_map.height = ((unsigned long (*)(id, SEL))objc_msgSend)(texture,
+	    sel_registerName("height"));
+	enc_map.bytes_per_row = ((unsigned long (*)(id, SEL))objc_msgSend)(
+	    texture, sel_registerName("bytesPerRow"));
+	if (enc_map.bytes_per_row != enc_map.width * 4) {
+		dprintf(console_fd,
+		    "SWEETMETAL: skip offscreen %lux%lu bpr=%lu (not 8-bit)%c",
+		    enc_map.width, enc_map.height, enc_map.bytes_per_row, 10);
+		enc_map.base = 0;
+		enc_map.width = 0;
+		enc_map.height = 0;
+		enc_map.bytes_per_row = 0;
+		return;
+	}
+	((void (*)(id, SEL))objc_msgSend)(texture, sel_registerName("markRendered"));
+	dprintf(console_fd,
+	    "SWEETMETAL: render target offscreen %lux%lu bpr=%lu base=%p%c",
+	    enc_map.width, enc_map.height, enc_map.bytes_per_row,
+	    enc_map.base, 10);
 }
 
 - (void)clearRed:(double)red green:(double)green blue:(double)blue
@@ -1969,8 +2488,11 @@ sweet_texture_surface(id texture)
 		}
 	}
 
-	if (enc_map.surface != 0 && enc_map.base != 0 && enc_pipeline != 0) {
+	if (enc_map.base != 0 && enc_pipeline != 0) {
 		SweetRaster r;
+		SweetSurfaceMapping src_map;
+		int src_mapped = 0;
+		bzero(&src_map, sizeof(src_map));
 		bzero(&r, sizeof(r));
 		unsigned long vbuf = ((unsigned long (*)(id, SEL, unsigned long))
 		    objc_msgSend)(enc_pipeline,
@@ -2004,6 +2526,31 @@ sweet_texture_surface(id texture)
 			r.col_fmt = 27;
 			r.col_off = 32;
 		}
+		r.blend_fn = 54;
+		if (((BOOL (*)(id, SEL, Class))objc_msgSend)(enc_pipeline,
+		    sel_registerName("isKindOfClass:"), objc_getClass("SweetPipeline"))) {
+			double blend = ((double (*)(id, SEL, const char *))objc_msgSend)(
+			    enc_pipeline, sel_registerName("fcValue:"), "fc_blend_function");
+			if (blend >= 0.0) {
+				r.blend_fn = (unsigned long)blend;
+			}
+			double tfn = ((double (*)(id, SEL, const char *))objc_msgSend)(
+			    enc_pipeline, sel_registerName("fcValue:"), "fc_texture_function");
+			if (tfn >= 0.0) {
+				r.tex_fn = (unsigned long)tfn;
+			}
+			double dfn = ((double (*)(id, SEL, const char *))objc_msgSend)(
+			    enc_pipeline, sel_registerName("fcValue:"),
+			    "fc_destination_function");
+			if (dfn >= 0.0) {
+				r.dst_fn = (unsigned long)dfn;
+			}
+			double img = ((double (*)(id, SEL, const char *))objc_msgSend)(
+			    enc_pipeline, sel_registerName("fcValue:"), "fc_image_count");
+			if (img >= 0.0) {
+				r.img_count = (unsigned long)img;
+			}
+		}
 		r.stride = stride != 0 ? stride : 48;
 		if (enc_vb[vbuf] != 0) {
 			void *vc = (void *)((void *(*)(id, SEL))objc_msgSend)(enc_vb[vbuf],
@@ -2017,11 +2564,24 @@ sweet_texture_surface(id texture)
 			}
 		}
 		for (unsigned int i = 0; i < 8 && r.tex == 0; i++) {
-			if (enc_tex[i] == 0) {
+			if (enc_tex[i] == 0 || enc_tex[i] == enc_target_tex) {
 				continue;
 			}
 			void *px = (void *)((void *(*)(id, SEL))objc_msgSend)(enc_tex[i],
 			    sel_registerName("pixelBytes"));
+			unsigned int sid = ((unsigned int (*)(id, SEL))objc_msgSend)(enc_tex[i],
+			    sel_registerName("surfaceID"));
+			if (px == 0 && sid != 0 && sid != enc_surface) {
+				/* Cross-process layer content lives in an IOSurface. */
+				if (sweet_surface_map(sid, &src_map) == 0) {
+					px = src_map.base;
+					src_mapped = 1;
+					dprintf(console_fd,
+					    "SWEETMETAL: sample surface=%u %lux%lu bpr=%lu\n",
+					    sid, src_map.width, src_map.height,
+					    src_map.bytes_per_row);
+				}
+			}
 			if (px == 0) {
 				continue;
 			}
@@ -2034,8 +2594,22 @@ sweet_texture_surface(id texture)
 			    sel_registerName("pixelFormat"));
 			r.tex_bpr = ((unsigned long (*)(id, SEL))objc_msgSend)(enc_tex[i],
 			    sel_registerName("bytesPerRow"));
-			r.tex_surface = ((unsigned int (*)(id, SEL))objc_msgSend)(enc_tex[i],
-			    sel_registerName("surfaceID"));
+			r.tex_surface = sid;
+			/* Uploaded pixels keep their declared format; IOSurface memory
+			 * this process renders into, and offscreen targets it has
+			 * rendered, are RGBA8 whatever the format says. */
+			r.tex_internal = src_mapped ? 1 : 0;
+			if (!r.tex_internal && ((BOOL (*)(id, SEL, Class))objc_msgSend)(
+			    enc_tex[i], sel_registerName("isKindOfClass:"),
+			    objc_getClass("SweetTexture"))) {
+				r.tex_internal = ((unsigned long (*)(id, SEL))objc_msgSend)(
+				    enc_tex[i], sel_registerName("rendered")) != 0;
+			}
+			if (src_mapped) {
+				if (r.tex_w == 0) r.tex_w = src_map.width;
+				if (r.tex_h == 0) r.tex_h = src_map.height;
+				if (r.tex_bpr == 0) r.tex_bpr = src_map.bytes_per_row;
+			}
 		}
 		r.dst = enc_map.base;
 		r.dst_w = enc_map.width;
@@ -2049,6 +2623,7 @@ sweet_texture_surface(id texture)
 		    (int)r.dst_h;
 		if (r.vb != 0 && index_buffer != 0 && r.stride >= 16 && count >= 3 &&
 		    count <= 4096) {
+			unsigned long long raster_t0 = mach_absolute_time();
 			void *ic = (void *)((void *(*)(id, SEL))objc_msgSend)(index_buffer,
 			    sel_registerName("contents"));
 			unsigned long il = ((unsigned long (*)(id, SEL))objc_msgSend)(
@@ -2074,10 +2649,18 @@ sweet_texture_surface(id texture)
 					sweet_raster_triangle(&r, a, b, c);
 				}
 				dprintf(console_fd,
-				    "SWEETMETAL: raster dest=%u tris=%lu stride=%lu tex=%p fmt=%lu",
-				    enc_surface, count / 3, r.stride, r.tex, r.tex_fmt_px);
+				    "SWEETMETAL: raster dest=%u tris=%lu stride=%lu tex=%p"
+				    " fmt=%lu %lux%lu bpr=%lu blend=%lu tfn=%lu dfn=%lu"
+				    " img=%lu ms=%.2f", enc_surface,
+				    count / 3, r.stride, r.tex, r.tex_fmt_px, r.tex_w,
+				    r.tex_h, r.tex_bpr, r.blend_fn, r.tex_fn, r.dst_fn,
+				    r.img_count,
+				    sweet_ticks_ms(mach_absolute_time() - raster_t0));
 				dprintf(console_fd, "%c", 10);
 			}
+		}
+		if (src_mapped) {
+			sweet_surface_unmap(&src_map);
 		}
 	}
 }
@@ -2100,11 +2683,38 @@ sweet_texture_surface(id texture)
 		    getpid(), enc_surface, type, start, count);
 		sweet_draw_logs++;
 	}
+	if ((type == 3 || type == 4) && count >= 3 && count <= 4096) {
+		static unsigned int indices[4096];
+		unsigned long n = 0;
+		if (type == 3) {
+			for (unsigned long i = 0; i < count; i++) {
+				indices[n++] = (unsigned int)(start + i);
+			}
+		} else {
+			for (unsigned long i = 2; i < count; i++) {
+				indices[n++] = (unsigned int)(start +
+				    ((i & 1) ? i - 1 : i - 2));
+				indices[n++] = (unsigned int)(start +
+				    ((i & 1) ? i - 2 : i - 1));
+				indices[n++] = (unsigned int)(start + i);
+			}
+		}
+		SweetBuffer *tmp = [[SweetBuffer alloc] initWithBytes:indices
+		    length:n * sizeof(unsigned int)];
+		[self drawIndexedPrimitives:3 indexCount:n indexType:1
+		    indexBuffer:tmp indexBufferOffset:0 instanceCount:1];
+	}
 }
 
 - (void)endEncoding
 {
 	sweet_log("encoder", "endEncoding");
+	if (enc_surface != 0 && enc_map.base != 0 && enc_map.width >= 1000 &&
+	    enc_map.height >= 2000) {
+		sweet_last_surface = enc_surface;
+		sweet_last_width = enc_map.width;
+		sweet_last_height = enc_map.height;
+	}
 	sweet_surface_unmap(&enc_map);
 }
 
@@ -2151,12 +2761,14 @@ sweet_texture_surface(id texture)
 {
 	sweet_log("buffer", "commit");
 	[self flushFills];
+	sweet_present_pending();
 }
 
 - (void)commitAndWaitUntilSubmitted
 {
 	sweet_log("buffer", "commitAndWaitUntilSubmitted");
 	[self flushFills];
+	sweet_present_pending();
 }
 
 - (void)enqueue
@@ -2178,6 +2790,8 @@ sweet_texture_surface(id texture)
 {
 	sweet_log("buffer", "renderCommandEncoderWithDescriptor");
 	unsigned int surface = 0;
+	id texture = 0;
+	BOOL texture_target = 0;
 	unsigned long action = 0;
 	double red = 0, green = 0, blue = 0, alpha = 0;
 	if (descriptor != 0) {
@@ -2187,12 +2801,13 @@ sweet_texture_surface(id texture)
 		if (attachment == 0 && attachments != 0) {
 			attachment = sweet_msg_id_idx(attachments, "objectAtIndex:", 0);
 		}
-		id texture = attachment != 0 ? sweet_msg_id(attachment, "texture") : 0;
+		texture = attachment != 0 ? sweet_msg_id(attachment, "texture") : 0;
 		action = attachment != 0 ?
 		    sweet_msg_ul(attachment, "loadAction") : 0;
 		if (texture != 0 &&
 		    ((BOOL (*)(id, SEL, Class))objc_msgSend)(texture,
 		    sel_registerName("isKindOfClass:"), objc_getClass("SweetTexture"))) {
+			texture_target = 1;
 			surface = ((unsigned int (*)(id, SEL))objc_msgSend)(texture,
 			    sel_registerName("surfaceID"));
 			if (action == 2) {
@@ -2201,7 +2816,7 @@ sweet_texture_surface(id texture)
 				    attachment, sel_registerName("clearColor"));
 				red = color.red; green = color.green;
 				blue = color.blue; alpha = color.alpha;
-				if (pending_count < 8) {
+				if (pending_count < 8 && surface != 0) {
 					pending_surface[pending_count] = surface;
 					pending_color[pending_count] =
 					    (sweet_channel(red) << 16) |
@@ -2221,7 +2836,10 @@ sweet_texture_surface(id texture)
 	}
 	SweetRenderEncoder *encoder = [[SweetRenderEncoder alloc]
 	    initWithSurface:surface];
-	if (action == 2 && surface != 0) {
+	if (texture != 0 && texture_target) {
+		[encoder setTargetTexture:texture];
+	}
+	if (action == 2) {
 		[encoder clearRed:red green:green blue:blue alpha:alpha];
 	}
 	return encoder;
