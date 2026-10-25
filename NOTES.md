@@ -2,6 +2,19 @@
 
 ### >>> ACTIVE: CA 宿主光栅化（性能整改）(2026-10-25) <<<
 
+**15:01 多核 `-kernel` 方案在宿主复现为早期 Data Abort，暂不可用。**
+- 宿主 QEMU（4 vCPU、HVC payload、`--kernel-stub`、`-d int`）：
+  CPU0 在 EL1 反复 Data Abort（FAR 0x220/0x158，ESR 0x96000006），
+  说明 68 字节 raw stub 经 `-kernel` 装载后没有走到内核入口（异常向量
+  在 0，取指落到 0x200）。也就是说 `arm_load_kernel` 的 PSCI 配置虽然
+  走了，但 raw stub 的装载/入口不对；手机 4 vCPU 也停在早期，与此一致。
+- 结论：多核下一步应改 **QEMU 机器侧**（在 loader 启动路径里显式设置
+  CPU `psci-conduit=HVC` 和第二从核 powered-off/reset 状态），或给
+  Android 引擎打同款补丁；不再用 `-kernel` raw stub 这条路。
+- 当前设备：`payload-0097m-offload`（1 vCPU、quiet、present offload）
+  运行中；offload 已验证（completion 增长、copies 2→464、fps 3–5）。
+- 渲染：渐变块 3 条竖缝待查（host 纹理上传/采样或行跨页边界）。
+
 **15:00 当前可用：1 vCPU + quiet + present offload；多核仍停在早期。**
 - offload 已验证：`offload completed` 持续增长、copies 2→464、fps 3–5，
   画面有正确状态栏和中间渐变块（渐变块带 3 条竖缝，待查）。
