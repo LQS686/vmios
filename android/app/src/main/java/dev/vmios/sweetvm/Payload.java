@@ -209,27 +209,28 @@ public final class Payload {
         }
 
         /*
-         * Multi-CPU QEMU boots need virtualization=on for the PSCI HVC
-         * conduit, which makes QEMU enter this stub at EL2. XNU must run at
-         * EL1, so drop EL2 -> EL1 first, then load boot_args/entry and branch.
-         * At EL1 (single-CPU QEMU, the phone) the first compare falls through.
+         * Multi-CPU QEMU boots run with virtualization=on, so QEMU enters
+         * this stub at EL2 (its PSCI SMC conduit). XNU must run at EL1:
+         * drop EL2 -> EL1 with HCR_EL2.RW=1 (AArch64 EL1), then load
+         * boot_args/entry and branch. At EL1 the first compare falls through.
          */
         int[] code = {
                 0xd5384242, // mrs x2, CurrentEL
                 0xf100205f, // cmp x2, #8 (EL2)
-                0x540000e1, // b.ne 2f
+                0x54000101, // b.ne 2f
                 0xd28078a2, // mov x2, #0x3c5 (EL1h, DAIF masked)
                 0xd51c4002, // msr spsr_el2, x2
-                0x10000082, // adr x2, 2f
+                0x100000a2, // adr x2, 2f
                 0xd51c4022, // msr elr_el2, x2
-                0xd51c111f, // msr hcr_el2, xzr
+                0xd2b00002, // mov x2, #0x80000000 (HCR_EL2.RW=1)
+                0xd51c1102, // msr hcr_el2, x2
                 0xd69f03e0, // eret
                 0x10000083, // adr x3, 3f
                 0xf9400060, // ldr x0, [x3]
                 0xf9400461, // ldr x1, [x3, #8]
                 0xd61f0020, // br x1
         };
-        ByteBuffer stub = ByteBuffer.allocate(68).order(ByteOrder.LITTLE_ENDIAN);
+        ByteBuffer stub = ByteBuffer.allocate(72).order(ByteOrder.LITTLE_ENDIAN);
         for (int word : code) {
             stub.putInt(word);
         }

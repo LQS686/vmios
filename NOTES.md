@@ -2,6 +2,20 @@
 
 ### >>> ACTIVE: CA 宿主光栅化（性能整改）(2026-10-25) <<<
 
+**15:12 多核：HCR_EL2.RW 修复让 4 vCPU 从“早期异常”推进到 userland。**
+- 关键修复：EL2→EL1 的 stub 原来把 `HCR_EL2` 清零，**RW 位=0 使 EL1
+  变成 AArch32**，`eret` 报 Illegal Execution State。改为
+  `HCR_EL2=0x80000000`（RW=1）后，SMC 内核 + `virtualization=on`
+  （QEMU conduit=SMC）+ 4 vCPU 能跑到 userland（ring 到
+  `fairplayd.H2`，约 t=440），不再是早期 fault。
+- 但还没到 CA/GUI：app 的 `copies=2`、`fps=0`，仍只有 1 条 TCG 线程忙；
+  ring 的 `SWEET CPU` 行无时间戳（1/1），无法确认本次是否 4 核；
+  `hw.ncpu` 插件日志尚未出现（backboardd 未到 CA 初始化）。
+- 下一步：在更早的 userland 进程/内核里拿本次 `N/N CPUs`，并看
+  `fairplayd`/utun 之后的停顿是 daemon 等待还是从核未启动。
+- 设备已恢复 **1 vCPU + quiet + offload**（`0097m-offload`）。
+- 渲染：渐变块 3 条竖缝仍待查。
+
 **15:01 多核 `-kernel` 方案在宿主复现为早期 Data Abort，暂不可用。**
 - 宿主 QEMU（4 vCPU、HVC payload、`--kernel-stub`、`-d int`）：
   CPU0 在 EL1 反复 Data Abort（FAR 0x220/0x158，ESR 0x96000006），

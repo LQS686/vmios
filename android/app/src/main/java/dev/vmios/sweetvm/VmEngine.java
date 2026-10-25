@@ -178,9 +178,9 @@ public final class VmEngine {
         // arm_load_kernel, which sets the CPU psci-conduit to HVC and holds
         // the secondaries powered off; HVC then traps to QEMU's PSCI without
         // needing EL2.
-        boolean kernelStub = cpus >= 2;
         cmd.add("-M");
-        cmd.add("virt,gic-version=3");
+        cmd.add(cpus >= 2 ? "virt,gic-version=3,virtualization=on"
+                : "virt,gic-version=3");
         cmd.add("-cpu"); cmd.add("cortex-a76");
         cmd.add("-smp"); cmd.add(Integer.toString(cpus));
         cmd.add("-m"); cmd.add(RAM_GIB + "G");
@@ -237,16 +237,11 @@ public final class VmEngine {
         cmd.add("-device");
         cmd.add(String.format(Locale.US, "loader,file=%s,addr=0x%x,force-raw=on",
                 ram.getAbsolutePath(), payload.physBase));
-        if (kernelStub) {
-            cmd.add("-kernel");
-            cmd.add(stub.getAbsolutePath());
-        } else {
-            cmd.add("-device");
-            cmd.add(String.format(Locale.US, "loader,file=%s,addr=0x%x,force-raw=on",
-                    stub.getAbsolutePath(), Payload.STUB_PA));
-            cmd.add("-device");
-            cmd.add(String.format(Locale.US, "loader,addr=0x%x,cpu-num=0", Payload.STUB_PA));
-        }
+        cmd.add("-device");
+        cmd.add(String.format(Locale.US, "loader,file=%s,addr=0x%x,force-raw=on",
+                stub.getAbsolutePath(), Payload.STUB_PA));
+        cmd.add("-device");
+        cmd.add(String.format(Locale.US, "loader,addr=0x%x,cpu-num=0", Payload.STUB_PA));
         if (rootFile != null) {
             if (!rootFile.isFile()) {
                 throw new IOException("iOS 根镜像不存在");
