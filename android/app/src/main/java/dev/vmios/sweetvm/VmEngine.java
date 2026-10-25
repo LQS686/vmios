@@ -291,6 +291,19 @@ public final class VmEngine {
         monitor.start();
 
         startReader(guestRam, payload, listener, offload);
+        if (cpus >= 2) {
+            final File qs = qmpSocket;
+            Thread probe = new Thread(() -> {
+                try {
+                    Thread.sleep(40000);
+                } catch (InterruptedException e) {
+                    return;
+                }
+                Snapshot.probeCpus(qs);
+            }, "sweetvm-qmp");
+            probe.setDaemon(true);
+            probe.start();
+        }
     }
 
     /** Probe every this many 32-bit words: 16 words = 64 bytes. */

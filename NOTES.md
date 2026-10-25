@@ -2,6 +2,19 @@
 
 ### >>> ACTIVE: CA 宿主光栅化（性能整改）(2026-10-25) <<<
 
+**15:17 QMP 硬证据：EL2 路径下 CPU0 先进异常，从核停在 reset。**
+- app 新增 QMP 诊断（`Snapshot.probeCpus`，启动 40 s 后 `info registers -a`）：
+  4 vCPU SMC+EL2+RW=1 启动时
+  `CPU#0 PC=check_exception_stack PSTATE=EL1h`（内核异常循环），
+  `CPU#1 PC=0 PSTATE=EL2h` 且寄存器全 0（从核停在 EL2 reset，PSCI
+  CPU_ON 没有把它启动）。即 CPU0 在跑到 PSCI/CA 之前已异常，多核
+  bring-up 的真正阻塞是 **XNU 在 EL2 环境下的早期 fault**，不是调度。
+- 修复方向：要么给内核补 EL2 适配（CI 内核），要么在 QEMU 侧避免把
+  guest 置于 EL2（PSCI conduit/loader 的机器补丁）；1 vCPU 无 EL2 路径
+  正常。设备已恢复 `0097m-offload`（1 vCPU + quiet + offload）。
+- 渲染：渐变块 3 条竖缝仍待查（先与旧 m5b 本地光栅同帧对比）。
+- 当前可用性能：1 vCPU offload 3–5 fps，画面可见状态栏/电量/home indicator。
+
 **15:12 多核：HCR_EL2.RW 修复让 4 vCPU 从“早期异常”推进到 userland。**
 - 关键修复：EL2→EL1 的 stub 原来把 `HCR_EL2` 清零，**RW 位=0 使 EL1
   变成 AArch32**，`eret` 报 Illegal Execution State。改为

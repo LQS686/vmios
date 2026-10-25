@@ -132,6 +132,30 @@ public final class Snapshot {
         }
     }
 
+    /** Diagnostic: log each vCPU's PC/halted state to prove SMP bring-up. */
+    public static void probeCpus(File qmpSock) {
+        LocalSocket s = new LocalSocket();
+        try {
+            s.connect(new LocalSocketAddress(qmpSock.getAbsolutePath(),
+                    LocalSocketAddress.Namespace.FILESYSTEM));
+            BufferedReader in = new BufferedReader(new InputStreamReader(
+                    s.getInputStream(), StandardCharsets.UTF_8));
+            OutputStream out = s.getOutputStream();
+            in.readLine();
+            qmp(out, in, "{\"execute\":\"qmp_capabilities\"}");
+            String r = qmp(out, in, "{\"execute\":\"human-monitor-command\","
+                    + "\"arguments\":{\"command-line\":\"info registers -a\"}}");
+            android.util.Log.i("sweetvm", "qmp regs: " + r);
+        } catch (Exception e) {
+            android.util.Log.w("sweetvm", "qmp cpus failed", e);
+        } finally {
+            try {
+                s.close();
+            } catch (IOException ignored) {
+            }
+        }
+    }
+
     private static String qmp(OutputStream out, BufferedReader in, String cmd)
             throws IOException {
         out.write((cmd + "\n").getBytes(StandardCharsets.UTF_8));
