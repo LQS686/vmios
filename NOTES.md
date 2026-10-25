@@ -1,6 +1,52 @@
 # vmios working notes
 
-### >>> ACTIVE: 真机回归 + 实时日志 + CA 绘制链路 (2026-10-25) <<<
+### >>> ACTIVE: CA 宿主光栅化（性能整改）(2026-10-25) <<<
+
+**结论（已测）：卡顿的根因是 TCG 里的逐像素光栅化，不是显示/上传。**
+m5a 那一轮（09:xx UTC）实测：416 次 draw 的光栅化共 208.7 s（观察窗口约
+900 s）；其中 216 次纯色 96.9 s、103 次 fmt550 143x307 纹理 94.9 s、15 次
+fmt115 256x1 25 s；全屏绘制单次 3.3–6.8 s（约 2.2 µs/像素）。present 拷贝
+只占约 1.3 ms，说明瓶颈完全在 guest 侧的光栅循环。
+
+**已落地（单元验证完成，真机未验证）：宿主接管 CA 光栅化**
+- 内核 `xnu/patches/0097-sweet-gpu-ca-draw.patch`（commit `f201a24`，CI run
+  `40153613944` success，产物 `.tools/dl/xnu-0097/kernel.development.sweet`）：
+  0x101 改为**异步入队**（不再每条等待 ack）；新增 0x103 flush（sendWait 等
+  host ack）、0x104 surface page map（把 16 KiB 页表按 ≤480 页/条经 wire op 5
+  发给宿主，解决 IOSurface 物理页离散、宿主无法按 PA 寻址的问题）；0x102
+  仍返回线性/段数信息。wire op：3=fill、4=CA draw、5=texmap、6=flush。
+- 插件 `vm/metal/SweetMetal.m`：把每个 draw batch 解码成规范 8-float 顶点
+  （x,y,u,v,r,g,b,a，88 字节头 + 96 字节/三角，40 三角/条）经 0x101 入队；
+  纹理按 (surface id) 走页表、上传纹理按版本号分块（3800 B/条）发送；每个
+  encoder `endEncoding`/commit 前调用 0x103 flush；宿主不可寻址（堆上离屏
+  纹理、未映射 surface、传输失败）自动回退本地光栅。编译通过
+  （`tools/build-sweetmetal.sh`，bundle 140955 B，md5 495a3278…）。
+- 宿主 `android/.../CaCompositor.java`（新增）+ `GpuWireServer.java`（op 4/5/6
+  分发、flush 回 8 字节 ack）：把 guest RAM 文件按 512 MiB 窗口 mmap，按页表
+  直接读写真实像素（无影子拷贝）；行内片段数学与插件完全一致（source-over、
+  blend 46 亮度混合、双线性采样、top-left 填充规则）；按帧缓存解码后的
+  纹理。APK 编译通过（`gradle assembleDebug`）。
+
+**产物：** `shim/out/sweet-0097.adt`（148684 B）、
+`shim/out/payload-0097.bin`（16799664 B，md5 d62d4993…）、
+APK `android/app/build/outputs/apk/debug/app-debug.apk`。
+
+**下一步（真机验证顺序，尚未执行）：**
+1. `adb install -r` 新 APK（保留 app 数据）；备份现有 `files/payload.bin`。
+2. push payload-0097.bin，run-as cp 覆盖；md5 校验。
+3. 启动 VM，`tools/phone-log-monitor.py` 实时看日志；预期内核出现
+   `SWEET GPU: map surface …`、`flush seq … result 0x0`、`draw seq …`，
+   插件日志 `SWEETMETAL: host map …` 且 `raster … ms=` 行显著减少。
+4. 对比帧时间/fps；若仍慢再考虑 GLES 后端（协议不变，只换宿主执行器）。
+5. 待查渲染缺陷：插件把 src_mapped 的 IOSurface 一律按 RGBA8 解码
+   （`tex_internal=1`），但日志里出现 fmt=550(BGR10_XR)，颜色可能因此偏色；
+   宿主目前镜像同一规则，需先确认 IOSurface 实际格式再统一修正。
+
+**未验证/风险：** 宿主路径尚未在任何一次真机启动中跑过；`0x101` 异步入队后
+若 flush 超时，插件最多容忍 2 次失败后永久回退本地光栅；混合路径（同帧部分
+宿主、部分本地）在重叠区域可能次序不一致（罕见）。
+
+### >>> 上一阶段: 真机回归 + 实时日志 + CA 绘制链路 (2026-10-25) <<<
 
 **真机恢复可用。** Xiaomi 14 Pro (eb72c928) 已连接；安装包
 dev.hackios.sweetvm 0.2.0 为 DEBUGGABLE，app 内部持有 16 GiB
@@ -47,6 +93,30 @@ framebuffer 采样，然后才是文字/图标；纹理都绑在 fragment textur
 **M4r/M4s（CPU 光栅化，已实现）：** 按 pso 元数据逐三角形填充，双线性
 采样上述纹理，src-over 预乘混合写入 IOSurface；同时修复了 half→float
 比例错误（原实现大 1024 倍）。真机验证截图见 `.tools/gputest/shots/`。
+
+**M4t/M4u/M4v/M4w 实测（2026-10-25，真机，观察）：**
+- 面板字节序已实证为 **RGBA**：向 guest 面板内存 y=1200 写入
+  `FF 00 00 FF`，真机出现纯红条；因此光栅器写 RGBA8 是对的，
+  壁纸发暗红不是“面板 R/B 交换”。
+- 根因（已由日志链定死）：本插件写入的所有 IOSurface/离屏纹理都是
+  **RGBA8**，但采样时按“声明的像素格式”解码。显示面 `surface 6`
+  声明 fmt 554（BGR10_XR→默认按 BGRA8 解），离屏 143x307/64x102 声明
+  fmt 550（按 packed B10G10R10 解）。CA 的壁纸降采样链
+  `downsample_8_frag_lph`/`downsample_blur_vert_lph`/`downsample_4_frag_lph`
+  因此读到 R/B 交换且乱码的像素，再全屏合成，形成白/粉巨柱与逐帧变亮。
+- 修复：`SweetTexture` 增加 `rendered` 标记（`setTargetTexture:` 置位），
+  `SweetRaster.tex_internal` 对“本进程写的 IOSurface（sid≠0）或已渲染
+  离屏纹理”置 1，采样一律按 RGBA8 解；`bytesPerPixel` 改用
+  `sweet_texel_bpp`；补 554/555=4bpp；`drawPrimitives` 三角带奇偶换向。
+- 新增函数常量捕获：swizzle 的真实 setter 会把值存入全局表
+  （`sweet_fc_store`），`SweetFunction` 在 `newFunctionWithDescriptor`
+  时快照，`SweetPipeline -copyConstantsFromFunction:` 取片元函数常量，
+  绘制时读 `fc_blend_function` 并实现 blend 46（亮度^4 vibrant）。
+  pso 创建日志新增 `pso fc blend/tex/dst/img`，raster 日志新增 `blend=`。
+
+**下一步：** m4x（仅往返格式修复）真机回归截图，确认壁纸色调恢复；
+再上 m4y（格式修复 + 常量捕获 + blend 46）对照。之后处理剩余缺陷：
+状态栏时间重复、时间后深色矩形、四角绿色残块、左侧竖条、电量颜色。
 
 ### >>> ACTIVE (superseded, 2026-10-24): PROJECT RENAMED TO vmios; DEBUG ON THE PC <<<
 

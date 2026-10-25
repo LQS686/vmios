@@ -27,6 +27,9 @@ public final class GpuWireServer {
     private static final int OP_CLEAR = 1;
     private static final int OP_DRAW = 2;
     private static final int OP_FILL = 3;
+    private static final int OP_CA_DRAW = 4;
+    private static final int OP_TEXMAP = 5;
+    private static final int OP_CA_FLUSH = 6;
     private static final int RESPONSE = 0x8000;
     private static final int WIDTH = 64;
     private static final int HEIGHT = 64;
@@ -115,6 +118,23 @@ public final class GpuWireServer {
                 fillSurface(payload, request);
                 continue;
             }
+            if (operation == OP_CA_DRAW) {
+                compositor().onDraw(payload);
+                continue;
+            }
+            if (operation == OP_TEXMAP) {
+                compositor().onMap(ByteBuffer.wrap(payload).order(ByteOrder.LITTLE_ENDIAN));
+                continue;
+            }
+            if (operation == OP_CA_FLUSH) {
+                compositor().onFlush();
+                ByteBuffer ack = ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN);
+                ack.putInt(MAGIC);
+                ack.putInt(request);
+                out.write(ack.array());
+                out.flush();
+                continue;
+            }
             if (operation != OP_CLEAR && operation != OP_DRAW) {
                 return;
             }
@@ -146,6 +166,21 @@ public final class GpuWireServer {
             out.write(reply.array());
             out.flush();
         }
+    }
+
+    private static CaCompositor compositor;
+
+    private static synchronized CaCompositor compositor() {
+        if (compositor == null && guestRam != null) {
+            try {
+                compositor = new CaCompositor(new GuestRam(guestRam));
+                Log.i(TAG, "CA compositor attached to " + guestRam);
+            } catch (Exception e) {
+                Log.e(TAG, "CA compositor failed to map guest RAM", e);
+                compositor = new CaCompositor(null);
+            }
+        }
+        return compositor;
     }
 
     private static RandomAccessFile panelFile;
