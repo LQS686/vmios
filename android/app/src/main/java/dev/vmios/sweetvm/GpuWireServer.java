@@ -46,6 +46,8 @@ public final class GpuWireServer {
     private static GpuWireServer instance;
     private static File guestRam;
     private static boolean panelStarted;
+    private static int wireLogs;
+    private static int dumpLogs;
 
     private final ServerSocket server;
     private final Thread thread;
@@ -114,20 +116,48 @@ public final class GpuWireServer {
             if (bytes > 0) {
                 in.readFully(payload);
             }
+            if (wireLogs < 32) {
+                wireLogs++;
+                Log.i(TAG, "wire op=" + operation + " bytes=" + bytes
+                        + " request=" + request);
+            }
+            if (operation == OP_CA_DRAW && dumpLogs < 10) {
+                dumpLogs++;
+                StringBuilder hex = new StringBuilder();
+                int n = Math.min(96, payload.length);
+                for (int i = 0; i < n; i++) {
+                    hex.append(String.format("%02x", payload[i] & 0xff));
+                    if ((i & 3) == 3) hex.append(' ');
+                }
+                Log.i(TAG, "dump req=" + request + " len=" + payload.length
+                        + " " + hex);
+            }
             if (operation == OP_FILL) {
                 fillSurface(payload, request);
                 continue;
             }
             if (operation == OP_CA_DRAW) {
-                compositor().onDraw(payload);
+                try {
+                    compositor().onDraw(payload);
+                } catch (Throwable t) {
+                    Log.e(TAG, "CA draw failed", t);
+                }
                 continue;
             }
             if (operation == OP_TEXMAP) {
-                compositor().onMap(ByteBuffer.wrap(payload).order(ByteOrder.LITTLE_ENDIAN));
+                try {
+                    compositor().onMap(ByteBuffer.wrap(payload).order(ByteOrder.LITTLE_ENDIAN));
+                } catch (Throwable t) {
+                    Log.e(TAG, "CA map failed", t);
+                }
                 continue;
             }
             if (operation == OP_CA_FLUSH) {
-                compositor().onFlush();
+                try {
+                    compositor().onFlush();
+                } catch (Throwable t) {
+                    Log.e(TAG, "CA flush failed", t);
+                }
                 ByteBuffer ack = ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN);
                 ack.putInt(MAGIC);
                 ack.putInt(request);

@@ -28,9 +28,11 @@ final class GuestRam {
     private static final int MASK = SIZE - 1;
 
     private final MappedByteBuffer[] windows;
+    private final long length;
 
     GuestRam(File file) throws Exception {
         long length = file.length();
+        this.length = length;
         int count = (int) ((length + SIZE - 1) >>> SHIFT);
         if (count <= 0) {
             throw new IllegalStateException("empty guest ram");
@@ -59,6 +61,10 @@ final class GuestRam {
     int index(long pa) {
         return (int) ((pa - BASE) & MASK);
     }
+
+    boolean contains(long pa) {
+        return pa >= BASE && pa - BASE < length;
+    }
 }
 
 final class CaCompositor {
@@ -78,6 +84,10 @@ final class CaCompositor {
     private long draws;
     private long pixels;
     private long decodeCount;
+    private int uploadLogs;
+    private int drawLogs;
+    private int rejectLogs;
+    private int mapLogs;
     private long frame;
     private long frameStart = System.nanoTime();
     private long frameDraws;
@@ -103,6 +113,7 @@ final class CaCompositor {
         int bpr;
         int width;
         int height;
+        long alloc;
 
         boolean ready() {
             return total > 0 && received >= total;
@@ -137,6 +148,7 @@ final class CaCompositor {
         int pageCount = b.getInt(8);
         int total = b.getInt(12);
         int shift = b.getInt(32);
+        long alloc = (b.getInt(16) & 0xffffffffL) | ((long) b.getInt(20) << 32);
         if (shift < 12 || shift > 20 || pageCount <= 0 || total <= 0
                 || pageIndex < 0 || pageIndex + pageCount > total) {
             return;
@@ -151,15 +163,32 @@ final class CaCompositor {
             s.pageSize = 1 << shift;
             s.pageMask = s.pageSize - 1;
             s.received = 0;
+            s.alloc = alloc;
             surfaces.put(id, s);
             decoded.remove(id);
         }
         for (int i = 0; i < pageCount; i++) {
             long pa = (b.getLong(40 + i * 8));
+            if (pa != 0 && (!ram.contains(pa) || (pa & 0x3fff) != 0)) {
+                if (rejectLogs < 8) {
+                    rejectLogs++;
+                    Log.w(TAG, "map reject id=" + id + " page " + (pageIndex + i)
+                            + " pa=0x" + Long.toHexString(pa));
+                }
+                return;
+            }
             if (s.pages[pageIndex + i] == 0) {
                 s.received++;
             }
             s.pages[pageIndex + i] = pa;
+        }
+        if (mapLogs < 8) {
+            mapLogs++;
+            Log.i(TAG, "map id=" + id + " pages=" + total + " alloc=" + alloc
+                    + " batch=" + pageIndex + "+" + pageCount + " first=0x"
+                    + Long.toHexString(b.getLong(40)) + " p1=0x"
+                    + Long.toHexString(b.getLong(48)) + " p2=0x"
+                    + Long.toHexString(b.getLong(56)));
         }
     }
 
@@ -177,8 +206,15 @@ final class CaCompositor {
         if (bytes <= 0) {
             return;
         }
-        if (total <= 0 || chunks <= 0 || chunk < 0 || chunk >= chunks
-                || width <= 0 || height <= 0 || bpr <= 0) {
+        if (total <= 0 || total > (2 << 20) || chunks <= 0 || chunk < 0
+                || chunk >= chunks || width <= 0 || height <= 0 || width > 8192
+                || height > 8192 || bpr <= 0 || bpr > (1 << 20)) {
+            if (rejectLogs < 8) {
+                rejectLogs++;
+                Log.w(TAG, "texture reject id=" + id + " " + width + "x" + height
+                        + " bpr=" + bpr + " fmt=" + fmt + " total=" + total
+                        + " chunk=" + chunk + "/" + chunks + " bytes=" + bytes);
+            }
             return;
         }
         Upload u = uploads.get(id);
@@ -204,6 +240,11 @@ final class CaCompositor {
         u.got += copy;
         if (u.got >= u.expect) {
             u.ready = true;
+            if (uploadLogs < 8) {
+                uploadLogs++;
+                Log.i(TAG, "upload " + id + " " + width + "x" + height
+                        + " bpr=" + bpr + " fmt=" + fmt + " bytes=" + total);
+            }
         }
     }
 
@@ -212,7 +253,7 @@ final class CaCompositor {
             return;
         }
         long now = System.nanoTime();
-        if (frameDraws > 0 && (draws & 63) == 0) {
+        if (frameDraws > 0 && (frame <= 8 || (frame & 63) == 0)) {
             Log.i(TAG, "frame " + frame + " draws=" + frameDraws + " px=" + framePixels
                     + " ms=" + ((now - frameStart) / 1000000L) + " decodes=" + decodeCount
                     + " maps=" + surfaces.size() + " uploads=" + uploads.size()
@@ -252,6 +293,13 @@ final class CaCompositor {
         int clipY1 = b.getInt(52);
         int blend = b.getInt(56);
         int triCount = b.getInt(60);
+        if (drawLogs < 12 && payload.length >= HEADER_BYTES) {
+            drawLogs++;
+            Log.i(TAG, "draw flags=0x" + Integer.toHexString(flags) + " len="
+                    + payload.length + " dst=" + dstId + " " + dstW + "x" + dstH
+                    + " bpr=" + dstBpr + " tex=" + texId + " " + texW + "x" + texH
+                    + " tris=" + triCount + " b80=" + b.getInt(80));
+        }
 
         Surface dst = surfaces.get(dstId);
         if (dst == null || !dst.ready()) {
@@ -261,7 +309,7 @@ final class CaCompositor {
         dst.width = dstW;
         dst.height = dstH;
         dst.bpr = dstBpr;
-        if (dstBpr < dstW * 4) {
+        if (dstBpr < dstW * 4 || (dst.alloc > 0 && (long) dstBpr * dstH > dst.alloc)) {
             dropped++;
             return;
         }
@@ -332,7 +380,8 @@ final class CaCompositor {
         if (cached != null && cached.width == width && cached.height == height) {
             return cached;
         }
-        if (width <= 0 || height <= 0 || bpr <= 0 || width > 16384 || height > 16384) {
+        if (width <= 0 || height <= 0 || bpr <= 0 || width > 8192 || height > 8192
+                || (long) width * height > 4_000_000L) {
             return null;
         }
         int[] out = new int[width * height];
@@ -618,6 +667,9 @@ final class CaCompositor {
             int x = minx;
             while (x < maxx) {
                 long pixelOffset = rowOffset + (long) x * 4;
+                if (dst.alloc > 0 && pixelOffset + 4 > dst.alloc) {
+                    break;
+                }
                 int page = (int) (pixelOffset >>> dst.pageShift);
                 if (page >= dst.total) {
                     break;
@@ -702,8 +754,7 @@ final class CaCompositor {
                                 | ((int) (og >= 1f ? 255 : og * 255f) << 8)
                                 | (int) (ob >= 1f ? 255 : ob * 255f);
                         buf.putInt(index, out);
-                        covered++;
-                    }
+                        covered++;                    }
                     e0 += d0x;
                     e1 += d1x;
                     e2 += d2x;

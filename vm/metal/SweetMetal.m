@@ -759,6 +759,108 @@ sweet_ca_map(unsigned int identifier)
 	return 1;
 }
 
+/*
+ * Staging surface for host rasterization.
+ *
+ * The host used to write the CA drawable itself. Its page map came from the
+ * kernel and matched the surface, yet writing it corrupted unrelated kernel
+ * and user pages (panics in cache_lookup_path / backtracer far values made of
+ * pixels). This surface is created and locked by this process, is never
+ * sampled or released, and is the only memory the host writes. Both the host
+ * and the local rasterizer draw into it; present then copies it to the panel.
+ */
+static unsigned int sweet_stage_id;
+static unsigned long sweet_stage_w, sweet_stage_h, sweet_stage_bpr;
+static unsigned char *sweet_stage_base;
+static void *sweet_stage_ref;
+static unsigned int sweet_stage_seed;
+static unsigned int sweet_stage_logs;
+
+static int
+sweet_stage_ensure(unsigned long width, unsigned long height, unsigned long bpr)
+{
+	if (width == 0 || height == 0 || bpr < width * 4) {
+		return 0;
+	}
+	if (sweet_stage_id != 0 && sweet_stage_w == width &&
+	    sweet_stage_h == height) {
+		return 1;
+	}
+	typedef const void *CFT;
+	void *cf = dlopen(
+	    "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation", 2);
+	void *ios = dlopen(
+	    "/System/Library/Frameworks/IOSurface.framework/IOSurface", 2);
+	if (cf == 0 || ios == 0) {
+		return 0;
+	}
+	CFT (*dict_new)(CFT, long, const void *, const void *) =
+	    dlsym(cf, "CFDictionaryCreateMutable");
+	void (*dict_set)(CFT, CFT, CFT) = dlsym(cf, "CFDictionarySetValue");
+	CFT (*num_new)(CFT, long, const void *) = dlsym(cf, "CFNumberCreate");
+	CFT (*str_new)(CFT, const char *, unsigned) =
+	    dlsym(cf, "CFStringCreateWithCString");
+	void *kcb = dlsym(cf, "kCFTypeDictionaryKeyCallBacks");
+	void *vcb = dlsym(cf, "kCFTypeDictionaryValueCallBacks");
+	CFT (*surface_create)(CFT) = dlsym(ios, "IOSurfaceCreate");
+	unsigned int (*get_id)(CFT) = dlsym(ios, "IOSurfaceGetID");
+	void *(*get_base)(CFT) = dlsym(ios, "IOSurfaceGetBaseAddress");
+	unsigned long (*get_bpr)(CFT) = dlsym(ios, "IOSurfaceGetBytesPerRow");
+	int (*lock)(CFT, unsigned int, unsigned int *) =
+	    dlsym(ios, "IOSurfaceLock");
+	if (dict_new == 0 || dict_set == 0 || num_new == 0 || str_new == 0 ||
+	    kcb == 0 || vcb == 0 || surface_create == 0 || get_id == 0 ||
+	    get_base == 0 || get_bpr == 0 || lock == 0) {
+		return 0;
+	}
+	CFT dict = dict_new(0, 8, kcb, vcb);
+	if (dict == 0) {
+		return 0;
+	}
+	struct { const char *key; int value; } props[] = {
+		{ "IOSurfaceWidth", (int)width },
+		{ "IOSurfaceHeight", (int)height },
+		{ "IOSurfaceBytesPerRow", (int)bpr },
+		{ "IOSurfaceAllocSize", (int)(bpr * height) },
+		{ "IOSurfacePixelFormat", 0x42475241 },
+	};
+	for (unsigned int i = 0; i < sizeof(props) / sizeof(props[0]); i++) {
+		CFT key = str_new(0, props[i].key, 0x08000100);
+		CFT value = num_new(0, 3, &props[i].value);
+		if (key != 0 && value != 0) {
+			dict_set(dict, key, value);
+		}
+	}
+	void *ref = surface_create(dict);
+	if (ref == 0) {
+		if (sweet_stage_logs < 4) {
+			sweet_stage_logs++;
+			dprintf(console_fd, "SWEETMETAL: stage create failed%c", 10);
+		}
+		return 0;
+	}
+	unsigned int seed = 0;
+	if (lock(ref, 0, &seed) != 0) {
+		return 0;
+	}
+	unsigned int id = get_id(ref);
+	unsigned char *base = (unsigned char *)get_base(ref);
+	unsigned long got_bpr = get_bpr(ref);
+	if (id == 0 || base == 0 || got_bpr < width * 4) {
+		return 0;
+	}
+	sweet_stage_ref = ref;
+	sweet_stage_seed = seed;
+	sweet_stage_id = id;
+	sweet_stage_base = base;
+	sweet_stage_w = width;
+	sweet_stage_h = height;
+	sweet_stage_bpr = got_bpr;
+	dprintf(console_fd, "SWEETMETAL: stage id=%u %lux%lu bpr=%lu base=%p%c",
+	    id, width, height, got_bpr, base, 10);
+	return 1;
+}
+
 /* One wire message: 4-byte sequence, 4 bytes of padding, payload. */
 static int
 sweet_ca_send(const void *payload, unsigned long bytes)
@@ -802,9 +904,34 @@ sweet_ca_flush(void)
 	}
 	unsigned int sequence = sweet_ca_sequence;
 	unsigned long output_size = 0;
-	int result = IOConnectCallStructMethod(sweet_accel_port, 0x103,
-	    &sequence, sizeof(sequence), 0, &output_size);
+	int result = 0;
+	/*
+	 * The host may still be rasterizing earlier batches when this flush
+	 * arrives. The kernel waits 4 x 250 ms; a timeout there is not just a
+	 * lost frame: the guest would continue and could release the surface
+	 * while the host is still writing its pages (that corrupted an
+	 * IOTimerEventSource and panicked the kernel). Keep the surface alive
+	 * and retry until the host acknowledges the sequence.
+	 */
+	for (int attempt = 0; attempt < 12; attempt++) {
+		result = IOConnectCallStructMethod(sweet_accel_port, 0x103,
+		    &sequence, sizeof(sequence), 0, &output_size);
+		if (result == 0) {
+			break;
+		}
+		if (attempt == 0 && sweet_ca_logs < 16) {
+			sweet_ca_logs++;
+			dprintf(console_fd,
+			    "SWEETMETAL: host flush %u timeout, waiting for host%c",
+			    sequence, 10);
+		}
+	}
 	sweet_ca_flushes++;
+	if (sweet_ca_flushes <= 8) {
+		dprintf(console_fd,
+		    "SWEETMETAL: host flush %u pending=%u submitted=%u local=%u%c",
+		    sequence, sweet_ca_pending, sweet_ca_submitted, sweet_ca_local, 10);
+	}
 	if (result != 0) {
 		sweet_ca_failures++;
 		if (sweet_ca_failures > 2) {
@@ -2423,6 +2550,7 @@ sweet_ca_batch(const SweetRaster *r, unsigned int dst_id,
 		header.tri_count = (unsigned int)(last - first);
 		header.chunk_index = (unsigned int)chunk;
 		header.chunk_count = (unsigned int)chunks;
+		memcpy(message, &header, sizeof(header));
 		unsigned char *out = message + sizeof(header);
 		for (unsigned long t = first; t < last; t++) {
 			struct sweet_ca_vertex v[3];
@@ -2488,6 +2616,7 @@ typedef struct {
 	SweetScissor enc_scissor;
 	SweetSurfaceMapping enc_map;
 	id enc_target_tex;
+	unsigned int enc_stage;
 }
 - (id)initWithSurface:(unsigned int)surface;
 - (void)setTargetTexture:(id)texture;
@@ -2530,6 +2659,7 @@ typedef struct {
 - (id)initWithSurface:(unsigned int)surface
 {
 	enc_surface = surface;
+	enc_stage = 0;
 	if (surface != 0 && sweet_surface_map(surface, &enc_map) == 0) {
 		dprintf(console_fd,
 		    "SWEETMETAL: mapped dest=%u %lux%lu bpr=%lu base=%p", surface,
@@ -2947,9 +3077,26 @@ sweet_texture_surface(id texture)
 		 * Uploaded pixel buffers travel once per version; a texture this
 		 * process rendered offscreen stays local because its contents
 		 * change every frame and live in heap memory.
+		 *
+		 * Full-size (drawable) destinations are redirected to this
+		 * process's own staging surface; the host must never write a CA
+		 * surface (see sweet_stage_ensure). Smaller destinations stay on
+		 * the local rasterizer.
 		 */
+		unsigned int host_surface = enc_surface;
+		if (enc_surface != 0 && r.dst_w >= 1000 && r.dst_h >= 2000 &&
+		    sweet_stage_ensure((unsigned long)r.dst_w, (unsigned long)r.dst_h,
+		        (unsigned long)r.dst_bpr)) {
+			r.dst = sweet_stage_base;
+			r.dst_w = sweet_stage_w;
+			r.dst_h = sweet_stage_h;
+			r.dst_bpr = sweet_stage_bpr;
+			host_surface = sweet_stage_id;
+			enc_stage = 1;
+		}
 		int host_ok = !sweet_ca_disabled && sweet_accel_port != 0 &&
-		    enc_surface != 0 && r.dst != 0 && r.dst_bpr != 0;
+		    enc_surface != 0 && r.dst != 0 && r.dst_bpr != 0 &&
+		    host_surface != enc_surface;
 		unsigned int tex_id = 0;
 		unsigned int tex_flags = 0;
 		if (host_ok && r.tex != 0) {
@@ -2976,6 +3123,30 @@ sweet_texture_surface(id texture)
 						texture->tex_host_version = texture->tex_version;
 					}
 				}
+			} else if (r.tex_owner != 0 && r.tex_internal &&
+			    r.tex_w > 0 && r.tex_h > 0 && r.tex_bpr >= r.tex_w * 4 &&
+			    r.tex_bpr * r.tex_h <= (1u << 20)) {
+				/*
+				 * Offscreen render targets live in this process's heap,
+				 * where the host cannot address them, so their whole
+				 * screen-sized composite used to stay on the TCG
+				 * rasterizer (~1.1 s per draw). The local rasterizer
+				 * writes those pixels as RGBA8; sending them costs
+				 * ~175 KB for the 143x307 wallpaper chain, which is far
+				 * cheaper than sampling them under TCG. There is no
+				 * version counter for renders, so upload every use.
+				 */
+				SweetTexture *texture = (SweetTexture *)r.tex_owner;
+				if (texture->tex_host_id == 0) {
+					texture->tex_host_id = sweet_ca_upload_ids++;
+				}
+				tex_id = texture->tex_host_id;
+				tex_flags = SWEET_CA_F_TEXTURED | SWEET_CA_F_UPLOAD_TEX;
+				if (!sweet_ca_upload(tex_id, (unsigned int)r.tex_fmt_px,
+				    r.tex_w, r.tex_h, r.tex_bpr, r.tex,
+				    r.tex_bpr * r.tex_h, tex_flags)) {
+					host_ok = 0;
+				}
 			} else {
 				host_ok = 0;
 			}
@@ -2987,7 +3158,7 @@ sweet_texture_surface(id texture)
 		    r.dst_w > 65535 || r.dst_h > 65535)) {
 			host_ok = 0;
 		}
-		if (host_ok && !sweet_ca_map(enc_surface)) {
+		if (host_ok && !sweet_ca_map(host_surface)) {
 			host_ok = 0;
 		}
 		if (r.vb != 0 && index_buffer != 0 && r.stride >= 16 && count >= 3 &&
@@ -3006,7 +3177,7 @@ sweet_texture_surface(id texture)
 				const unsigned char *ip = (const unsigned char *)ic + index_offset;
 				int submitted = 0;
 				if (host_ok) {
-					submitted = sweet_ca_batch(&r, enc_surface, ip, n,
+					submitted = sweet_ca_batch(&r, host_surface, ip, n,
 					    index_type, tex_id, tex_flags);
 					if (submitted) {
 						sweet_ca_submitted++;
@@ -3091,12 +3262,17 @@ sweet_texture_surface(id texture)
 	sweet_log("encoder", "endEncoding");
 	/* The drawable must be complete before the swap record is sent. */
 	sweet_ca_flush();
-	if (enc_surface != 0 && enc_map.base != 0 && enc_map.width >= 1000 &&
+	if (enc_stage && sweet_stage_id != 0) {
+		sweet_last_surface = sweet_stage_id;
+		sweet_last_width = sweet_stage_w;
+		sweet_last_height = sweet_stage_h;
+	} else if (enc_surface != 0 && enc_map.base != 0 && enc_map.width >= 1000 &&
 	    enc_map.height >= 2000) {
 		sweet_last_surface = enc_surface;
 		sweet_last_width = enc_map.width;
 		sweet_last_height = enc_map.height;
 	}
+	enc_stage = 0;
 	sweet_surface_unmap(&enc_map);
 }
 

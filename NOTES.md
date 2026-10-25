@@ -2,6 +2,50 @@
 
 ### >>> ACTIVE: CA 宿主光栅化（性能整改）(2026-10-25) <<<
 
+**12:05 状态：宿主光栅跑通，但写 CA surface 会打崩 guest；已改为 staging。**
+- AOT（`adb shell cmd package compile -m speed -f dev.hackios.sweetvm`）把全屏
+  host draw 从 1.2 s 降到 **11–21 ms**；这也说明之前 1.2 s 主要是 debug APK
+  的解释执行，不是算法本身。
+- 宿主收到的页表已核对：surface 6 首页 `0xf1e94000`、surface 5 首页
+  `0xc4590000` 与内核 `SWEET SURF: ... create id` 日志完全一致，页表内容没错。
+- 但真实写入后 guest 立刻 panic：`cache_lookup_path` 数据异常，`far`
+  是像素值；同时 calaccessd 等用户进程崩溃。同负载 DRY_RUN（只算不写）
+  6 分钟无此 panic，因此是宿主写 surface 触发的内存破坏，而非光栅数学。
+  可能原因：surface 生命周期/所有权或页表在写入期间的归属；尚未定位到
+  具体页。
+- 规避方案（已实现，**未真机验证**）：插件自建一块 1125x2436 的
+  staging IOSurface（`IOSurfaceCreate`，长期 Lock 持有），全尺寸绘制的
+  HOST 与本地光栅都写它，`endEncoding` 后直接 present 它；宿主不再写任何
+  CA drawable。文件 `vm/metal/SweetMetal.m` 的 `sweet_stage_ensure`。
+  bundle `vm/metal/build/SweetMetalAccel.sgb`（141291 B），payload：
+  `shim/out/payload-0097e.bin`（md5 53838009…）、
+  `shim/out/payload-0097e-2cpu.bin`（md5 6a40f330…）。APK 无需改动。
+- 设备 12:04 从 adb 掉线（未回连），真机验证暂停。回连后顺序：
+  1) 推 0097e，AOT 后启动，确认不再 panic、`SWEETMETAL: stage id=...` 出现、
+     画面与 fps；2) 若稳定，再测 2 vCPU（0097e-2cpu，ADT 已带 2 个 CPU 节点）。
+- 另：设备 prefs `mttcg=true` 但 cmdline 是 `cpus=1`，多核从未真正启用；
+  2cpu payload 已备好。AOT 编译每次安装 APK 后都要重做。
+
+**11:35 更新：找到并修复宿主链路的三处实际缺陷。**
+1. 设备上安装的 APK 是 10-24 20:33 的旧包（改名前 `dev.hackios.sweetvm`），不含
+   `CaCompositor`；本地重建的 payload 又只带了 `debug=...cpus=1` 的基础 cmdline，
+   缺 `gpu_wire=1 sweetmetal=1`。现在 APK 用
+   `gradle -PvmiosAppId=dev.hackios.sweetvm assembleDebug` 覆盖安装（签名一致，
+   16 GiB 数据保留），payload 用设备 m5a payload 的完整 300 字节 cmdline 重打。
+2. 设备 prefs 里 `mttcg=true`，但 payload 是 `cpus=1`，所以此前从未真正跑过多核。
+3. 宿主 `sweetgpu-host` 在 `onTexture` 处 OOM（一次 1.16 GB 分配）：根因是插件
+   `sweet_ca_batch()` 填好 `struct sweet_ca_header` 却**没有 memcpy 到发送缓冲区**，
+   顶点直接写在 `message+88`，宿主读到未初始化栈数据。3888 B 纹理块头部正确、
+   280 B 绘制批次头部全错，正好对应这一处。已补 `memcpy(message, &header, ...)`
+   （bundle md5 `9cd790df…`，payload `879908e5…`）。
+   同时宿主对 `total/width/height/bpr/pixels` 加硬上限，避免再次被异常消息打崩。
+
+**11:30 观测（修复前）：** 76 次“全屏 dest=5/6 + 143x307 fmt550 内部纹理”占
+本地光栅 85 s（约 1.13 s/次），其余绘制合计 <0.2 s；宿主已收到 map/flush 但
+每帧都回退本地。已新增：内部堆纹理 ≤1 MiB 时按 RGBA8 上传给宿主（
+`SWEET_CA_F_UPLOAD_TEX`+`F_INTERNAL`，每次使用都传，无版本计数），目标是让
+全屏合成在宿主完成。
+
 **结论（已测）：卡顿的根因是 TCG 里的逐像素光栅化，不是显示/上传。**
 m5a 那一轮（09:xx UTC）实测：416 次 draw 的光栅化共 208.7 s（观察窗口约
 900 s）；其中 216 次纯色 96.9 s、103 次 fmt550 143x307 纹理 94.9 s、15 次
