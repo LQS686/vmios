@@ -20,10 +20,25 @@ typedef struct objc_method *Method;
 typedef void (*IMP)(void);
 
 Class objc_getClass(const char *name);
+Class object_getClass(id obj);
+typedef struct objc_ivar *Ivar;
+Ivar *class_copyIvarList(Class cls, unsigned int *outCount);
+const char *ivar_getName(Ivar ivar);
+long ivar_getOffset(Ivar ivar);
+typedef unsigned int mach_port_t;
+typedef int kern_return_t;
+extern mach_port_t mach_task_self_;
+kern_return_t mach_vm_read_overwrite(mach_port_t target_task,
+    unsigned long long address, unsigned long long size,
+    unsigned long long buffer, unsigned long long *outsize);
+static void sweet_hex64(const char *tag, unsigned int index, const void *pointer);
 Class class_getSuperclass(Class cls);
 const char *class_getName(Class cls);
 const char *object_getClassName(id obj);
 Method *class_copyMethodList(Class cls, unsigned int *outCount);
+Method class_getInstanceMethod(Class cls, SEL name);
+IMP method_getImplementation(Method method);
+IMP method_setImplementation(Method method, IMP imp);
 SEL method_getName(Method method);
 const char *method_getTypeEncoding(Method method);
 BOOL class_addMethod(Class cls, SEL name, IMP imp, const char *types);
@@ -190,6 +205,97 @@ sweet_msg_id_idx(id obj, const char *sel, unsigned long index)
 {
 	return ((id (*)(id, SEL, unsigned long))objc_msgSend)(obj,
 	    sel_registerName(sel), index);
+}
+
+/*
+ * CoreAnimation sets its uber-shader function constants by name on the real
+ * MTLFunctionConstantValues object before handing it to our fake library, so
+ * descriptor introspection cannot see them. Swizzle the real setters and log
+ * the name/type/value at the moment CA stores them.
+ */
+static IMP sweet_cv_index_imp;
+static IMP sweet_cv_name_imp;
+static unsigned sweet_cv_hooked;
+
+static void
+sweet_cv_report(const char *kind, const char *name, unsigned long index,
+    unsigned long type, const void *value)
+{
+	unsigned int raw = 0;
+	float f = 0.0f;
+	int s = 0;
+	if (value != 0) {
+		memcpy(&raw, value, sizeof(raw));
+		memcpy(&f, value, sizeof(f));
+		memcpy(&s, value, sizeof(s));
+	}
+	if (console_fd < 0) {
+		console_fd = open("/dev/console", 1);
+	}
+	dprintf(console_fd,
+	    "SWEETMETAL: cvset %s name=%s idx=%lu type=%lu u=%u s=%d f=%g hex=%#x",
+	    kind, name, index, type, raw, s, (double)f, raw);
+	dprintf(console_fd, "%c", 10);
+}
+
+static void
+sweet_cv_set_index(id self, SEL _cmd, const void *value, unsigned long type,
+    unsigned long index)
+{
+	sweet_cv_report("byindex", "-", index, type, value);
+	if (sweet_cv_index_imp != 0) {
+		((void (*)(id, SEL, const void *, unsigned long, unsigned long))
+		    sweet_cv_index_imp)(self, _cmd, value, type, index);
+	}
+}
+
+static void
+sweet_cv_set_name(id self, SEL _cmd, const void *value, unsigned long type,
+    id name)
+{
+	sweet_cv_report("byname", sweet_cstr(name), 0, type, value);
+	if (sweet_cv_name_imp != 0) {
+		((void (*)(id, SEL, const void *, unsigned long, id))
+		    sweet_cv_name_imp)(self, _cmd, value, type, name);
+	}
+}
+
+static void
+sweet_install_cv_hooks(void)
+{
+	static const char *classes[2] = {
+		"MTLFunctionConstantValuesInternal",
+		"MTLFunctionConstantValues"
+	};
+	if (sweet_cv_hooked == 3) {
+		return;
+	}
+	for (unsigned i = 0; i < 2; i++) {
+		Class cls = objc_getClass(classes[i]);
+		if (cls == 0) {
+			continue;
+		}
+		if ((sweet_cv_hooked & 1) == 0) {
+			Method m = class_getInstanceMethod(cls,
+			    sel_registerName("setConstantValue:type:atIndex:"));
+			if (m != 0 && method_getImplementation(m) != (IMP)sweet_cv_set_index) {
+				sweet_cv_index_imp = method_setImplementation(m,
+				    (IMP)sweet_cv_set_index);
+				sweet_cv_hooked |= 1;
+				sweet_log("cv hook atIndex on", classes[i]);
+			}
+		}
+		if ((sweet_cv_hooked & 2) == 0) {
+			Method m = class_getInstanceMethod(cls,
+			    sel_registerName("setConstantValue:type:withName:"));
+			if (m != 0 && method_getImplementation(m) != (IMP)sweet_cv_set_name) {
+				sweet_cv_name_imp = method_setImplementation(m,
+				    (IMP)sweet_cv_set_name);
+				sweet_cv_hooked |= 2;
+				sweet_log("cv hook withName on", classes[i]);
+			}
+		}
+	}
 }
 
 /*
@@ -499,6 +605,7 @@ sweet_loaded(void)
 {
 	static void *thread;
 	sweet_log("bundle loaded", 0);
+	sweet_install_cv_hooks();
 	int probe_rc = pthread_create(&thread, 0, sweet_probe_thread, 0);
 	dprintf(console_fd, "SWEETMETAL: probe thread rc=%d\n", probe_rc);
 	void *queue = dispatch_get_global_queue(0, 0);
@@ -659,14 +766,69 @@ static id sweet_pipeline_named(id name);
 - (id)newFunctionWithDescriptor:(id)descriptor error:(id *)error
 {
 	id name = descriptor ? sweet_msg_id(descriptor, "name") : 0;
+	sweet_install_cv_hooks();
 	dprintf(console_fd, "SWEETMETAL: library newFunctionWithDescriptor %s\n",
 	    sweet_cstr(name));
 	if (descriptor != 0) {
 		id cv = sweet_msg_id(descriptor, "constantValues");
 		if (cv != 0) {
-			id desc = sweet_msg_id(cv, "description");
-			dprintf(console_fd, "SWEETMETAL:   constants %s", sweet_cstr(desc));
+			Class cvc = object_getClass(cv);
+			dprintf(console_fd, "SWEETMETAL: cv class %s obj %p", class_getName(cvc), cv);
 			dprintf(console_fd, "%c", 10);
+			unsigned int ivn = 0;
+			Ivar *ivs = class_copyIvarList(cvc, &ivn);
+			for (unsigned int i = 0; ivs != 0 && i < ivn && i < 12; i++) {
+				dprintf(console_fd, "SWEETMETAL: cv ivar %s +%ld",
+				    ivar_getName(ivs[i]), ivar_getOffset(ivs[i]));
+				dprintf(console_fd, "%c", 10);
+			}
+			if (ivs != 0) {
+				free(ivs);
+			}
+			{
+				id arr = sweet_msg_id(cv, "newIndexedConstantArray");
+				unsigned long n = arr != 0 ? sweet_msg_ul(arr, "count") : 0;
+				dprintf(console_fd, "SWEETMETAL: cv indexed %lu", n);
+				dprintf(console_fd, "%c", 10);
+				for (unsigned long i = 0; i < n && i < 16; i++) {
+					id c = sweet_msg_id_idx(arr, "objectAtIndex:", i);
+					if (c == 0) {
+						continue;
+					}
+					dprintf(console_fd, "SWEETMETAL: cv[%lu] class %s",
+					    i, object_getClassName(c));
+					dprintf(console_fd, "%c", 10);
+					unsigned int cin = 0;
+					Ivar *civ = class_copyIvarList(object_getClass(c), &cin);
+					for (unsigned int k = 0; civ != 0 && k < cin && k < 8; k++) {
+						dprintf(console_fd, "SWEETMETAL:   civar %s +%ld",
+						    ivar_getName(civ[k]), ivar_getOffset(civ[k]));
+						dprintf(console_fd, "%c", 10);
+					}
+					if (civ != 0) {
+						free(civ);
+					}
+					{
+						unsigned long long cidx = *(unsigned long long *)((char *)c + 8);
+						unsigned long long ctyp = *(unsigned long long *)((char *)c + 16);
+						unsigned long long cdat = *(unsigned long long *)((char *)c + 24);
+						dprintf(console_fd, "SWEETMETAL:   idx %llu type %llu data %#llx",
+						    cidx, ctyp, cdat);
+						dprintf(console_fd, "%c", 10);
+						if (cdat > 0x100000000ULL && (cdat & 7) == 0) {
+							unsigned long long val[2] = { 0, 0 };
+							unsigned long long got = 0;
+							if (mach_vm_read_overwrite(mach_task_self_, cdat, sizeof(val),
+							    (unsigned long long)val, &got) == 0 && got == sizeof(val)) {
+								dprintf(console_fd, "SWEETMETAL:   value %#llx %#llx",
+								    val[0], val[1]);
+								dprintf(console_fd, "%c", 10);
+							}
+						}
+					}
+					sweet_hex64("cvraw64_", i, (const void *)c);
+				}
+			}
 		}
 	}
 	SweetFunction *function = [[SweetFunction alloc] init];
@@ -865,6 +1027,26 @@ sweet_pipeline_from_descriptor(id descriptor)
 				name = sweet_cstr(fnname);
 			}
 		}
+		id frag = sweet_msg_id(descriptor, "fragmentFunction");
+		if (frag != 0) {
+			dprintf(console_fd, "SWEETMETAL: pso frag %s", sweet_cstr(sweet_msg_id(frag, "name")));
+			dprintf(console_fd, "%c", 10);
+		}
+		if (strstr(name, "fixed_") != 0) {
+			id d = sweet_msg_id(descriptor, "description");
+			if (d != 0) {
+				dprintf(console_fd, "SWEETMETAL: pso desc %.1600s", sweet_cstr(d));
+				dprintf(console_fd, "%c", 10);
+			}
+			id vd = sweet_msg_id(descriptor, "vertexDescriptor");
+			if (vd != 0) {
+				id dd = sweet_msg_id(vd, "description");
+				if (dd != 0) {
+					dprintf(console_fd, "SWEETMETAL: pso vdesc %.1200s", sweet_cstr(dd));
+					dprintf(console_fd, "%c", 10);
+				}
+			}
+		}
 	}
 	((void (*)(id, SEL, const char *))objc_msgSend)(state,
 	    sel_registerName("setNameC:"), name);
@@ -1057,9 +1239,18 @@ typedef struct {
 
 static unsigned int sweet_encoder_logs;
 static unsigned int sweet_draw_logs;
+static unsigned int sweet_draw_logs5;
 
 /* Render encoder: records the destination surface and the draw inputs so the
  * kernel/host can later replay CA's compositor draws with real content. */
+typedef struct {
+	double origin_x, origin_y, width, height, znear, zfar;
+} SweetViewport;
+
+typedef struct {
+	unsigned long x, y, width, height;
+} SweetScissor;
+
 @interface SweetRenderEncoder : SweetObject {
 	unsigned int enc_surface;
 	id enc_pipeline;
@@ -1071,12 +1262,24 @@ static unsigned int sweet_draw_logs;
 	id enc_tex[8];
 	id enc_ib;
 	unsigned long enc_iboff;
+	unsigned char enc_vbytes[8][256];
+	unsigned long enc_vblen[8];
+	unsigned char enc_fbytes[8][256];
+	unsigned long enc_fblen[8];
+	SweetViewport enc_viewport;
+	SweetScissor enc_scissor;
 }
 - (id)initWithSurface:(unsigned int)surface;
 - (void)setRenderPipelineState:(id)pipeline;
 - (void)setVertexBuffer:(id)buffer offset:(unsigned long)offset
     atIndex:(unsigned long)index;
 - (void)setVertexBufferOffset:(unsigned long)offset atIndex:(unsigned long)index;
+- (void)setVertexBytes:(const void *)bytes length:(unsigned long)length
+    atIndex:(unsigned long)index;
+- (void)setViewport:(SweetViewport)viewport;
+- (void)setScissorRect:(SweetScissor)rect;
+- (void)setFragmentBytes:(const void *)bytes length:(unsigned long)length
+    atIndex:(unsigned long)index;
 - (void)setFragmentTexture:(id)texture atIndex:(unsigned long)index;
 - (void)setFragmentSamplerState:(id)state atIndex:(unsigned long)index;
 - (void)setFragmentBuffer:(id)buffer offset:(unsigned long)offset
@@ -1125,6 +1328,50 @@ static unsigned int sweet_draw_logs;
 {
 	if (index < 8) {
 		enc_vboff[index] = offset;
+	}
+}
+
+- (void)setViewport:(SweetViewport)viewport
+{
+	enc_viewport = viewport;
+	dprintf(console_fd,
+	    "SWEETMETAL: viewport %g,%g %gx%g z=%g..%g", viewport.origin_x,
+	    viewport.origin_y, viewport.width, viewport.height, viewport.znear,
+	    viewport.zfar);
+	dprintf(console_fd, "%c", 10);
+}
+
+- (void)setScissorRect:(SweetScissor)rect
+{
+	enc_scissor = rect;
+	dprintf(console_fd, "SWEETMETAL: scissor %lu,%lu %lux%lu", rect.x, rect.y,
+	    rect.width, rect.height);
+	dprintf(console_fd, "%c", 10);
+}
+
+- (void)setVertexBytes:(const void *)bytes length:(unsigned long)length
+    atIndex:(unsigned long)index
+{
+	if (index < 8 && bytes != 0) {
+		unsigned long n = length < 256 ? length : 256;
+		memcpy(enc_vbytes[index], bytes, n);
+		enc_vblen[index] = n;
+		dprintf(console_fd, "SWEETMETAL: vbytes[%lu] len=%lu", index, length);
+		dprintf(console_fd, "%c", 10);
+		sweet_hex64("vbB64_", (unsigned int)index, enc_vbytes[index]);
+	}
+}
+
+- (void)setFragmentBytes:(const void *)bytes length:(unsigned long)length
+    atIndex:(unsigned long)index
+{
+	if (index < 8 && bytes != 0) {
+		unsigned long n = length < 256 ? length : 256;
+		memcpy(enc_fbytes[index], bytes, n);
+		enc_fblen[index] = n;
+		dprintf(console_fd, "SWEETMETAL: fbytes[%lu] len=%lu", index, length);
+		dprintf(console_fd, "%c", 10);
+		sweet_hex64("fbB64_", (unsigned int)index, enc_fbytes[index]);
 	}
 }
 
@@ -1184,7 +1431,9 @@ sweet_texture_surface(id texture)
 {
 	enc_ib = index_buffer;
 	enc_iboff = index_offset;
-	if (sweet_draw_logs < 12 || (sweet_draw_logs % 60) == 0) {
+	BOOL interest = (enc_surface == 5) ? (sweet_draw_logs5 < 40) :
+	    (sweet_draw_logs < 12);
+	if (interest) {
 		const char *pipeline = "(none)";
 		if (enc_pipeline != 0 && ((BOOL (*)(id, SEL, Class))objc_msgSend)(
 		    enc_pipeline, sel_registerName("isKindOfClass:"),
@@ -1206,8 +1455,17 @@ sweet_texture_surface(id texture)
 				dprintf(console_fd,
 				    "SWEETMETAL:   vb[%u]=%p+%lu len=%lu\n", i,
 				    contents, enc_vboff[i], length);
-				sweet_hex64("vb64_", i,
-				    (const char *)contents + (enc_vboff[i] < length ? enc_vboff[i] : 0));
+				{
+					const char *vbase = (const char *)contents +
+					    (enc_vboff[i] < length ? enc_vboff[i] : 0);
+					unsigned long n = (enc_surface == 5) ? 256 : 64;
+					for (unsigned long off = 0; off < n; off += 64) {
+						dprintf(console_fd,
+						    "SWEETMETAL:   chunk %lu", off);
+						dprintf(console_fd, "%c", 10);
+						sweet_hex64("vb64_", i, vbase + off);
+					}
+				}
 			}
 			if (enc_tex[i] != 0) {
 				dprintf(console_fd, "SWEETMETAL:   tex[%u]=surface %u\n",
@@ -1243,10 +1501,27 @@ sweet_texture_surface(id texture)
 			    index_buffer, sel_registerName("length"));
 			dprintf(console_fd, "SWEETMETAL:   ib=%p+%lu len=%lu\n",
 			    contents, index_offset, length);
-			sweet_hex32("ibytes", 0,
-			    (const char *)contents + (index_offset < length ? index_offset : 0));
+			{
+				const unsigned short *ip = (const unsigned short *)
+				    ((const char *)contents + (index_offset < length ? index_offset : 0));
+				unsigned long imax = 0;
+				unsigned long n = count < 512 ? count : 512;
+				for (unsigned long k = 0; k < n && (index_offset + 2 * k) < length; k++) {
+					if (ip[k] > imax) {
+						imax = ip[k];
+					}
+				}
+				dprintf(console_fd, "SWEETMETAL:   imax=%lu", imax);
+				dprintf(console_fd, "%c", 10);
+				sweet_hex32("ibytes", 0,
+				    (const char *)contents + (index_offset < length ? index_offset : 0));
+			}
 		}
-		sweet_draw_logs++;
+		if (enc_surface == 5) {
+			sweet_draw_logs5++;
+		} else {
+			sweet_draw_logs++;
+		}
 	}
 }
 
