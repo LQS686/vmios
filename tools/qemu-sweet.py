@@ -250,6 +250,10 @@ def main():
                     help='bridge the first virtio-mmio console to a host TCP GPU wire server')
     ap.add_argument('--incoming', metavar='FILE',
                     help='restore a VM state written by QMP migrate file:...')
+    ap.add_argument('--psci-hvc', action='store_true',
+                    help='set the CPU psci-conduit to HVC (loader boots skip arm_load_kernel)')
+    ap.add_argument('--kernel-stub', action='store_true',
+                    help='boot the stub via -kernel so arm_load_kernel sets PSCI/secondaries')
     ap.add_argument('--machine-extra',
                     help='extra -M virt properties, e.g. virtualization=on')
     ap.add_argument('--qemu-debug', action='store_true',
@@ -320,6 +324,8 @@ def main():
     cmdline = payload[0x48:0x48 + 608].split(b'\0', 1)[0]
     if b'sweetfb_offload=1' in cmdline:
         cmd += ['-device', 'sweet-fb']
+    if a.psci_hvc:
+        cmd += ['-global', f'driver={a.cpu},property=psci-conduit,value=2']
     if a.gpu_wire:
         cmd += ['-global', 'virtio-mmio.force-legacy=false',
                 '-chardev', f'socket,id=gpu_wire,host=127.0.0.1,port={a.gpu_wire}',
@@ -333,9 +339,15 @@ def main():
         if a.touchfile:
             dev += f',touchfile={os.path.abspath(a.touchfile)}'
         cmd += ['-device', dev]
-    cmd += ['-device', f'loader,file={out}/ram.bin,addr={phys_base:#x},force-raw=on',
-            '-device', f'loader,file={out}/stub.bin,addr={STUB_PA:#x},force-raw=on',
-            '-device', f'loader,addr={STUB_PA:#x},cpu-num=0']
+    if a.kernel_stub:
+        # -kernel reaches arm_load_kernel, which configures the CPU
+        # psci-conduit and holds the secondary CPUs powered off.
+        cmd += ['-device', f'loader,file={out}/ram.bin,addr={phys_base:#x},force-raw=on',
+                '-kernel', f'{out}/stub.bin']
+    else:
+        cmd += ['-device', f'loader,file={out}/ram.bin,addr={phys_base:#x},force-raw=on',
+                '-device', f'loader,file={out}/stub.bin,addr={STUB_PA:#x},force-raw=on',
+                '-device', f'loader,addr={STUB_PA:#x},cpu-num=0']
     if a.incoming:
         cmd += ['-incoming', f'file:{os.path.abspath(a.incoming)}']
     if a.gdb:

@@ -2,6 +2,23 @@
 
 ### >>> ACTIVE: CA 宿主光栅化（性能整改）(2026-10-25) <<<
 
+**14:58 多核：loader boot 跳过 arm_load_kernel 是根因；`-kernel` 已接上但 CPU 数仍待证。**
+- QEMU 用 `-device loader` 启动时不会调用 `arm_load_kernel`，CPU 的
+  `psci-conduit` 保持 DISABLED，所以 HVC/SMC 都不被接管。把 68 字节 stub
+  作为 `-kernel` 传给 QEMU 可以走 `arm_load_kernel`（app 的 `VmEngine`
+  在 `cpus>=2` 时已改成 `-kernel stub.bin`，并去掉 stub loader 和
+  `virtualization=on`）。真机 4 vCPU + HVC payload 能启动，但 65 s 时
+  `copies=2`、仍只有 1 条 TCG 线程忙；ring 里的 `SWEET CPU` 行没有时间戳，
+  无法确认是本次启动。下一步要在**本次启动**里拿到 `N/N CPUs initialized`
+  的带时间戳证据，再判断从核是否起来。
+- 直接用 `-global ...psci-conduit=2` 会触发早期 Data Abort（stub 入口
+  未走通），不可用；`virtualization=on` 的 EL2 路径 stub `eret` 报
+  Illegal Execution State（SPSR/ELR 已反汇编确认正确），也暂不可用。
+- 当前设备已恢复到 **1 vCPU + quiet + present offload**（payload
+  `0097m-offload`，md5 22af99fd…），offload completion 正常增长。
+- 渲染缺陷：offload 画面出现中间灰白渐变块 + 3 条竖直缝
+  （`.tools/shot-offload2.png`），下一步与本地光栅同帧对比定位。
+
 **14:47 present offload 真机验证成功；渲染异常定位到渐变块。**
 - `payload-0097m-offload.bin`（quiet 插件 + `sweetfb_offload=1`）+ 新 APK：
   `-device sweet-fb` 生效，app 日志 `offload completed=1,2,3… status=0`
