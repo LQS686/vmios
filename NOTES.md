@@ -2,6 +2,17 @@
 
 ### >>> ACTIVE: CA 宿主光栅化（性能整改）(2026-10-25) <<<
 
+**15:00 当前可用：1 vCPU + quiet + present offload；多核仍停在早期。**
+- offload 已验证：`offload completed` 持续增长、copies 2→464、fps 3–5，
+  画面有正确状态栏和中间渐变块（渐变块带 3 条竖缝，待查）。
+- 多核：`-kernel stub.bin` 已接进 app（cpus>=2），QEMU 命令行确认
+  `-kernel .../stub.bin`、无 virtualization；但 4 vCPU HVC 启动 60 s 时
+  仍只有 1 条 TCG 线程忙、`hw.ncpu`（插件新增的用户态日志）未出现，
+  guest 停在早期。下一步用宿主 QEMU `--kernel-stub --qemu-debug` 抓第一个
+  异常/PC，确认 PSCI conduit 与从核 reset 状态；仍可能需要 QEMU 机器补丁
+  或 Android 引擎重建。
+- 设备现在运行 `payload-0097m-offload`（1 vCPU offload），这是已验证配置。
+
 **14:58 多核：loader boot 跳过 arm_load_kernel 是根因；`-kernel` 已接上但 CPU 数仍待证。**
 - QEMU 用 `-device loader` 启动时不会调用 `arm_load_kernel`，CPU 的
   `psci-conduit` 保持 DISABLED，所以 HVC/SMC 都不被接管。把 68 字节 stub

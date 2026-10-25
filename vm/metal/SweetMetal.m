@@ -66,6 +66,8 @@ char *dlerror(void);
 int usleep(unsigned int usec);
 int pthread_create(void *thread, const void *attr, void *(*start)(void *), void *arg);
 void *dispatch_get_global_queue(long identifier, unsigned long flags);
+int sysctlbyname(const char *name, void *oldp, unsigned long *oldlenp,
+    const void *newp, unsigned long newlen);
 unsigned long long dispatch_time(unsigned long long when, long long delta);
 void dispatch_after_f(unsigned long long when, void *queue, void *context,
     void (*work)(void *));
@@ -1258,6 +1260,11 @@ static void
 sweet_loaded(void)
 {
 	static void *thread;
+	int ncpu = 0;
+	unsigned long ncpu_len = sizeof(ncpu);
+	if (sysctlbyname("hw.ncpu", &ncpu, &ncpu_len, 0, 0) == 0) {
+		dprintf(console_fd, "SWEETMETAL: hw.ncpu=%d%c", ncpu, 10);
+	}
 	sweet_log("bundle loaded", 0);
 	sweet_install_cv_hooks();
 	int probe_rc = pthread_create(&thread, 0, sweet_probe_thread, 0);
