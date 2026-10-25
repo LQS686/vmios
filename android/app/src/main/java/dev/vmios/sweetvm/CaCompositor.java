@@ -28,9 +28,12 @@ final class GuestRam {
     private static final int MASK = SIZE - 1;
 
     private final MappedByteBuffer[] windows;
-    private final long length;
+    final long length;
+    final File file;
+    boolean nativeOk;
 
     GuestRam(File file) throws Exception {
+        this.file = file;
         long length = file.length();
         this.length = length;
         int count = (int) ((length + SIZE - 1) >>> SHIFT);
@@ -69,6 +72,22 @@ final class GuestRam {
 
 final class CaCompositor {
     private static final String TAG = "sweetgpu-ca";
+    private static final boolean NATIVE;
+    private static native int nativeInit(String path, long length);
+    private static native int nativeTriangle(long[] pages, int total, int pageShift,
+            long alloc, int dstBpr, int clipX0, int clipY0, int clipX1, int clipY1,
+            int blend, int[] tex, int texW, int texH, int textured, float[] verts);
+
+    static {
+        boolean ok;
+        try {
+            System.loadLibrary("sweetraster");
+            ok = true;
+        } catch (Throwable t) {
+            ok = false;
+        }
+        NATIVE = ok;
+    }
     static final int F_TEXTURED = 1;
     static final int F_UPLOAD_TEX = 2;
     static final int F_INTERNAL = 4;
@@ -88,6 +107,7 @@ final class CaCompositor {
     private int drawLogs;
     private int rejectLogs;
     private int mapLogs;
+    private int mapValidated;
     private long frame;
     private long frameStart = System.nanoTime();
     private long frameDraws;
@@ -96,6 +116,11 @@ final class CaCompositor {
 
     CaCompositor(GuestRam ram) {
         this.ram = ram;
+        if (ram != null) {
+            ram.nativeOk = NATIVE
+                    && nativeInit(ram.file.getAbsolutePath(), ram.length) == 1;
+            Log.i(TAG, "native raster=" + ram.nativeOk);
+        }
     }
 
     private boolean disabled() {
@@ -114,6 +139,8 @@ final class CaCompositor {
         int width;
         int height;
         long alloc;
+
+        boolean validated;
 
         boolean ready() {
             return total > 0 && received >= total;
@@ -189,6 +216,29 @@ final class CaCompositor {
                     + Long.toHexString(b.getLong(40)) + " p1=0x"
                     + Long.toHexString(b.getLong(48)) + " p2=0x"
                     + Long.toHexString(b.getLong(56)));
+        }
+        if (s.received >= s.total && !s.validated && mapValidated < 8) {
+            s.validated = true;
+            mapValidated++;
+            int bad = 0;
+            for (int i = 0; i < s.total; i++) {
+                long pa = s.pages[i];
+                if (pa == 0) {
+                    bad++;
+                    continue;
+                }
+                int got = ram.at(pa).getInt(ram.index(pa));
+                int want = 0xC0DE0000 | i;
+                if (got != want) {
+                    bad++;
+                    if (bad <= 8) {
+                        Log.w(TAG, "map page " + i + " pa=0x" + Long.toHexString(pa)
+                                + " got=0x" + Integer.toHexString(got)
+                                + " want=0x" + Integer.toHexString(want));
+                    }
+                }
+            }
+            Log.i(TAG, "map validate id=" + id + " pages=" + s.total + " bad=" + bad);
         }
     }
 
@@ -617,6 +667,15 @@ final class CaCompositor {
             float ax, float ay, float au, float av, float ar, float ag, float ab, float aa,
             float bx, float by, float bu, float bv, float br, float bg, float bb, float ba,
             float cx, float cy, float cu, float cv, float cr, float cg, float cb, float ca) {
+        if (ram != null && ram.nativeOk && dst.pages != null) {
+            float[] v = { ax, ay, au, av, ar, ag, ab, aa, bx, by, bu, bv, br, bg, bb, ba,
+                    cx, cy, cu, cv, cr, cg, cb, ca };
+            int[] texels = textured && tex != null ? tex.pixels : null;
+            return nativeTriangle(dst.pages, dst.total, dst.pageShift, dst.alloc,
+                    dst.bpr, clipX0, clipY0, clipX1, clipY1, blend, texels,
+                    tex != null ? tex.width : 0, tex != null ? tex.height : 0,
+                    textured ? 1 : 0, v);
+        }
         float area = edge(ax, ay, bx, by, cx, cy);
         if (area == 0f) {
             return 0;

@@ -775,6 +775,10 @@ static unsigned char *sweet_stage_base;
 static void *sweet_stage_ref;
 static unsigned int sweet_stage_seed;
 static unsigned int sweet_stage_logs;
+/* Diagnostic: keep the stage read-only and let the host verify every page. */
+static int sweet_stage_diag = 0;
+/* Diagnostic: local raster writes the stage; the host gets no draws. */
+static int sweet_stage_local = 0;
 
 static int
 sweet_stage_ensure(unsigned long width, unsigned long height, unsigned long bpr)
@@ -858,6 +862,13 @@ sweet_stage_ensure(unsigned long width, unsigned long height, unsigned long bpr)
 	sweet_stage_bpr = got_bpr;
 	dprintf(console_fd, "SWEETMETAL: stage id=%u %lux%lu bpr=%lu base=%p%c",
 	    id, width, height, got_bpr, base, 10);
+	if (sweet_stage_diag) {
+		for (unsigned long i = 0; (i << 14) < got_bpr * height; i++) {
+			*(volatile unsigned int *)(base + (i << 14)) =
+			    0xC0DE0000u | (unsigned int)i;
+		}
+		sweet_ca_map(id);
+	}
 	return 1;
 }
 
@@ -3091,8 +3102,10 @@ sweet_texture_surface(id texture)
 			r.dst_w = sweet_stage_w;
 			r.dst_h = sweet_stage_h;
 			r.dst_bpr = sweet_stage_bpr;
-			host_surface = sweet_stage_id;
 			enc_stage = 1;
+			if (!sweet_stage_local) {
+				host_surface = sweet_stage_id;
+			}
 		}
 		int host_ok = !sweet_ca_disabled && sweet_accel_port != 0 &&
 		    enc_surface != 0 && r.dst != 0 && r.dst_bpr != 0 &&
@@ -3262,11 +3275,31 @@ sweet_texture_surface(id texture)
 	sweet_log("encoder", "endEncoding");
 	/* The drawable must be complete before the swap record is sent. */
 	sweet_ca_flush();
-	if (enc_stage && sweet_stage_id != 0) {
-		sweet_last_surface = sweet_stage_id;
-		sweet_last_width = sweet_stage_w;
-		sweet_last_height = sweet_stage_h;
-	} else if (enc_surface != 0 && enc_map.base != 0 && enc_map.width >= 1000 &&
+	if (enc_stage && sweet_stage_id != 0 && enc_map.base != 0 &&
+	    enc_map.width == sweet_stage_w && enc_map.height == sweet_stage_h) {
+		/*
+		 * The window server presents this drawable itself; our own
+		 * IOMobileFramebufferOpen fails, and the host must not write CA
+		 * memory. Copy the host-rendered staging surface into the drawable
+		 * so that present shows it.
+		 */
+		unsigned char *src = sweet_stage_base;
+		unsigned char *dst = enc_map.base;
+		unsigned long span = sweet_stage_w * 4;
+		unsigned long long copy_t0 = mach_absolute_time();
+		for (unsigned long y = 0; y < sweet_stage_h; y++) {
+			memcpy(dst + y * enc_map.bytes_per_row,
+			    src + y * sweet_stage_bpr, span);
+		}
+		if (sweet_stage_logs < 8) {
+			sweet_stage_logs++;
+			dprintf(console_fd,
+			    "SWEETMETAL: stage copy %lux%lu ms=%.1f%c",
+			    sweet_stage_w, sweet_stage_h,
+			    sweet_ticks_ms(mach_absolute_time() - copy_t0), 10);
+		}
+	}
+	if (enc_surface != 0 && enc_map.base != 0 && enc_map.width >= 1000 &&
 	    enc_map.height >= 2000) {
 		sweet_last_surface = enc_surface;
 		sweet_last_width = enc_map.width;

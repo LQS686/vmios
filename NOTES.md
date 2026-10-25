@@ -2,6 +2,53 @@
 
 ### >>> ACTIVE: CA 宿主光栅化（性能整改）(2026-10-25) <<<
 
+**13:53 多核的真正卡点：guest SMP bring-up，不是调度。**
+- 之前 2/4 vCPU “只有一条 TCG 线程忙” 的直接原因已找到：`mkadt.py` 把
+  cpu1..N 的 DT `state` 写成 `stopped`，XNU 的 topology 只算 1 个 CPU
+  （旧 ring 的 `requested=1 selected=1`）。**已修**：所有 CPU 都写 `running`。
+- 修后 4 vCPU（普通 payload 和 `mkpayload --qemu-psci` 两版）都会在早期
+  SMP 启动卡住：ring 的 `total` 停在 593538 不再前进，只有 1 条 TCG 线程
+  100%，其余 3 条 0%。说明 **app 里的 QEMU 从核没有起来，kernel 在等 CPU**，
+  不是“4 核都在但调度不用”。
+- 下一步要修的是 QEMU/ADT 的 CPU 匹配：MPIDR Aff0 vs Aff1、PSCI HVC/SMC、
+  以及 host QEMU 已有的 qemu-psci 补丁要进 Android 引擎；修好后再测
+  2/4 vCPU 的真实收益。当前 app 的 QEMU 多核不可用。
+- 当前最佳可用配置仍是 **1 vCPU + native 宿主光栅 + staging + drawable 拷贝**
+  （`payload-0097i.bin`，md5 91049ce6…，约 5 fps，可见状态栏/电量/时间）。
+
+**13:41 多核与 present offload 的实测结论。**
+- **2 vCPU MTTCG（ADT 2 CPU 节点 + cpus=2，2 s 锁超时）**：能启动到 CA，
+  t=451 仍在 SweetMetal 渲染，无 ticket lock panic；但 QEMU 只有一条 TCG 线程
+  占 96%，第二条 **0%**——CA/present 仍是串行，2 vCPU 没有收益。2cpu payload
+  `payload-0097i-2cpu.bin`（md5 5c2239d8…）保留备查。
+- **present offload（`sweetfb_offload=1`，app 日志 `present=native`）**：guest
+  的 swap 继续、宿主 native 绘制 5–47 ms、stage copy 6.9 ms，但 app 的
+  `copies` 冻结在 22，滑动后也不增长——QEMU sweet-fb 没有回写 completion
+  序号，reader 永远等不到新帧。与文档“未真机验证”一致，**offload 目前不可用**，
+  已回退到 guest present。offload payload `payload-0097j.bin`（md5 a9a26fcb…）。
+- **当前最佳可用配置**：1 vCPU + native 宿主光栅 + staging + drawable 拷贝
+  （`payload-0097i.bin`，md5 91049ce6…），可见 iOS 状态栏/时间/电量，
+  交互约 **5 fps**，无 panic。宿主绘制 5–47 ms，stage copy 6–9 ms，
+  剩余瓶颈是 guest 串行 CA 编码 + 内核每帧 10.9 MB present memcpy。
+- 待查渲染异常：背景/壁纸仍大面积黑色，status bar 文字颜色正确；下一步对比
+  host raster 与本地光栅的同一帧，定位是 clear/stage 内容还是图层混合。
+
+**13:27 里程碑：宿主光栅链路可见、稳定、快。**
+- 修正 IOMobileFramebufferOpen 失败（conn=0）后的呈现路径：插件把 staging
+  **memcpy 到 CA drawable**，由 guest 窗口服务器 present；拷贝实测 **6.2–8 ms**
+  （11 MB，TCG 下约 1.5 GB/s）。
+- 宿主逐像素循环改为 **native C（JNI，`libsweetraster.so`）**：全屏绘制
+  **6–42 ms**（debug APK 无法 AOT；Java 版本 1.1 s）。页表校验
+  `map validate pages=676 bad=0`，staging 是我方独占内存，宿主不再写 CA surface。
+- 真机截图已有正确 iOS 状态栏（时间/电量/home indicator）；交互滑动实测
+  **约 5 fps**，无 panic。staging 的 drawable 拷贝与宿主绘制都不是瓶颈，
+  剩余限制是 guest 侧 CA 编码 + 内核 present 的串行工作。
+- 产物：`payload-0097i.bin`（md5 91049ce6…）；APK 含
+  `lib/arm64-v8a/libsweetraster.so`（NDK r27）。
+
+**下一步：2 vCPU MTTCG。** 2cpu payload 正在构建；重点看 CA 编码/present 是否
+并行化、ticket lock 是否稳定（2 s 超时已在 cmdline）。
+
 **12:05 状态：宿主光栅跑通，但写 CA surface 会打崩 guest；已改为 staging。**
 - AOT（`adb shell cmd package compile -m speed -f dev.hackios.sweetvm`）把全屏
   host draw 从 1.2 s 降到 **11–21 ms**；这也说明之前 1.2 s 主要是 debug APK
